@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = ["crates/*", "apps/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+
+[workspace.dependencies]
+# L1 硬许可依赖（00 架构总览 §8）
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros", "io-util", "signal"] }
+socket2 = "0.5"
+x25519-dalek = { version = "2", features = ["getrandom", "zeroize", "static_secrets"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+sha2 = "0.10"
+hkdf = "0.12"
+hmac = "0.12"
+aes-gcm = "0.10"
+zeroize = { version = "1", features = ["derive"] }
+bytes = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1

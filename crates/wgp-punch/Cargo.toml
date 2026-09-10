@@ -1,0 +1,9 @@
+[package]
+name = "wgp-punch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "折跃门打洞引擎：状态机、竞速调度器（唯一发包点）、步长学习、三波、保活"
+
+[dependencies]
+wgp-proto = { path = "../wgp-proto" }

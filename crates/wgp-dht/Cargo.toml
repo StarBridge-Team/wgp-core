@@ -1,0 +1,16 @@
+[package]
+name = "wgp-dht"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "折跃门去中心化信令面：Kademlia 变种、房间键、租约/继位链、观察者协议"
+
+[dependencies]
+wgp-proto = { path = "../wgp-proto" }
+ed25519-dalek = { workspace = true }
+rand_core = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+wgp-crypto = { path = "../wgp-crypto" }

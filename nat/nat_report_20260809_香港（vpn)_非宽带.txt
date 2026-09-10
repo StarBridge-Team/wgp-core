@@ -1,0 +1,646 @@
+==============================================
+        NAT 类型检测报告 (多 STUN)
+==============================================
+IPv4 STUN 服务器 :
+  - 小米       : stun.miwifi.com:3478
+  - 12voip     : stun.12voip.com:3478
+  - Cloudflare : stun.cloudflare.com:3478
+  单次穿插 STUN  :
+    - AA-Net     : stun.aa.net.uk:3478
+    - Acrobits   : stun.acrobits.cz:3478
+    - ActionVoIP : stun.actionvoip.com:3478
+    - Annatel    : stun.annatel.net:3478
+    - AntiSIP    : stun.antisip.com:3478
+    - Cablenet   : stun.cablenet-as.net:3478
+    - CheapVoIP  : stun.cheapvoip.com:3478
+IPv6 STUN 服务器 : [2001:4860:4860::8888]:19302
+独立轮次          : 30
+单次穿插次数      : 7
+同端口测试次数    : 10
+开始时间          : 2026-08-09 00:39:55
+结束时间          : 2026-08-09 00:41:54
+耗时              : 118 秒
+----------------------------------------------
+【一、综合结论】
+判定 NAT 类型     : 端口受限锥形 NAT (Port Restricted Cone NAT)
+本机公网 IPv4     : 104.28.152.131
+本机公网端口      : 28126
+观察到的不同映射  : 25 个
+  -> 104.28.152.131:28126, 104.28.152.131:28562, 104.28.152.131:28086, 104.28.152.131:28461, 104.28.152.131:27333, 104.28.152.131:28879, 104.28.152.131:29129, 104.28.152.131:28307, 104.28.152.131:29358, 104.28.152.131:27458, 104.28.152.131:28640, 104.28.152.131:27592, 104.28.152.131:27644, 104.28.152.131:28655, 104.28.152.131:28266, 104.28.152.131:28590, 104.28.152.131:28236, 104.28.152.131:29492, 104.28.152.131:28989, 104.28.152.131:29493, 104.28.152.131:29321, 104.28.152.131:28438, 104.28.152.131:28179, 104.28.152.131:29447, 104.28.152.131:28216
+RTT 最小/最大/平均 : 316 / 407 / 355 ms
+----------------------------------------------
+【二、IPv4 归属地】
+  IP              : 104.28.152.131
+  国家            : United States
+  地区/省         : California
+  城市            : East Los Angeles
+  邮政编码        : 90022
+  运营商/组织     : Cloudflare, Inc.
+  ASN             : AS13335
+  时区            : America/Los_Angeles
+  坐标            : 34.0239, -118.1720
+----------------------------------------------
+【三、IPv6 检测】
+  STUN 服务器     : [2001:4860:4860::8888]:19302
+  本机 IPv6       : 2606:4700:110:84e3:666f:3a31:1a2a:f358
+  公网 IPv6       : 不可达
+  备注            : IPv6 STUN 响应超时
+----------------------------------------------
+【四、同端口稳定性测试 (10 次)】
+  本地套接字      : 0.0.0.0:61091
+  成功 / 总数     : 8 / 10
+  RTT 最小/平均/最大 : 343 / 382 / 425 ms
+  映射稳定性      : 稳定
+  观察到的映射    : 104.28.152.131:28696
+  结论            : 映射稳定 (8 次命中同一映射), 不是 Symmetric NAT
+  [# 1] OK  映射=104.28.152.131:28696  RTT=425ms
+  [# 2] OK  映射=104.28.152.131:28696  RTT=343ms
+  [# 3] FAIL (响应超时)
+  [# 4] FAIL (响应超时)
+  [# 5] OK  映射=104.28.152.131:28696  RTT=344ms
+  [# 6] OK  映射=104.28.152.131:28696  RTT=398ms
+  [# 7] OK  映射=104.28.152.131:28696  RTT=405ms
+  [# 8] OK  映射=104.28.152.131:28696  RTT=353ms
+  [# 9] OK  映射=104.28.152.131:28696  RTT=396ms
+  [#10] OK  映射=104.28.152.131:28696  RTT=399ms
+----------------------------------------------
+【五、独立轮次检测结果统计】
+  PortRestrictedCone     : 20 次
+  UdpBlocked             : 12 次
+  Unknown                : 5 次
+
+  按 STUN 服务器分类 :
+  小米         : 总 10 轮, 成功 10 轮 (PortRestrictedCone=10)
+  12voip     : 总 10 轮, 成功 10 轮 (PortRestrictedCone=10)
+  Cloudflare : 总 10 轮, 成功 0 轮
+  AA-Net     : 总 1 轮, 成功 1 轮 (Unknown=1)
+  Acrobits   : 总 1 轮, 成功 0 轮
+  ActionVoIP : 总 1 轮, 成功 1 轮 (Unknown=1)
+  Annatel    : 总 1 轮, 成功 1 轮 (Unknown=1)
+  AntiSIP    : 总 1 轮, 成功 0 轮
+  Cablenet   : 总 1 轮, 成功 1 轮 (Unknown=1)
+  CheapVoIP  : 总 1 轮, 成功 1 轮 (Unknown=1)
+----------------------------------------------
+【六、检测方法说明】
+  Test I    : 普通 Binding Request,获取映射地址
+  Test II   : 带 CHANGE-REQUEST(change-port) 标志,探测是否能从不同端口接收响应
+  Test III  : 带 CHANGE-REQUEST(change-ip + change-port),探测是否能从不同 IP 接收响应
+  同端口测试: 复用同一本地 socket 连续探测,观察 NAT 分配的端口是否变化
+              若端口稳定 -> 不是 Symmetric;端口抖动 -> 高度疑似 Symmetric
+  IPv6 测试 : 通过 connect 到公网 v6 端点推断本机出口 v6,再用 IPv6 STUN 获取公网 v6
+  分类规则 (单服务器简化版) :
+    - Test I 失败                       -> UDP Blocked
+    - 映射稳定 + Test II/III 成功       -> Open Internet
+    - 映射稳定 + Test II 成功           -> Full Cone NAT
+    - 映射稳定 + Test II 失败           -> Port Restricted Cone NAT
+    - 映射变化 或 同端口测试端口抖动    -> Symmetric NAT
+----------------------------------------------
+【七、逐轮详细数据】
+
+---- 第 1 轮 ----
+  STUN 服务器      : 小米 (stun.miwifi.com:3478)
+  本地套接字       : 0.0.0.0:64517
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 104.28.152.131:28126
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 104.28.152.131:28126
+      响应来源 : 111.206.174.2:3478
+      RTT      : 407 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 2 轮 ----
+  STUN 服务器      : 12voip (stun.12voip.com:3478)
+  本地套接字       : 0.0.0.0:63153
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 104.28.152.131:28562
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 104.28.152.131:28562
+      响应来源 : 77.72.169.213:3478
+      RTT      : 330 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 3 轮 ----
+  STUN 服务器      : Cloudflare (stun.cloudflare.com:3478)
+  本地套接字       : 0.0.0.0:62260
+  NAT 类型         : UDP 被阻止 / 对称型 UDP 防火墙
+  映射一致性       : 变化
+  [Test 1] Binding Request (Test I)
+      状态     : 失败 (发送失败: 使用了与请求的协议不兼容的地址。 (os error 10047))
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 ()
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 ()
+
+---- 第 4 轮 ----
+  STUN 服务器      : 小米 (stun.miwifi.com:3478)
+  本地套接字       : 0.0.0.0:52626
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 104.28.152.131:28086
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 104.28.152.131:28086
+      响应来源 : 111.206.174.2:3478
+      RTT      : 398 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 5 轮 ----
+  STUN 服务器      : 12voip (stun.12voip.com:3478)
+  本地套接字       : 0.0.0.0:56708
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 104.28.152.131:28461
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 104.28.152.131:28461
+      响应来源 : 77.72.169.213:3478
+      RTT      : 339 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 6 轮 ----
+  STUN 服务器      : Cloudflare (stun.cloudflare.com:3478)
+  本地套接字       : 0.0.0.0:51887
+  NAT 类型         : UDP 被阻止 / 对称型 UDP 防火墙
+  映射一致性       : 变化
+  [Test 1] Binding Request (Test I)
+      状态     : 失败 (发送失败: 使用了与请求的协议不兼容的地址。 (os error 10047))
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 ()
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 ()
+
+---- 第 7 轮 ----
+  STUN 服务器      : 小米 (stun.miwifi.com:3478)
+  本地套接字       : 0.0.0.0:51888
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 104.28.152.131:27333
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 104.28.152.131:27333
+      响应来源 : 111.206.174.2:3478
+      RTT      : 402 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 8 轮 ----
+  STUN 服务器      : 12voip (stun.12voip.com:3478)
+  本地套接字       : 0.0.0.0:59097
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 104.28.152.131:28879
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 104.28.152.131:28879
+      响应来源 : 77.72.169.213:3478
+      RTT      : 339 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 9 轮 ----
+  STUN 服务器      : Cloudflare (stun.cloudflare.com:3478)
+  本地套接字       : 0.0.0.0:56121
+  NAT 类型         : UDP 被阻止 / 对称型 UDP 防火墙
+  映射一致性       : 变化
+  [Test 1] Binding Request (Test I)
+      状态     : 失败 (发送失败: 使用了与请求的协议不兼容的地址。 (os error 10047))
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 ()
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 ()
+
+---- 第 10 轮 ----
+  STUN 服务器      : 小米 (stun.miwifi.com:3478)
+  本地套接字       : 0.0.0.0:56306
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 104.28.152.131:29129
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 104.28.152.131:29129
+      响应来源 : 111.206.174.2:3478
+      RTT      : 377 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 11 轮 ----
+  STUN 服务器      : 12voip (stun.12voip.com:3478)
+  本地套接字       : 0.0.0.0:52151
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 104.28.152.131:28307
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 104.28.152.131:28307
+      响应来源 : 77.72.169.213:3478
+      RTT      : 316 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 12 轮 ----
+  STUN 服务器      : Cloudflare (stun.cloudflare.com:3478)
+  本地套接字       : 0.0.0.0:63147
+  NAT 类型         : UDP 被阻止 / 对称型 UDP 防火墙
+  映射一致性       : 变化
+  [Test 1] Binding Request (Test I)
+      状态     : 失败 (发送失败: 使用了与请求的协议不兼容的地址。 (os error 10047))
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 ()
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 ()
+
+---- 第 13 轮 ----
+  STUN 服务器      : 小米 (stun.miwifi.com:3478)
+  本地套接字       : 0.0.0.0:51102
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 104.28.152.131:29358
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 104.28.152.131:29358
+      响应来源 : 111.206.174.2:3478
+      RTT      : 351 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 14 轮 ----
+  STUN 服务器      : 12voip (stun.12voip.com:3478)
+  本地套接字       : 0.0.0.0:63657
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 104.28.152.131:27458
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 104.28.152.131:27458
+      响应来源 : 77.72.169.213:3478
+      RTT      : 323 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 15 轮 ----
+  STUN 服务器      : Cloudflare (stun.cloudflare.com:3478)
+  本地套接字       : 0.0.0.0:50850
+  NAT 类型         : UDP 被阻止 / 对称型 UDP 防火墙
+  映射一致性       : 变化
+  [Test 1] Binding Request (Test I)
+      状态     : 失败 (发送失败: 使用了与请求的协议不兼容的地址。 (os error 10047))
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 ()
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 ()
+
+---- 第 16 轮 ----
+  STUN 服务器      : 小米 (stun.miwifi.com:3478)
+  本地套接字       : 0.0.0.0:50851
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 104.28.152.131:28640
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 104.28.152.131:28640
+      响应来源 : 111.206.174.2:3478
+      RTT      : 366 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 17 轮 ----
+  STUN 服务器      : 小米 (stun.miwifi.com:3478)
+  本地套接字       : 0.0.0.0:62957
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 104.28.152.131:27592
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 104.28.152.131:27592
+      响应来源 : 111.206.174.2:3478
+      RTT      : 385 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 18 轮 ----
+  STUN 服务器      : 小米 (stun.miwifi.com:3478)
+  本地套接字       : 0.0.0.0:52507
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 104.28.152.131:27644
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 104.28.152.131:27644
+      响应来源 : 111.206.174.2:3478
+      RTT      : 368 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 19 轮 ----
+  STUN 服务器      : 小米 (stun.miwifi.com:3478)
+  本地套接字       : 0.0.0.0:65158
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 104.28.152.131:28655
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 104.28.152.131:28655
+      响应来源 : 111.206.174.2:3478
+      RTT      : 393 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 20 轮 ----
+  STUN 服务器      : 小米 (stun.miwifi.com:3478)
+  本地套接字       : 0.0.0.0:62681
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 104.28.152.131:28266
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 104.28.152.131:28266
+      响应来源 : 111.206.174.2:3478
+      RTT      : 407 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 21 轮 ----
+  STUN 服务器      : 12voip (stun.12voip.com:3478)
+  本地套接字       : 0.0.0.0:63065
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 104.28.152.131:28590
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 104.28.152.131:28590
+      响应来源 : 77.72.169.213:3478
+      RTT      : 323 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 22 轮 ----
+  STUN 服务器      : 12voip (stun.12voip.com:3478)
+  本地套接字       : 0.0.0.0:52378
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 104.28.152.131:28236
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 104.28.152.131:28236
+      响应来源 : 77.72.169.213:3478
+      RTT      : 332 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 23 轮 ----
+  STUN 服务器      : 12voip (stun.12voip.com:3478)
+  本地套接字       : 0.0.0.0:56497
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 104.28.152.131:29492
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 104.28.152.131:29492
+      响应来源 : 77.72.169.213:3478
+      RTT      : 328 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 24 轮 ----
+  STUN 服务器      : 12voip (stun.12voip.com:3478)
+  本地套接字       : 0.0.0.0:55491
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 104.28.152.131:28989
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 104.28.152.131:28989
+      响应来源 : 77.72.169.213:3478
+      RTT      : 322 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 25 轮 ----
+  STUN 服务器      : 12voip (stun.12voip.com:3478)
+  本地套接字       : 0.0.0.0:65379
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 104.28.152.131:29493
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 104.28.152.131:29493
+      响应来源 : 77.72.169.213:3478
+      RTT      : 328 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 26 轮 ----
+  STUN 服务器      : Cloudflare (stun.cloudflare.com:3478)
+  本地套接字       : 0.0.0.0:51825
+  NAT 类型         : UDP 被阻止 / 对称型 UDP 防火墙
+  映射一致性       : 变化
+  [Test 1] Binding Request (Test I)
+      状态     : 失败 (发送失败: 使用了与请求的协议不兼容的地址。 (os error 10047))
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 ()
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 ()
+
+---- 第 27 轮 ----
+  STUN 服务器      : Cloudflare (stun.cloudflare.com:3478)
+  本地套接字       : 0.0.0.0:64615
+  NAT 类型         : UDP 被阻止 / 对称型 UDP 防火墙
+  映射一致性       : 变化
+  [Test 1] Binding Request (Test I)
+      状态     : 失败 (发送失败: 使用了与请求的协议不兼容的地址。 (os error 10047))
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 ()
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 ()
+
+---- 第 28 轮 ----
+  STUN 服务器      : Cloudflare (stun.cloudflare.com:3478)
+  本地套接字       : 0.0.0.0:64616
+  NAT 类型         : UDP 被阻止 / 对称型 UDP 防火墙
+  映射一致性       : 变化
+  [Test 1] Binding Request (Test I)
+      状态     : 失败 (发送失败: 使用了与请求的协议不兼容的地址。 (os error 10047))
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 ()
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 ()
+
+---- 第 29 轮 ----
+  STUN 服务器      : Cloudflare (stun.cloudflare.com:3478)
+  本地套接字       : 0.0.0.0:64617
+  NAT 类型         : UDP 被阻止 / 对称型 UDP 防火墙
+  映射一致性       : 变化
+  [Test 1] Binding Request (Test I)
+      状态     : 失败 (发送失败: 使用了与请求的协议不兼容的地址。 (os error 10047))
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 ()
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 ()
+
+---- 第 30 轮 ----
+  STUN 服务器      : Cloudflare (stun.cloudflare.com:3478)
+  本地套接字       : 0.0.0.0:64618
+  NAT 类型         : UDP 被阻止 / 对称型 UDP 防火墙
+  映射一致性       : 变化
+  [Test 1] Binding Request (Test I)
+      状态     : 失败 (发送失败: 使用了与请求的协议不兼容的地址。 (os error 10047))
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 ()
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 ()
+
+---- 第 31 轮 ----
+  STUN 服务器      : AA-Net (stun.aa.net.uk:3478)
+  本地套接字       : 0.0.0.0:64619
+  NAT 类型         : 未知 / 无法判定
+  映射一致性       : 稳定
+  观察到的映射集合 : 104.28.152.131:29321
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 104.28.152.131:29321
+      响应来源 : 81.187.30.115:3478
+      RTT      : 320 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 ()
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 ()
+
+---- 第 32 轮 ----
+  STUN 服务器      : Acrobits (stun.acrobits.cz:3478)
+  本地套接字       : 0.0.0.0:53570
+  NAT 类型         : UDP 被阻止 / 对称型 UDP 防火墙
+  映射一致性       : 稳定
+  [Test 1] Binding Request (Test I)
+      状态     : 失败 (响应超时)
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 ()
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 ()
+
+---- 第 33 轮 ----
+  STUN 服务器      : ActionVoIP (stun.actionvoip.com:3478)
+  本地套接字       : 0.0.0.0:51511
+  NAT 类型         : 未知 / 无法判定
+  映射一致性       : 稳定
+  观察到的映射集合 : 104.28.152.131:28438
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 104.28.152.131:28438
+      响应来源 : 77.72.169.212:3478
+      RTT      : 330 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 ()
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 ()
+
+---- 第 34 轮 ----
+  STUN 服务器      : Annatel (stun.annatel.net:3478)
+  本地套接字       : 0.0.0.0:50253
+  NAT 类型         : 未知 / 无法判定
+  映射一致性       : 稳定
+  观察到的映射集合 : 104.28.152.131:28179
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 104.28.152.131:28179
+      响应来源 : 88.218.220.40:3478
+      RTT      : 365 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 ()
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 ()
+
+---- 第 35 轮 ----
+  STUN 服务器      : AntiSIP (stun.antisip.com:3478)
+  本地套接字       : 0.0.0.0:58016
+  NAT 类型         : UDP 被阻止 / 对称型 UDP 防火墙
+  映射一致性       : 稳定
+  [Test 1] Binding Request (Test I)
+      状态     : 失败 (发送失败: 使用了与请求的协议不兼容的地址。 (os error 10047))
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 ()
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 ()
+
+---- 第 36 轮 ----
+  STUN 服务器      : Cablenet (stun.cablenet-as.net:3478)
+  本地套接字       : 0.0.0.0:57555
+  NAT 类型         : 未知 / 无法判定
+  映射一致性       : 稳定
+  观察到的映射集合 : 104.28.152.131:29447
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 104.28.152.131:29447
+      响应来源 : 213.140.209.236:3478
+      RTT      : 402 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 ()
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 ()
+
+---- 第 37 轮 ----
+  STUN 服务器      : CheapVoIP (stun.cheapvoip.com:3478)
+  本地套接字       : 0.0.0.0:59649
+  NAT 类型         : 未知 / 无法判定
+  映射一致性       : 稳定
+  观察到的映射集合 : 104.28.152.131:28216
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 104.28.152.131:28216
+      响应来源 : 77.72.169.212:3478
+      RTT      : 343 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 ()
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 ()
+
+==============================================
+                    报告结束
+==============================================

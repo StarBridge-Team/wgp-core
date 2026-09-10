@@ -1,0 +1,766 @@
+==============================================
+        NAT 类型检测报告 (小米 STUN)
+==============================================
+STUN 服务器       : stun.miwifi.com:3478
+检测轮次          : 50
+开始时间          : 2026-06-26 20:44:26
+结束时间          : 2026-06-26 20:47:23
+耗时              : 177 秒
+----------------------------------------------
+【一、综合结论】
+判定 NAT 类型     : 端口受限锥形 NAT (Port Restricted Cone NAT)
+本机公网 IP       : 222.244.77.90
+本机公网端口      : 5888
+观察到的不同映射  : 42 个 -> 222.244.77.90:5888, 222.244.77.90:8000, 222.244.77.90:5312, 222.244.77.90:4864, 222.244.77.90:4992, 222.244.77.90:5056, 222.244.77.90:5184, 222.244.77.90:4160, 222.244.77.90:5952, 222.244.77.90:6720, 222.244.77.90:7488, 222.244.77.90:7808, 222.244.77.90:5121, 222.244.77.90:4929, 222.244.77.90:7617, 222.244.77.90:6529, 222.244.77.90:7040, 222.244.77.90:5250, 222.244.77.90:4418, 222.244.77.90:6338, 222.244.77.90:4610, 222.244.77.90:8130, 222.244.77.90:7170, 222.244.77.90:4225, 222.244.77.90:6017, 222.244.77.90:6914, 222.244.77.90:4098, 222.244.77.90:6657, 222.244.77.90:7232, 222.244.77.90:6721, 222.244.77.90:7489, 222.244.77.90:7104, 222.244.77.90:6528, 222.244.77.90:7360, 222.244.77.90:6209, 222.244.77.90:7041, 222.244.77.90:4544, 222.244.77.90:4352, 222.244.77.90:5632, 222.244.77.90:4736, 222.244.77.90:4609, 222.244.77.90:6977
+RTT 最小 / 最大 / 平均 : 45 / 72 / 61 ms
+----------------------------------------------
+【二、本机/网络信息 (公网 IP 归属地)】
+  IP              : 222.244.77.90
+  国家            : China
+  地区/省         : Hunan
+  城市            : Changsha
+  邮政编码        : -
+  运营商/组织     : Chinanet
+  ASN             : AS4134
+  时区            : Asia/Shanghai
+  坐标            : 28.2014, 112.9611
+----------------------------------------------
+【三、检测结果统计】
+  PortRestrictedCone     : 42 次
+  UdpBlocked             : 8 次
+----------------------------------------------
+【四、检测方法说明】
+  Test I   : 普通 Binding Request,获取映射地址
+  Test II  : 带 CHANGE-REQUEST(change-port) 标志,探测是否能从不同端口接收响应
+  Test III : 带 CHANGE-REQUEST(change-ip + change-port),探测是否能从不同 IP 接收响应
+  附加     : 多次 Test I,观察映射地址是否变化,用于识别 Symmetric NAT
+  分类规则 (单服务器简化版) :
+    - Test I 失败                       -> UDP Blocked
+    - 映射稳定 + Test II/III 成功       -> Open Internet
+    - 映射稳定 + Test II 成功           -> Full Cone NAT
+    - 映射稳定 + Test II 失败           -> Port Restricted Cone NAT
+    - 映射变化                          -> Symmetric NAT
+----------------------------------------------
+【五、逐轮详细数据】
+
+---- 第 1 轮 ----
+  本地套接字       : 0.0.0.0:63606
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 222.244.77.90:5888
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 222.244.77.90:5888
+      响应来源 : 111.206.174.2:3478
+      RTT      : 69 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 2 轮 ----
+  本地套接字       : 0.0.0.0:57527
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 222.244.77.90:8000
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 222.244.77.90:8000
+      响应来源 : 111.206.174.2:3478
+      RTT      : 67 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 3 轮 ----
+  本地套接字       : 0.0.0.0:61558
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 222.244.77.90:5312
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 222.244.77.90:5312
+      响应来源 : 111.206.174.2:3478
+      RTT      : 72 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 4 轮 ----
+  本地套接字       : 0.0.0.0:61418
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 222.244.77.90:4864
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 222.244.77.90:4864
+      响应来源 : 111.206.174.2:3478
+      RTT      : 68 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 5 轮 ----
+  本地套接字       : 0.0.0.0:61331
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 222.244.77.90:4992
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 222.244.77.90:4992
+      响应来源 : 111.206.174.2:3478
+      RTT      : 48 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 6 轮 ----
+  本地套接字       : 0.0.0.0:52427
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 222.244.77.90:5056
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 222.244.77.90:5056
+      响应来源 : 111.206.174.2:3478
+      RTT      : 48 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 7 轮 ----
+  本地套接字       : 0.0.0.0:53975
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 222.244.77.90:5184
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 222.244.77.90:5184
+      响应来源 : 111.206.174.2:3478
+      RTT      : 71 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 8 轮 ----
+  本地套接字       : 0.0.0.0:52999
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 222.244.77.90:4160
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 222.244.77.90:4160
+      响应来源 : 111.206.174.2:3478
+      RTT      : 47 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 9 轮 ----
+  本地套接字       : 0.0.0.0:53000
+  NAT 类型         : UDP 被阻止 / 对称型 UDP 防火墙
+  映射一致性       : 变化
+  [Test 1] Binding Request (Test I)
+      状态     : 失败 (响应超时)
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 ()
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 ()
+
+---- 第 10 轮 ----
+  本地套接字       : 0.0.0.0:53245
+  NAT 类型         : UDP 被阻止 / 对称型 UDP 防火墙
+  映射一致性       : 变化
+  [Test 1] Binding Request (Test I)
+      状态     : 失败 (响应超时)
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 ()
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 ()
+
+---- 第 11 轮 ----
+  本地套接字       : 0.0.0.0:58347
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 222.244.77.90:5952
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 222.244.77.90:5952
+      响应来源 : 111.206.174.2:3478
+      RTT      : 67 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 12 轮 ----
+  本地套接字       : 0.0.0.0:61133
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 222.244.77.90:6720
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 222.244.77.90:6720
+      响应来源 : 111.206.174.2:3478
+      RTT      : 71 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 13 轮 ----
+  本地套接字       : 0.0.0.0:61134
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 222.244.77.90:7488
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 222.244.77.90:7488
+      响应来源 : 111.206.174.2:3478
+      RTT      : 52 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 14 轮 ----
+  本地套接字       : 0.0.0.0:61729
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 222.244.77.90:7808
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 222.244.77.90:7808
+      响应来源 : 111.206.174.2:3478
+      RTT      : 49 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 15 轮 ----
+  本地套接字       : 0.0.0.0:61730
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 222.244.77.90:5121
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 222.244.77.90:5121
+      响应来源 : 111.206.174.2:3478
+      RTT      : 67 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 16 轮 ----
+  本地套接字       : 0.0.0.0:61731
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 222.244.77.90:4929
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 222.244.77.90:4929
+      响应来源 : 111.206.174.2:3478
+      RTT      : 53 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 17 轮 ----
+  本地套接字       : 0.0.0.0:50289
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 222.244.77.90:7617
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 222.244.77.90:7617
+      响应来源 : 111.206.174.2:3478
+      RTT      : 49 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 18 轮 ----
+  本地套接字       : 0.0.0.0:52632
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 222.244.77.90:6529
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 222.244.77.90:6529
+      响应来源 : 111.206.174.2:3478
+      RTT      : 66 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 19 轮 ----
+  本地套接字       : 0.0.0.0:51828
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 222.244.77.90:7040
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 222.244.77.90:7040
+      响应来源 : 111.206.174.2:3478
+      RTT      : 49 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 20 轮 ----
+  本地套接字       : 0.0.0.0:64811
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 222.244.77.90:5250
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 222.244.77.90:5250
+      响应来源 : 111.206.174.2:3478
+      RTT      : 48 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 21 轮 ----
+  本地套接字       : 0.0.0.0:64055
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 222.244.77.90:4418
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 222.244.77.90:4418
+      响应来源 : 111.206.174.2:3478
+      RTT      : 50 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 22 轮 ----
+  本地套接字       : 0.0.0.0:60640
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 222.244.77.90:6338
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 222.244.77.90:6338
+      响应来源 : 111.206.174.2:3478
+      RTT      : 72 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 23 轮 ----
+  本地套接字       : 0.0.0.0:59073
+  NAT 类型         : UDP 被阻止 / 对称型 UDP 防火墙
+  映射一致性       : 变化
+  [Test 1] Binding Request (Test I)
+      状态     : 失败 (响应超时)
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 ()
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 ()
+
+---- 第 24 轮 ----
+  本地套接字       : 0.0.0.0:60802
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 222.244.77.90:4610
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 222.244.77.90:4610
+      响应来源 : 111.206.174.2:3478
+      RTT      : 69 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 25 轮 ----
+  本地套接字       : 0.0.0.0:65030
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 222.244.77.90:8130
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 222.244.77.90:8130
+      响应来源 : 111.206.174.2:3478
+      RTT      : 65 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 26 轮 ----
+  本地套接字       : 0.0.0.0:64047
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 222.244.77.90:7170
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 222.244.77.90:7170
+      响应来源 : 111.206.174.2:3478
+      RTT      : 67 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 27 轮 ----
+  本地套接字       : 0.0.0.0:63835
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 222.244.77.90:4225
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 222.244.77.90:4225
+      响应来源 : 111.206.174.2:3478
+      RTT      : 46 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 28 轮 ----
+  本地套接字       : 0.0.0.0:64754
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 222.244.77.90:6017
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 222.244.77.90:6017
+      响应来源 : 111.206.174.2:3478
+      RTT      : 47 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 29 轮 ----
+  本地套接字       : 0.0.0.0:60379
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 222.244.77.90:6914
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 222.244.77.90:6914
+      响应来源 : 111.206.174.2:3478
+      RTT      : 70 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 30 轮 ----
+  本地套接字       : 0.0.0.0:57815
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 222.244.77.90:4098
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 222.244.77.90:4098
+      响应来源 : 111.206.174.2:3478
+      RTT      : 51 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 31 轮 ----
+  本地套接字       : 0.0.0.0:58610
+  NAT 类型         : UDP 被阻止 / 对称型 UDP 防火墙
+  映射一致性       : 变化
+  [Test 1] Binding Request (Test I)
+      状态     : 失败 (响应超时)
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 ()
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 ()
+
+---- 第 32 轮 ----
+  本地套接字       : 0.0.0.0:58611
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 222.244.77.90:6657
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 222.244.77.90:6657
+      响应来源 : 111.206.174.2:3478
+      RTT      : 71 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 33 轮 ----
+  本地套接字       : 0.0.0.0:54770
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 222.244.77.90:7232
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 222.244.77.90:7232
+      响应来源 : 111.206.174.2:3478
+      RTT      : 67 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 34 轮 ----
+  本地套接字       : 0.0.0.0:55893
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 222.244.77.90:6721
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 222.244.77.90:6721
+      响应来源 : 111.206.174.2:3478
+      RTT      : 68 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 35 轮 ----
+  本地套接字       : 0.0.0.0:61980
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 222.244.77.90:7489
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 222.244.77.90:7489
+      响应来源 : 111.206.174.2:3478
+      RTT      : 71 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 36 轮 ----
+  本地套接字       : 0.0.0.0:64725
+  NAT 类型         : UDP 被阻止 / 对称型 UDP 防火墙
+  映射一致性       : 变化
+  [Test 1] Binding Request (Test I)
+      状态     : 失败 (响应超时)
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 ()
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 ()
+
+---- 第 37 轮 ----
+  本地套接字       : 0.0.0.0:64726
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 222.244.77.90:7104
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 222.244.77.90:7104
+      响应来源 : 111.206.174.2:3478
+      RTT      : 53 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 38 轮 ----
+  本地套接字       : 0.0.0.0:65055
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 222.244.77.90:6528
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 222.244.77.90:6528
+      响应来源 : 111.206.174.2:3478
+      RTT      : 45 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 39 轮 ----
+  本地套接字       : 0.0.0.0:65056
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 222.244.77.90:7360
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 222.244.77.90:7360
+      响应来源 : 111.206.174.2:3478
+      RTT      : 66 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 40 轮 ----
+  本地套接字       : 0.0.0.0:65057
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 222.244.77.90:6209
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 222.244.77.90:6209
+      响应来源 : 111.206.174.2:3478
+      RTT      : 67 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 41 轮 ----
+  本地套接字       : 0.0.0.0:61198
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 222.244.77.90:7041
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 222.244.77.90:7041
+      响应来源 : 111.206.174.2:3478
+      RTT      : 69 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 42 轮 ----
+  本地套接字       : 0.0.0.0:65495
+  NAT 类型         : UDP 被阻止 / 对称型 UDP 防火墙
+  映射一致性       : 变化
+  [Test 1] Binding Request (Test I)
+      状态     : 失败 (响应超时)
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 ()
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 ()
+
+---- 第 43 轮 ----
+  本地套接字       : 0.0.0.0:65496
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 222.244.77.90:4544
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 222.244.77.90:4544
+      响应来源 : 111.206.174.2:3478
+      RTT      : 65 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 44 轮 ----
+  本地套接字       : 0.0.0.0:50313
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 222.244.77.90:4352
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 222.244.77.90:4352
+      响应来源 : 111.206.174.2:3478
+      RTT      : 72 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 45 轮 ----
+  本地套接字       : 0.0.0.0:50314
+  NAT 类型         : UDP 被阻止 / 对称型 UDP 防火墙
+  映射一致性       : 变化
+  [Test 1] Binding Request (Test I)
+      状态     : 失败 (响应超时)
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 ()
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 ()
+
+---- 第 46 轮 ----
+  本地套接字       : 0.0.0.0:54052
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 222.244.77.90:5632
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 222.244.77.90:5632
+      响应来源 : 111.206.174.2:3478
+      RTT      : 71 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 47 轮 ----
+  本地套接字       : 0.0.0.0:57465
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 222.244.77.90:4736
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 222.244.77.90:4736
+      响应来源 : 111.206.174.2:3478
+      RTT      : 67 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 48 轮 ----
+  本地套接字       : 0.0.0.0:56232
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 222.244.77.90:4609
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 222.244.77.90:4609
+      响应来源 : 111.206.174.2:3478
+      RTT      : 67 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 49 轮 ----
+  本地套接字       : 0.0.0.0:60023
+  NAT 类型         : 端口受限锥形 NAT (Port Restricted Cone NAT)
+  映射一致性       : 稳定
+  观察到的映射集合 : 222.244.77.90:6977
+  [Test 1] Binding Request (Test I)
+      状态     : 成功
+      映射地址 : 222.244.77.90:6977
+      响应来源 : 111.206.174.2:3478
+      RTT      : 51 ms
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 (响应超时)
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 (响应超时)
+
+---- 第 50 轮 ----
+  本地套接字       : 0.0.0.0:62583
+  NAT 类型         : UDP 被阻止 / 对称型 UDP 防火墙
+  映射一致性       : 变化
+  [Test 1] Binding Request (Test I)
+      状态     : 失败 (响应超时)
+  [Test 2] CHANGE-REQUEST change-port (Test II)
+      状态     : 失败 ()
+  [Test 3] CHANGE-REQUEST change-ip+port (Test III)
+      状态     : 失败 ()
+
+==============================================
+                    报告结束
+==============================================

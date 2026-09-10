@@ -1,0 +1,34 @@
+#!/usr/sbin/nft -f
+# wgp-node 源站流量整形（07 §7 技术级加固）
+# 原则：协议本身是小包低频（正常流量远低于限速），超频即视为滥用。
+flush ruleset
+
+table inet wgp {
+    # 白名单：允许的入站端口（UDP：DHT 3841 + STUN 3478）
+    set protected_udp {
+        type inet_service
+        elements = { 3841, 3478 }
+    }
+
+    chain input {
+        type filter hook input priority filter; policy drop;
+
+        # 回环与已建连接放行
+        iif "lo" accept
+        ct state established,related accept
+
+        # 完全静默：不回 ICMP（减扫描发现面）
+        ip protocol icmp drop
+        ip6 nexthdr icmpv6 drop
+
+        # 业务 UDP：单 IP 限速（每 10 秒 40 包；正常 ping/打洞信令远低于此）
+        udp dport @protected_udp ct state new counter hashlimit \
+            name wgp-udp \
+            above 40/10sec burst 20 packets \
+            drop
+        udp dport @protected_udp accept
+
+        # 其余全拒
+        counter drop
+    }
+}

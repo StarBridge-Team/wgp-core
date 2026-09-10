@@ -1,0 +1,8 @@
+[package]
+name = "wgp-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "折跃门协议层：包格式/常量/编解码 + STUN 最小子集（无 IO、无 async）"
+
+[dependencies]
