@@ -1,0 +1,29 @@
+[Unit]
+Description=wgp-node-hobby (ZheYueMen P2P contributor seed/observer/STUN, relay-denied)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# 工作目录：存放 node_identity.key（身份持久化，勿删除）
+WorkingDirectory=/opt/wgp-node
+# 部署参数不写死在单元里：二进制默认值即 07 §6 规格
+# （bind 0.0.0.0:11010 + stun 3478 + tcp 3481），需要变更时用环境文件覆盖：
+#   sudo cp server/deploy/wgp-node.env.example /etc/wgp-node/env
+#   然后取消注释所需键（WGP_BIND / WGP_STUN / ...），systemctl restart
+# 前缀 "-" 表示文件可以不存在；键名与 server.rs collect_env() 一一对应
+EnvironmentFile=-/etc/wgp-node/env
+# 贡献版二进制内部强制 force_hobby（拒绝 Forward 中转），无需也无法传参关闭
+ExecStart=/opt/wgp-node/wgp-node-hobby
+# 身份文件敏感性：仅本服务可读（07 §8 防身份漂移）
+User=wgp
+Group=wgp
+Restart=on-failure
+RestartSec=5
+# 无状态服务：无需大内存；限一下防止异常
+MemoryMax=256M
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,12 @@
+[package]
+name = "wgp-node"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "折跃门服务端节点程序（双形态：wgp-node 静态IP完整版 / wgp-node-hobby 家庭宽带贡献版，07 §6/§7）"
+
+[dependencies]
+wgp-core = { path = "../../kernel/wgp-core", default-features = false, features = ["node"] }
+wgp-dht = { path = "../../kernel/wgp-dht" }
+rand_core = { workspace = true }
+tokio = { workspace = true }

@@ -1,15 +1,24 @@
 [workspace]
+members = [
+    "kernel/wgp-proto",
+    "kernel/wgp-crypto",
+    "kernel/wgp-punch",
+    "kernel/wgp-dht",
+    "kernel/wgp-core",
+    "server/wgp-node",
+    "client/wgp-client",
+]
 resolver = "2"
-members = ["crates/*", "apps/*"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
+authors = ["折跃门团队"]
+license = "MIT"
 
 [workspace.dependencies]
-# L1 硬许可依赖（00 架构总览 §8）
-tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros", "io-util", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros", "io-util", "signal", "fs"] }
 socket2 = "0.5"
 x25519-dalek = { version = "2", features = ["getrandom", "zeroize", "static_secrets"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }

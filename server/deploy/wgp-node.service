@@ -1,0 +1,26 @@
+[Unit]
+Description=wgp-node (ZheYueMen P2P seed/observer/STUN/commit-forward)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# 工作目录：存放 node_identity.key（身份持久化，勿删除）
+WorkingDirectory=/opt/wgp-node
+# 参数：--bind(--stun/--tcp 为 UDP 11010 / STUN 3478 / 信令 TCP 3481)；
+#   静态 IP 完整版：wgp-node --bind ... --stun 3478 --tcp 3481
+ExecStart=/opt/wgp-node/wgp-node --bind 0.0.0.0:11010 --stun 3478 --tcp 3481
+# 可选项：--identity /opt/wgp-node/node_identity.key --observer-rate-limit 12
+#         --observer-rate-window 10 --log-level info
+# 身份文件敏感性：仅本服务可读（07 §8 防身份漂移）
+User=wgp
+Group=wgp
+Restart=on-failure
+RestartSec=5
+# 无状态服务：无需大内存；限一下防止异常
+MemoryMax=256M
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

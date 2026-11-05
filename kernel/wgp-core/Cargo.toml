@@ -1,0 +1,25 @@
+[package]
+name = "wgp-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "折跃门内核门面：Engine + PunchedLink 交付物 + 全部对外接口（14 文档的代码落点）"
+
+[features]
+# client = 全量（打洞/信令/密钥导出/载体）；node = 仅服务端四职（DHT/观察者/STUN/兜底转发）
+default = ["client"]
+client = ["dep:wgp-punch", "dep:wgp-crypto", "dep:rand_core", "dep:sha2"]
+node = []
+
+[dependencies]
+wgp-proto = { path = "../wgp-proto" }
+wgp-dht = { path = "../wgp-dht" }
+wgp-punch = { path = "../wgp-punch", optional = true }
+wgp-crypto = { path = "../wgp-crypto", optional = true }
+rand_core = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+tokio = { workspace = true }
+socket2 = { workspace = true }
+
+[dev-dependencies]
+rand_core = { workspace = true }
