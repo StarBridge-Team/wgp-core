@@ -16,7 +16,6 @@ client/wgp-client 客户端参考外围：code / 开房 / join
 docs/             设计文档 12 篇（00-16 编号）
 项目完整文档/      按代码现状撰写的全量文档 15 篇（逐个源文件）
 nat/              NAT 实测数据
-vendor/           外部代码：mesh-tun-proto（EasyTier 协议兼容层，独立构建）
 ```
 
 ## 构建与测试
@@ -46,7 +45,15 @@ wgp-client 开房 --network-name <网络名> --network-secret <网络密钥> -p 
 
 - 先读 [`项目完整文档/00-项目总览.md`](项目完整文档/00-项目总览.md)，再按文末路线深入
 - 写代码前必读 [`项目完整文档/03-代码编写硬规矩与规范.md`](项目完整文档/03-代码编写硬规矩与规范.md)
-- 本次拼装与验证记录见 [`STATUS.md`](STATUS.md)
+- 本次拼装与验证记录见 [`STATUS.md`](STATUS.md)、现状盘点见 [`PROGRESS.md`](PROGRESS.md)
+
+## EasyTier 兼容（不在本仓）
+
+上游 EasyTier 是 **LGPL-3.0**，且 ET 协议层依赖 protobuf（本仓内核明令禁止）。
+因此 ET 协议兼容层 `mesh-tun-proto` 单独建仓：**StarBridge-Team/mesh-tun-proto**，本仓不链接它。
+
+合规路径建议（见该仓 `LICENSING.md`）：把桥接做成**独立进程**（`wgp-et-bridge`），
+本仓与它通过本地 socket 通信，而非静态链接——这样 LGPL 不会覆盖 wgp 本体。
 
 > 上线前须知：内核交付物是 `PunchedLink`（UDP socket / TCP 流 + 会话密钥），
 > 数据面（QUIC-TLS / TLS-PSK 帧流 / 端口转发 / 虚拟网卡）属于外围任务，尚未实现。
