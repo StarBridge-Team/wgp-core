@@ -8,6 +8,8 @@ members = [
     "server/wgp-node",
     "client/wgp-client",
 ]
+# vendor/ 放外部代码（EasyTier 协议兼容层），独立构建，不进本 workspace
+exclude = ["vendor"]
 resolver = "2"
 
 [workspace.package]

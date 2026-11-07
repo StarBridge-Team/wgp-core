@@ -1,0 +1,35 @@
+[package]
+name = "mesh-tun-proto"
+version = "0.1.0"
+edition = "2021"
+description = "Lightweight mesh protocol layer: TUN-capable IPv4 forwarding + user-data frames over an authenticated encrypted relay"
+
+[features]
+default = []
+
+# 默认关闭：SOCKS5 / 端口转发 / smoltcp 风格 L4 套接字（非 P2P 核心）
+proxy = ["tokio/full"]
+
+[dependencies]
+bytes = "1"
+aes-gcm = "0.10"
+prost = "0.13"
+prost-types = "0.13"
+rand = "0.8"
+anyhow = "1"
+thiserror = "1"
+hex = "0.4"
+stun = "0.5"
+
+# proxy 功能需要 tokio full runtime；非 proxy 场景最小化依赖
+[dependencies.tokio]
+version = "1"
+default-features = false
+features = ["rt", "time", "sync", "io-util"]
+
+[build-dependencies]
+prost-build = "0.13"
+
+[[bin]]
+name = "mesh-tun-proto"
+required-features = ["proxy"]

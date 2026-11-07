@@ -1,6 +1,10 @@
 # 构建产物
 /target/
 
+# vendor/ 下外部 crate 独立构建的产物（它们不进本 workspace）
+/vendor/*/target/
+/vendor/*/Cargo.lock
+
 # 预编译对照件（来自 external release 包，不入库）
 /release-prebuilt/
 

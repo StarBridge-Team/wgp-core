@@ -16,6 +16,7 @@ client/wgp-client 客户端参考外围：code / 开房 / join
 docs/             设计文档 12 篇（00-16 编号）
 项目完整文档/      按代码现状撰写的全量文档 15 篇（逐个源文件）
 nat/              NAT 实测数据
+vendor/           外部代码：mesh-tun-proto（EasyTier 协议兼容层，独立构建）
 ```
 
 ## 构建与测试
