@@ -96,9 +96,19 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
                 .ok_or_else(|| format!("选项 {flag} 需要一个值"))
         };
         match flag.as_str() {
-            "--name" | "-n" => o.name = Some(take(&mut i)?),
-            "--key" | "-k" => o.key = Some(take(&mut i)?),
-            "--seed" | "-s" => o.seed = Some(take(&mut i)?),
+            // 网络身份：`--name/--key` 与 EasyTier 习惯的
+            // `--network-name/--network-secret` 是同一组语义，全部接受
+            "--name" | "-n" | "--network-name" => o.name = Some(take(&mut i)?),
+            "--key" | "-k" | "--network-secret" | "--secret" => o.key = Some(take(&mut i)?),
+            // 种子端点：`--seed/-s` 与 EasyTier 习惯的 `--peers/-p` 等价；
+            // 可重复给多次（也支持单个值内逗号/分号/空白分隔）
+            "--seed" | "-s" | "--peers" | "-p" => {
+                let one = take(&mut i)?;
+                o.seed = Some(match o.seed.take() {
+                    Some(prev) => format!("{prev},{one}"),
+                    None => one,
+                });
+            }
             "--storage" => o.storage = Some(take(&mut i)?),
             "--observer" => o.observer = Some(take(&mut i)?),
             "--identity" | "-i" => o.identity = Some(PathBuf::from(take(&mut i)?)),
@@ -161,15 +171,35 @@ fn cmd_host(args: &[String]) -> Result<(), String> {
 }
 
 /// 加入房间
+///
+/// 两种写法等价：
+///   join <U/房间码>                                    —— 房主把码发给你
+///   join --network-name N --network-secret S           —— 双方各自持有网络名+密钥，本地派生
 fn cmd_join(args: &[String]) -> Result<(), String> {
     let opts = parse_opts(args)?;
-    let code = opts
-        .positional
-        .first()
-        .cloned()
-        .ok_or("缺少房间码：join <U/房间码>")?;
+    let code = resolve_join_code(&opts)?;
     println!("房间码  : {code}");
     run_room(&code, opts)
+}
+
+/// 解析加入目标：显式房间码优先，否则由「网络名 + 网络密钥」在本地派生
+fn resolve_join_code(opts: &Opts) -> Result<String, String> {
+    if let Some(code) = opts.positional.first() {
+        return Ok(code.clone());
+    }
+    match (&opts.name, &opts.key) {
+        (Some(name), Some(key)) => {
+            let code = derive_room_code(name, key);
+            println!("网络    : {name}");
+            println!("派生房间码: {code}");
+            Ok(code)
+        }
+        _ => Err(
+            "缺少加入目标：给 `join <U/房间码>`，或改用 \
+             `join --network-name <网络名> --network-secret <网络密钥>` 在本地派生"
+                .to_string(),
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -463,13 +493,20 @@ fn print_help() {
         "折跃门客户端 v{VERSION}（14 文档的参考外围：仅装配 + 呈现，无协议实现）\n\
          \n\
          用法：\n\
-           wgp-client code <房间名> <房间密钥>              离线派生房间码\n\
-           wgp-client 开房 [--name N] [--key K] [选项]      创建房间（房主 + 锚点）\n\
-           wgp-client join <U/房间码> [选项]                加入房间\n\
+           wgp-client code <网络名> <网络密钥>                离线派生房间码\n\
+           wgp-client 开房 <选项>                            创建房间（房主 + 锚点）\n\
+           wgp-client join <U/房间码> <选项>                  按房间码加入\n\
+           wgp-client join --network-name N --network-secret S <选项>\n\
+                                                             按网络名+密钥加入（本地派生，无需交换码）\n\
+         \n\
+         网络身份（两种写法等价，后者为 EasyTier 习惯）：\n\
+           -n, --name <名字>              等价 --network-name\n\
+           -k, --key <密钥>               等价 --network-secret / --secret\n\
          \n\
          选项：\n\
-           -s, --seed <list>      种子端点（逗号/分号/空白分隔）\n\
+           -s, --seed <list>      种子端点（可重复；也支持逗号/分号/空白分隔）\n\
                                   udp://host:port 或 tcp://host:port\n\
+           -p, --peers <list>     等价 --seed（EasyTier 习惯）\n\
            --storage <ep>         显式房间键存储节点（默认取最快 UDP 种子）\n\
            --observer <list>      观察者/STUN 端点，逗号分隔 ip:port（缺省跳过 NAT 探测，自动降级 TCP 兜底）\n\
            -i, --identity <path>  身份文件（默认 {DEFAULT_IDENTITY_FILE}）\n\
@@ -482,8 +519,9 @@ fn print_help() {
          \n\
          示例：\n\
            wgp-client code 示例房间 123456\n\
-           wgp-client 开房 --name 示例房间 --key 123456 --seed udp://轻松.躺进.icu:11010\n\
-           wgp-client join U/C2G9-GYET-311W-R636 --seed udp://轻松.躺进.icu:11010"
+           wgp-client 开房 --network-name 示例房间 --network-secret 123456 -p udp://轻松.躺进.icu:11010\n\
+           wgp-client join --network-name 示例房间 --network-secret 123456 -p udp://轻松.躺进.icu:11010\n\
+           wgp-client join U/C2G9-GYET-311W-R636 -p udp://轻松.躺进.icu:11010"
     );
 }
 
@@ -519,5 +557,55 @@ mod tests {
         // 13 文档测试向量
         let code = derive_room_code("示例房间", "123456");
         assert_eq!(code, "U/C2G9-GYET-311W-R636");
+    }
+
+    #[test]
+    fn join_accepts_easytier_style_network_flags() {
+        // --network-name / --network-secret 与 --name / --key 同义
+        let o = parse_opts(&v(&[
+            "--network-name",
+            "示例房间",
+            "--network-secret",
+            "123456",
+        ]))
+        .unwrap();
+        assert_eq!(o.name.as_deref(), Some("示例房间"));
+        assert_eq!(o.key.as_deref(), Some("123456"));
+        // 无位置参数时由网络身份本地派生，结果与 code 子命令一致
+        assert_eq!(resolve_join_code(&o).unwrap(), "U/C2G9-GYET-311W-R636");
+    }
+
+    #[test]
+    fn join_prefers_explicit_room_code_over_network_flags() {
+        let o = parse_opts(&v(&[
+            "U/8SRU-FM1Q-XTDQ-LL36",
+            "--network-name",
+            "示例房间",
+            "--network-secret",
+            "123456",
+        ]))
+        .unwrap();
+        assert_eq!(resolve_join_code(&o).unwrap(), "U/8SRU-FM1Q-XTDQ-LL36");
+    }
+
+    #[test]
+    fn join_without_code_or_network_identity_errors() {
+        let o = parse_opts(&v(&["--peers", "udp://127.0.0.1:11010"])).unwrap();
+        assert!(resolve_join_code(&o).is_err());
+    }
+
+    #[test]
+    fn peers_alias_accumulates_like_easytier() {
+        // 可重复给多次，内部合并成一个列表
+        let o = parse_opts(&v(&[
+            "-p",
+            "udp://a:1",
+            "--peers",
+            "tcp://b:2",
+            "--seed",
+            "c:3",
+        ]))
+        .unwrap();
+        assert_eq!(o.seed.as_deref(), Some("udp://a:1,tcp://b:2,c:3"));
     }
 }

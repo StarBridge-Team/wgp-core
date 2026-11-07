@@ -31,11 +31,15 @@ cargo build --release         # LTO release，产出 wgp-node / wgp-node-hobby /
 # 种子 + 观察者（默认三端口：UDP 11010 信令 / UDP 3478 STUN / TCP 3481 信令兜底）
 wgp-node --bind 0.0.0.0:11010 --stun 3478 --tcp 3481
 
-# 房主
-wgp-client 开房 --name 测试房 --key <房间密钥> --seed udp://<种子>:11010
-# 加入（贴入房主打印的 U/ 码）
-wgp-client join U/xxxx-xxxx-xxxx-xxxx --seed udp://<种子>:11010
+# 加入一个网络：一条命令，不需要房间码、不需要配置文件
+wgp-client join --network-name <网络名> --network-secret <网络密钥> -p udp://<种子>:11010
+
+# 房主（同样可用 --network-name/--network-secret）
+wgp-client 开房 --network-name <网络名> --network-secret <网络密钥> -p udp://<种子>:11010
 ```
+
+网络名 + 网络密钥即 EasyTier 的 `network_name` / `network_secret`；两者由客户端本地派生成房间码，
+所以**两端不需要交换任何码**。房主要分享时再执行 `wgp-client code <网络名> <网络密钥>` 把码发出去即可。
 
 ## 文档
 
