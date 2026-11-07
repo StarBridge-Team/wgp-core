@@ -2,6 +2,8 @@
 
 两端业务数据端到端直连，种子节点只承担信令与端点观测，永不转发业务流量。
 
+许可证：**GPL-3.0-or-later**（上游链条：EasyTier LGPL → mesh-tun-proto LGPL → **wgp GPL** → mc-link GPL）。
+
 ## 目录
 
 ```
@@ -47,13 +49,14 @@ wgp-client 开房 --network-name <网络名> --network-secret <网络密钥> -p 
 - 写代码前必读 [`项目完整文档/03-代码编写硬规矩与规范.md`](项目完整文档/03-代码编写硬规矩与规范.md)
 - 本次拼装与验证记录见 [`STATUS.md`](STATUS.md)、现状盘点见 [`PROGRESS.md`](PROGRESS.md)
 
-## EasyTier 兼容（不在本仓）
+## EasyTier 兼容（单独建仓）
 
 上游 EasyTier 是 **LGPL-3.0**，且 ET 协议层依赖 protobuf（本仓内核明令禁止）。
-因此 ET 协议兼容层 `mesh-tun-proto` 单独建仓：**StarBridge-Team/mesh-tun-proto**，本仓不链接它。
+因此 ET 协议兼容层 `mesh-tun-proto` 单独建仓：**StarBridge-Team/mesh-tun-proto**。
 
-合规路径建议（见该仓 `LICENSING.md`）：把桥接做成**独立进程**（`wgp-et-bridge`），
-本仓与它通过本地 socket 通信，而非静态链接——这样 LGPL 不会覆盖 wgp 本体。
+本仓已选 **GPL-3.0-or-later**：LGPL 库可被 GPL 程序直接静态链接并入，
+先前"结合作品/可重链接义务"的顾虑随之解除——桥接可以做成独立进程（推荐，
+契合 `P2pNode` 同步 tick 模型），也可以直接同进程链接，均合规。详见该仓 `LICENSING.md`。
 
 > 上线前须知：内核交付物是 `PunchedLink`（UDP socket / TCP 流 + 会话密钥），
 > 数据面（QUIC-TLS / TLS-PSK 帧流 / 端口转发 / 虚拟网卡）属于外围任务，尚未实现。

@@ -15,7 +15,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
 authors = ["折跃门团队"]
-license = "MIT"
+license = "GPL-3.0-or-later"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros", "io-util", "signal", "fs"] }
