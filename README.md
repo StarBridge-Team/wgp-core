@@ -45,9 +45,12 @@ wgp-client 开房 --network-name <网络名> --network-secret <网络密钥> -p 
 
 ## 文档
 
-- 先读 [`项目完整文档/00-项目总览.md`](项目完整文档/00-项目总览.md)，再按文末路线深入
+- **接手先读**：[`HANDOFF.md`](HANDOFF.md)（本轮做了什么 / 现在在哪 / 下一步怎么走）
+- 代码现状盘点：[`PROGRESS.md`](PROGRESS.md)（逐层完成度、断点、未验证项）
+- 拼装与验证记录：[`STATUS.md`](STATUS.md)
+- 设计文档：先读 [`项目完整文档/00-项目总览.md`](项目完整文档/00-项目总览.md)，再按文末路线深入
 - 写代码前必读 [`项目完整文档/03-代码编写硬规矩与规范.md`](项目完整文档/03-代码编写硬规矩与规范.md)
-- 本次拼装与验证记录见 [`STATUS.md`](STATUS.md)、现状盘点见 [`PROGRESS.md`](PROGRESS.md)
+- DHT 身份与信任方案：[`docs/17-DHT节点身份与信任方案.md`](docs/17-DHT节点身份与信任方案.md)
 
 ## EasyTier 兼容（单独建仓）
 
