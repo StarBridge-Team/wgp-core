@@ -859,7 +859,11 @@ mod tests {
             let mut key = [0u8; 32];
             key[0] = i as u8;
             key[1] = (i >> 8) as u8;
-            store.insert(key, (vec![i as u8], now - Duration::from_secs(10_000 - i as u64)));
+            // 用 checked_sub：开机不足 10000s 时 Instant 相减会 panic（time.rs 溢出），此时退化为 now
+            let old = now
+                .checked_sub(Duration::from_secs(10_000 - i as u64))
+                .unwrap_or(now);
+            store.insert(key, (vec![i as u8], old));
         }
         // 覆盖旧 key 不逐出
         let k0 = [0u8; 32];

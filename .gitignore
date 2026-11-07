@@ -1,0 +1,14 @@
+# 构建产物
+/target/
+
+# 预编译对照件（来自 external release 包，不入库）
+/release-prebuilt/
+
+# 节点/客户端身份私钥，绝不入库
+node_identity.key
+wgp-client.key
+*.key
+
+# 运行期产物
+*.log
+*.jsonl
