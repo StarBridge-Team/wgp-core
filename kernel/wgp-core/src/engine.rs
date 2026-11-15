@@ -82,6 +82,15 @@ impl Clone for Engine {
 #[cfg(feature = "client")]
 const ROOM_UPKEEP_INTERVAL_MS: u64 = 2_000;
 
+/// 入表轮询：间隔 / 轮数（共 6s）/ 每多少轮补发一次报道（1.5s）。
+/// 锚点每 ROOM_UPKEEP_INTERVAL_MS 才处理一次报道，等待窗口要明显长于它。
+#[cfg(feature = "client")]
+const JOIN_POLL_INTERVAL_MS: u64 = 300;
+#[cfg(feature = "client")]
+const JOIN_POLL_ROUNDS: u32 = 20;
+#[cfg(feature = "client")]
+const JOIN_REREQUEST_EVERY: u32 = 5;
+
 /// 进程级单调毫秒（禁止读系统时钟；03 §3.3.2 硬约束）
 #[cfg(feature = "client")]
 fn engine_now_ms() -> u64 {
@@ -406,11 +415,14 @@ impl Engine {
         let joined = match rt.fetch(&code_str).await {
             Ok(rec) if rec.members.iter().any(|(id, _)| *id == my_id) => rec,
             Ok(rec) => {
-                // 未入表：签名报道 + 轮询等锚点处理
-                let _ = rt.request_join(&code_str, &rec).await;
+                // 未入表：签名报道 + 轮询等锚点处理。报道经 UDP 中转且没有应答，丢一个包就没了——
+                // 所以每隔几轮补发一次（锚点侧幂等），而不是只发一次然后干等
                 let mut last = rec;
-                for _ in 0..10 {
-                    tokio::time::sleep(Duration::from_millis(300)).await;
+                for round in 0..JOIN_POLL_ROUNDS {
+                    if round % JOIN_REREQUEST_EVERY == 0 {
+                        let _ = rt.request_join(&code_str, &last).await;
+                    }
+                    tokio::time::sleep(Duration::from_millis(JOIN_POLL_INTERVAL_MS)).await;
                     match rt.fetch(&code_str).await {
                         Ok(r) if r.members.iter().any(|(id, _)| *id == my_id) => {
                             last = r;
@@ -853,5 +865,60 @@ mod tests {
         assert!(matches!(link.transport, LinkTransport::Tcp { .. }));
         assert_eq!(link.peer_addr, b_tcp_bind, "TCP 交付物的对端地址 = 流的对端");
         assert!(lost_rx.try_recv().is_err(), "不应有 lost 回调");
+    }
+
+    /// 报道请求经 UDP 中转且没有应答：第一份丢了，入表不应就此失败——等待期间会定期补发。
+    /// 用「存储节点起初拒绝中转、1 秒后恢复」模拟首份报道丢失。
+    #[tokio::test]
+    async fn join_survives_a_lost_join_request() {
+        use rand_core::OsRng;
+        use wgp_dht::RelayPolicy;
+        const CODE: &str = "U/ENG-ROOM-0002-DD55";
+
+        async fn spawn_node() -> Arc<DhtNode> {
+            DhtNode::bind(
+                NodeIdentity::generate(&mut OsRng),
+                "127.0.0.1:0".parse().unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+
+        let storage = spawn_node().await;
+        let storage_addr = storage.local_addr().unwrap();
+
+        let (engine_a, _ev_a) = Engine::new();
+        let node_a = spawn_node().await;
+        node_a.ping(storage_addr).await.unwrap();
+        engine_a.attach_dht(node_a.clone(), storage_addr).await;
+        let a_handle = engine_a
+            .join_room(crate::RoomCode(CODE.to_string()), None)
+            .await
+            .expect("A 建房成功");
+
+        let (engine_b, _ev_b) = Engine::new();
+        let node_b = spawn_node().await;
+        node_b.ping(storage_addr).await.unwrap();
+        engine_b.attach_dht(node_b.clone(), storage_addr).await;
+
+        // 首份报道会被丢弃；1 秒后中转恢复，只有补发的报道才能送达锚点
+        storage.set_relay_policy(RelayPolicy::Deny).await;
+        let healer = {
+            let storage = storage.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(1000)).await;
+                storage.set_relay_policy(RelayPolicy::Allow).await;
+            })
+        };
+
+        let b_handle = engine_b
+            .join_room(crate::RoomCode(CODE.to_string()), None)
+            .await
+            .expect("补发的报道应让 B 入表");
+        assert!(b_handle.members >= 2);
+        healer.await.unwrap();
+
+        let _ = a_handle.leave();
+        let _ = b_handle.leave();
     }
 }
