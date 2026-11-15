@@ -59,3 +59,28 @@ Downloads 里另有两个目录 `libcxx等10项文件`、`build-web等7项文件
 | `f31d592` 仓库化 | 2026-11-07 | 本次拼装：根 `Cargo.toml`、nat 补齐、README/STATUS/忽略规则、测试修复 |
 
 两次快照之间：32 个源文件逐字节相同，19 个改过，新增 6 个模块（`rank`/`orchestrator`/`servers`/`endpoint`/`punycode`/`room_code`）。
+
+## 5. 2026-11-15 追加：路线图 M2–M5 的验证记录
+
+本节只记「实际跑过什么」。做了什么、还有哪些问题见 [`HANDOFF.md`](HANDOFF.md)。全部在同一台开发机上，全部是回环。
+
+| 项 | 结果 |
+|---|---|
+| `cargo check --workspace --all-targets --locked` | 通过，0 warning |
+| `cargo test --workspace` | **286 passed / 0 failed**（proto 44、crypto 13、punch 21、dht 75、core 43、port 55、node 19、client 16） |
+| `bridge/wgp-et-bridge`（独立 workspace） | 4 passed；验收用例连续 4 次通过 |
+| `cargo check` 交叉目标 | `x86_64-unknown-linux-gnu`（--all-targets）与 `x86_64-unknown-linux-musl`（--bins）均 0 warning |
+| Windows 端到端 `scripts\e2e-local.ps1` | 单种子、`-Discovery`（5 轮）、`-Discovery -Hobby` 全部 PASS；仅 hobby 种子（`-Hobby`）按预期 FAIL |
+| Linux 端到端 `scripts/e2e-local.sh` | WSL2 Ubuntu 24.04（内核 6.6），`x86_64-unknown-linux-musl` 静态二进制：单种子、`--discovery`、`--discovery --hobby` 全部 PASS |
+| release 吞吐（经转发口往返） | Windows：8MiB，单向约 33 MiB/s；WSL：4MiB，单向约 18 MiB/s |
+| 本机打包 `scripts\package.ps1` | 三个程序版本输出正常、13 文档房间码标准向量命中 |
+
+端到端脚本校验的内容：种子就绪（发现模式下两个种子互相收录）→ 房主建房 → 加入方入表 →（发现模式：两端都学到两个种子、
+选中同一个存储节点、自动选到观察者）→ 隧道就绪 → TCP 4MiB 往返逐字节一致 → UDP 40 个数据报一致 → 杀掉加入方后重启，
+隧道重新就绪且 TCP 转发恢复。
+
+两处回归测试做过变异检验（把修复临时改回旧逻辑，确认测试随之失败）：租约的跨进程时钟比较、入表只发一次报道。
+装配线阶段漂移死锁的用例则是修复前失败、修复后通过。
+
+**没有验证的**：真实 NAT、真实丢包与乱序、跨机器运行、Linux 的 systemd / nftables 部署件、除 x86_64 以外的架构
+（由 GitHub Actions 的发版流程负责，结果以该流程的实际运行为准）。

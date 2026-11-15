@@ -109,7 +109,7 @@ wgp-node-hobby --bind 0.0.0.0:11010 --stun 3478 --tcp 3481
 ```
 
 > CLI 以 `--flag value` 为准（`--bind/--stun/--tcp/--identity/--observer-rate-limit/
-> --observer-rate-window/--log-level/--config`）；配置优先级：命令行 > WGP_* 环境变量 >
+> --observer-rate-window/--log-level/--config/--advertise/--peers`）；配置优先级：命令行 > WGP_* 环境变量 >
 > `wgp-node.conf` > 默认值。旧的纯位置参数（`wgp-node 0.0.0.0:11010 3478 3481`）仅首位
 > bind 向后兼容，stun/tcp 位置值已不生效（取默认 3478/3481）。
 
@@ -156,7 +156,12 @@ sudo bash server/deploy/install-hobby.sh # 创建用户+装二进制+装单元+e
 | 环境文件 | `/etc/wgp-node/env` | 安装脚本首装从 `wgp-node.env.example` 模板创建（全注释=全默认）；**已存在则绝不覆盖**。改键后 `systemctl restart wgp-node-hobby` |
 | `wgp-node.conf` | 工作目录 | 二进制自动加载；键同 env（去 `WGP_` 前缀） |
 
-键名与 `server.rs::collect_env()` 一一对应：`WGP_BIND` / `WGP_STUN` / `WGP_TCP` / `WGP_HOBBY`（贡献版恒 true 无需设） / `WGP_OBSERVER_RATE_LIMIT` / `WGP_OBSERVER_RATE_WINDOW` / `WGP_IDENTITY` / `WGP_LOG_LEVEL` / `WGP_CONFIG`。
+键名与 `server.rs::collect_env()` 一一对应：`WGP_BIND` / `WGP_STUN` / `WGP_TCP` / `WGP_HOBBY`（贡献版恒 true 无需设） / `WGP_OBSERVER_RATE_LIMIT` / `WGP_OBSERVER_RATE_WINDOW` / `WGP_IDENTITY` / `WGP_LOG_LEVEL` / `WGP_CONFIG` / `WGP_ADVERTISE` / `WGP_PEERS`。
+
+`WGP_ADVERTISE=<本机公网IPv4>`（或 `--advertise`）让节点对外宣告自己：其他节点与客户端可以自动发现它，客户端也不必再手填观察者。
+只接受 IPv4 地址，且假定外部端口与本机端口一致（端口映射请按原号映射）；家宽换了公网 IP 要改配置并重启。宣告后身份文件旁会多一个
+`node_identity.epoch`（启动计数，请和身份文件一起保留）。`WGP_PEERS=udp://另一个种子:11010,...`（或 `--peers`）指定入网引导的其他种子。
+两者都不设时节点不参与发现，行为与以前一致。
 
 脚本可调安装位置（均有默认，不需要就不设）：`WGP_INSTALL_DIR` / `WGP_RUN_USER` / `WGP_ENV_FILE` / `WGP_BIN`。防火墙仍按 §2 手工执行 `wgp-node.nft`（该文件首行 `flush ruleset` 会清空宿主机全部规则，故脚本不代劳）。
 
