@@ -5,6 +5,7 @@ pub mod commit;
 pub mod derive;
 pub mod escape;
 pub mod ka;
+pub mod tunnel;
 #[cfg(test)]
 mod handshake_test;
 

@@ -186,6 +186,41 @@ pub mod seed_advertise {
     }
 }
 
+// ============== 数据面隧道报文（外围 bridge/wgp-port） ==============
+
+/// 数据面隧道报文的外层头部（12B，明文，整体作 AEAD 的 AAD）：
+///   magic(2) | type=0x40 | flags(1) | counter(8, BE)
+///
+/// 内核只登记类型号与外层头部布局——打洞成功后保活探针（0x10）与业务数据共用同一
+/// UDP socket，收包侧靠 [`classify`] 的类型字节分流；头部之后的密文及其帧语义属于外围
+/// 数据面（R1：内核不碰业务数据）。
+/// counter 同时是 AEAD nonce 的低 8 字节：同一密钥下严格递增、永不复用。
+pub mod tunnel {
+    pub const TYPE: u8 = 0x40;
+    pub const HEADER_LEN: usize = 12;
+
+    pub fn encode_header(flags: u8, counter: u64, out: &mut [u8; HEADER_LEN]) {
+        out[0..2].copy_from_slice(&super::SIG_MAGIC);
+        out[2] = TYPE;
+        out[3] = flags;
+        out[4..12].copy_from_slice(&counter.to_be_bytes());
+    }
+
+    /// 解出 (flags, counter)；长度不足、魔数或类型不符返回 None
+    pub fn decode_header(buf: &[u8]) -> Option<(u8, u64)> {
+        if buf.len() < HEADER_LEN {
+            return None;
+        }
+        if buf[0..2] != super::SIG_MAGIC || buf[2] != TYPE {
+            return None;
+        }
+        let counter = u64::from_be_bytes([
+            buf[4], buf[5], buf[6], buf[7], buf[8], buf[9], buf[10], buf[11],
+        ]);
+        Some((buf[3], counter))
+    }
+}
+
 /// 任意数据面报文的统一判定入口（用于 UDP 接收分流）
 pub fn classify(buf: &[u8]) -> Option<u8> {
     if buf.len() < 3 {
@@ -226,5 +261,39 @@ mod tests {
     fn seed_advertise_payload_isolation() {
         let payload = seed_advertise::payload_for_sign([1, 2, 3, 4], 3841, 3478, 0x05, 0x01);
         assert_eq!(payload.len(), seed_advertise::SIGNED_LEN);
+    }
+
+    #[test]
+    fn tunnel_header_roundtrip_and_classify() {
+        let mut hdr = [0u8; tunnel::HEADER_LEN];
+        tunnel::encode_header(0x03, 0x0102_0304_0506_0708, &mut hdr);
+        assert_eq!(tunnel::decode_header(&hdr), Some((0x03, 0x0102_0304_0506_0708)));
+        // 分流：隧道报文与探针共用魔数、靠类型字节区分
+        assert_eq!(classify(&hdr), Some(tunnel::TYPE));
+        let mut probe_buf = [0u8; probe::LEN];
+        probe::encode(
+            &Probe {
+                session_tag: [0; 4],
+                nonce: [0; 4],
+                timestamp: [0; 8],
+                auth_tag: [0; 12],
+            },
+            &mut probe_buf,
+        );
+        assert_eq!(classify(&probe_buf), Some(probe::TYPE));
+        assert_ne!(probe::TYPE, tunnel::TYPE);
+    }
+
+    #[test]
+    fn tunnel_header_rejects_short_and_foreign() {
+        let mut hdr = [0u8; tunnel::HEADER_LEN];
+        tunnel::encode_header(0, 7, &mut hdr);
+        assert!(tunnel::decode_header(&hdr[..tunnel::HEADER_LEN - 1]).is_none());
+        let mut wrong_type = hdr;
+        wrong_type[2] = probe::TYPE;
+        assert!(tunnel::decode_header(&wrong_type).is_none());
+        let mut wrong_magic = hdr;
+        wrong_magic[0] ^= 0xFF;
+        assert!(tunnel::decode_header(&wrong_magic).is_none());
     }
 }
