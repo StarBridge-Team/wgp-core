@@ -3,3 +3,8 @@
 # 我们的程序是发给别人解压即用的，所以本机构建、CI 与发版统一静态链接（Linux 发版包本来就是 musl 静态）。
 [target.'cfg(all(windows, target_env = "msvc"))']
 rustflags = ["-C", "target-feature=+crt-static"]
+
+# Linux 的 musl 目标：同样静态链接。多数 musl 目标默认就是静态的，但龙架构（loongarch64）默认动态链接，
+# 不指定的话产物会依赖目标机器上的 musl 运行库（发版流程里用 rust-lld 交叉链接时还会直接找不到库）。
+[target.'cfg(target_env = "musl")']
+rustflags = ["-C", "target-feature=+crt-static"]

@@ -100,7 +100,10 @@ jobs:
         if: matrix.verify == 'qemu'
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q qemu-user-static binfmt-support
+          sudo apt-get install -y -q qemu-user-static
+          # 各架构的执行处理器由 systemd-binfmt 按软件包带来的配置注册；装包时一般已自动完成，这里再确保一次
+          sudo systemctl restart systemd-binfmt
+          ls /proc/sys/fs/binfmt_misc/ | grep -E '^qemu-(aarch64|arm|loongarch64)$'
 
       # Windows 产物静态链接 C 运行时（.cargo/config.toml）：没装 VC++ 运行库的机器上也要能直接跑。
       # 这是静态检查，构建机上跑不了的 ARM64 产物也一并检查。
