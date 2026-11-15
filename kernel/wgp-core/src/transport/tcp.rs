@@ -16,6 +16,9 @@ use tokio::net::{TcpSocket, TcpStream};
 /// 单端口 TCP 打洞尝试超时（SYN 交叉窗口；retry 后总时长 < 800ms 波窗口）
 pub const TCP_PORT_PUNCH_TIMEOUT_MS: u64 = 250;
 
+/// 降级档 TCP keepalive 的空闲探测起始时间（秒）
+pub const TCP_KEEPALIVE_IDLE_S: u64 = 30;
+
 /// 单端口重试次数（SYN 错位在真实 NAT 与 loopback 均会发生；03 §3.5.6 重试语义）
 const PUNCH_RETRIES: u32 = 2;
 const PUNCH_RETRY_GAP_MS: u64 = 80;
@@ -78,6 +81,11 @@ impl TcpProbeCarrier {
         .ok()?
         .ok()?;
         stream.set_nodelay(true).ok(); // 02 §2.2：立即禁用 Nagle
+        // 降级档保活由 TCP keepalive 承担（14 §12）：必须显式开启——系统默认关闭，
+        // 空闲流在 NAT 上的映射到期后会被静默丢弃，外围却无从得知。
+        let keepalive =
+            socket2::TcpKeepalive::new().with_time(Duration::from_secs(TCP_KEEPALIVE_IDLE_S));
+        let _ = socket2::SockRef::from(&stream).set_tcp_keepalive(&keepalive);
 
         // ② 互发验签探针首帧
         let probe = craft_probe(

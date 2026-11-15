@@ -15,7 +15,7 @@ pub mod race;
 #[cfg(feature = "client")]
 pub use circuit::{decide_race, CircuitInput, RaceConfig, TcpTrigger};
 #[cfg(feature = "client")]
-pub use keepalive::keepalive_loop;
+pub use keepalive::{fair_share_interval_ms, keepalive_loop, BUDGET_WINDOW_MS};
 #[cfg(feature = "client")]
 pub use nat_probe::{classify_reports, NatClass, NatProbe, ObserverReport};
 #[cfg(feature = "client")]
@@ -42,6 +42,8 @@ use crate::RoomKey;
 use std::collections::HashMap;
 #[cfg(feature = "client")]
 use std::net::{IpAddr, SocketAddr};
+#[cfg(feature = "client")]
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 #[cfg(feature = "client")]
 use std::time::Duration;
@@ -69,6 +71,10 @@ impl Clone for Engine {
             storage: self.storage.clone(),
             #[cfg(feature = "client")]
             links: self.links.clone(),
+            #[cfg(feature = "client")]
+            refill_started: self.refill_started.clone(),
+            #[cfg(feature = "client")]
+            keepalive_links: self.keepalive_links.clone(),
         }
     }
 }
@@ -145,6 +151,12 @@ pub struct Engine {
     /// 活跃链路保活停止开关（release 时拉闸；14 §10 条款 4）
     #[cfg(feature = "client")]
     links: Arc<tokio::sync::Mutex<HashMap<PeerId, watch::Sender<bool>>>>,
+    /// 窗口预算回填定时器是否已启动（首次 new_link 时惰性启动；H6 的时间驱动面）
+    #[cfg(feature = "client")]
+    refill_started: Arc<AtomicBool>,
+    /// 当前在跑的保活链路数（多链路公平节拍的分母，见 keepalive::fair_share_interval_ms）
+    #[cfg(feature = "client")]
+    keepalive_links: Arc<AtomicUsize>,
 }
 
 /// 打洞会话事件流
@@ -189,6 +201,10 @@ impl Engine {
                 storage: Arc::new(tokio::sync::Mutex::new(None)),
                 #[cfg(feature = "client")]
                 links: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+                #[cfg(feature = "client")]
+                refill_started: Arc::new(AtomicBool::new(false)),
+                #[cfg(feature = "client")]
+                keepalive_links: Arc::new(AtomicUsize::new(0)),
             },
             rx,
         )
@@ -213,10 +229,25 @@ impl Engine {
         let tx = self.tx.clone();
         let budget = self.budget.clone();
         let links = self.links.clone();
+        let keepalive_links = self.keepalive_links.clone();
+        self.ensure_window_refill();
         let peer = input.peer;
         let carrier = Arc::new(input.carrier);
         tokio::spawn(async move {
             let _ = tx.send(EngineEvent::PunchingStarted { peer });
+
+            // 会话级轮预算（H6：单侧 ≤47 包/轮）：从共享窗口预扣，竞速结束归还未用部分。
+            // 每个会话独立一轮——重打洞 / mesh 多边不再共用（并耗尽）同一轮配额。
+            let session_budget = Arc::new(tokio::sync::Mutex::new(
+                budget.lock().await.reserve_round(),
+            ));
+            if session_budget.lock().await.remaining().0 == 0 {
+                // 窗口预算耗尽：本窗口内不再发任何探针，明确告知外围停止催促
+                let cause = LinkLossCause::BudgetExhausted;
+                let _ = tx.send(EngineEvent::LinkLost { peer, cause });
+                sink.on_link_lost(peer, cause);
+                return;
+            }
 
             let outcome = race_punch(
                 &carrier,
@@ -224,10 +255,13 @@ impl Engine {
                 input.model.as_ref(),
                 input.peer_ip,
                 input.seed,
-                budget.clone(),
+                session_budget.clone(),
                 input.udp_enabled,
             )
             .await;
+
+            let unused = session_budget.lock().await.clone();
+            budget.lock().await.refund_round(&unused);
 
             match outcome {
                 RaceOutcome::Udp { peer_addr, .. } => {
@@ -240,6 +274,7 @@ impl Engine {
                         transport: LinkTransport::Udp {
                             socket: carrier.socket(),
                         },
+                        peer_addr,
                         session_key: input.session_key,
                         quality: LinkQuality {
                             rtt: Duration::from_millis(0),
@@ -257,17 +292,24 @@ impl Engine {
                     let c2 = carrier.clone();
                     let budget2 = budget.clone();
                     tokio::spawn(async move {
-                        keepalive_loop(c2, peer_addr, budget2, stop_rx).await;
+                        keepalive_links.fetch_add(1, Ordering::Relaxed);
+                        keepalive_loop(c2, peer_addr, budget2, stop_rx, keepalive_links.clone())
+                            .await;
+                        keepalive_links.fetch_sub(1, Ordering::Relaxed);
                     });
                 }
                 RaceOutcome::Tcp { stream, .. } => {
                     // TCP 路径 = 降级档（00 §4 链路优先级：LAN > QUIC > TCP > ICMP）
                     // 保活由 TCP keepalive/流活性承担，内核不另发探针
                     let rank = LinkRank::Degraded;
+                    let peer_addr = stream
+                        .peer_addr()
+                        .unwrap_or_else(|_| SocketAddr::new(input.peer_ip, 0));
                     let _ = tx.send(EngineEvent::LinkYielded { peer, rank });
                     let link = PunchedLink {
                         peer_id: peer,
                         transport: LinkTransport::Tcp { stream },
+                        peer_addr,
                         session_key: input.session_key,
                         quality: LinkQuality {
                             rtt: Duration::from_millis(0),
@@ -289,6 +331,25 @@ impl Engine {
         LinkStream {
             rx: self.tx.subscribe(),
         }
+    }
+
+    /// 惰性启动窗口预算回填定时器（H6：≤500 包/10 分钟的时间驱动面）。
+    /// 弱引用持有预算：引擎及其保活任务全部销毁后，定时器在下个周期自行退出。
+    #[cfg(feature = "client")]
+    fn ensure_window_refill(&self) {
+        if self.refill_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let weak = Arc::downgrade(&self.budget);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(BUDGET_WINDOW_MS)).await;
+                match weak.upgrade() {
+                    Some(budget) => budget.lock().await.refill_window(),
+                    None => break,
+                }
+            }
+        });
     }
 
     /// 释放链路：停保活、清注册（LinkControl::release 的引擎实现）
@@ -521,7 +582,8 @@ mod tests {
             .await
             .unwrap();
         let a_addr = a.local_addr().unwrap();
-        let b_ip = b.local_addr().unwrap().ip();
+        let b_addr = b.local_addr().unwrap();
+        let b_ip = b_addr.ip();
 
         // 对端回发（同 key：模拟承诺-揭示后的共享探针密钥）
         tokio::spawn(async move {
@@ -561,6 +623,8 @@ mod tests {
         let link = yielded_rx.recv().await.expect("交付链路");
         assert_eq!(link.peer_id, peer_id);
         assert!(matches!(link.transport, LinkTransport::Udp { .. }));
+        // 14 §2：交付物必须带验证过的对端地址（socket 未 connect，外围据此发包）
+        assert_eq!(link.peer_addr, b_addr);
     }
 
     /// 无对端 → 链路丢失事件 + 外围收到 lost 回调
@@ -598,6 +662,17 @@ mod tests {
 
         let lost = lost_rx.recv().await.expect("lost 回调");
         assert_eq!(lost, peer_id);
+
+        // 预算口径（H6）：本会话发包不超一轮配额；未用部分已归还；
+        // 下一会话仍能拿到完整的一轮（修复前：轮预算从不复位，第二次打洞 0 配额）
+        use wgp_proto::consts::{PROBE_BUDGET_PER_10MIN, PROBE_BUDGET_PER_ROUND};
+        let mut shared = engine.budget.lock().await;
+        let used = PROBE_BUDGET_PER_10MIN - shared.remaining().1;
+        assert!(
+            used > 0 && used <= PROBE_BUDGET_PER_ROUND,
+            "单会话发包须在一轮配额内，used={used}"
+        );
+        assert_eq!(shared.reserve_round().remaining().0, PROBE_BUDGET_PER_ROUND);
     }
 
     /// 多客户端联调：两台 Engine（各自 DHT 节点 + 共同存储节点）加入同一房间。
@@ -776,6 +851,7 @@ mod tests {
         let link = yielded_rx.recv().await.expect("TCP 链路交付");
         assert_eq!(link.rank, LinkRank::Degraded);
         assert!(matches!(link.transport, LinkTransport::Tcp { .. }));
+        assert_eq!(link.peer_addr, b_tcp_bind, "TCP 交付物的对端地址 = 流的对端");
         assert!(lost_rx.try_recv().is_err(), "不应有 lost 回调");
     }
 }
