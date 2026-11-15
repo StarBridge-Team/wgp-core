@@ -52,7 +52,8 @@ use tokio::sync::broadcast;
 use tokio::sync::watch;
 #[cfg(feature = "client")]
 use wgp_crypto::SecretBox;
-use wgp_dht::{DhtNode, NodeIdentity, ObserverPolicy, ObserverServer};
+use wgp_dht::{AdvertiseSpec, DhtNode, NodeIdentity, ObserverPolicy, ObserverServer};
+use wgp_proto::packet::seed_advertise_v2;
 #[cfg(feature = "client")]
 use wgp_dht::{RoomError, RoomRuntime, room_key as room_key_of};
 #[cfg(feature = "client")]
@@ -122,6 +123,15 @@ pub struct NodeConfig {
     pub hobby: bool,
     /// 观察者限频策略（运维参数；默认 `ObserverPolicy::default`）
     pub observer_policy: ObserverPolicy,
+    /// 对外宣告的公网 IPv4（None = 不宣告，别的节点只能靠手工配置找到本节点）。
+    /// 内核不猜测自己的公网地址；端口沿用 bind / stun / tcp_signal 的实际绑定值，
+    /// 即假定外部端口与本机端口一致（端口映射请按原号映射）。
+    pub advertise: Option<std::net::Ipv4Addr>,
+    /// 广告纪元（17 §5）：接收端只采纳更大的纪元，同一身份每次启动都要比上次大。
+    /// 内核不读系统时钟也不落盘，由外围持久化后注入。仅在 advertise 为 Some 时有意义。
+    pub advertise_epoch: u64,
+    /// 入网引导端点：其他种子的 DHT 地址（已解析）。空 = 独立运行，等别人来找
+    pub peers: Vec<std::net::SocketAddr>,
 }
 
 /// 打洞输入：已协商完成的会话上下文（承诺-揭示产物 + 对端观察报告）。
@@ -477,7 +487,9 @@ impl Engine {
 
     /// 节点路径：种子/观察者模式——wgp-node 的完整逻辑入口（07 §6 四职）。
     /// 承载：DHT 节点（RPC/转发/种子）+ 观察者（STUN 响应，独立端口）
-    ///      + TCP 信令面（UDP 被封/受限时的长度前缀帧兜底）。
+    ///      + TCP 信令面（UDP 被封/受限时的长度前缀帧兜底）
+    ///      + 种子发现（17 P0）：配置了 advertise 就周期宣告自己；配置了 peers 就以它们为
+    ///        入口建立种子目录。两者都不配置时行为与以前完全一致。
     pub async fn run_node(&self, cfg: NodeConfig, identity: NodeIdentity) -> NodeHandle {
         let bind_addr: Option<std::net::SocketAddr> = cfg.bind.parse().ok();
         let dht = match bind_addr {
@@ -523,6 +535,39 @@ impl Engine {
             },
             None => None,
         };
+
+        if let Some(node) = dht.as_ref() {
+            node.pin_seeds(&cfg.peers).await;
+            if let (Some(ip), Ok(local)) = (cfg.advertise, node.local_addr()) {
+                let spec = AdvertiseSpec {
+                    addr_v4: ip.octets(),
+                    dht_port: local.port(),
+                    stun_port: observer
+                        .as_ref()
+                        .and_then(|o| o.local_addr().ok())
+                        .map_or(0, |a| a.port()),
+                    tcp_port: tcp.map_or(0, |a| a.port()),
+                    priority: 0,
+                    // 贡献模式不中转：如实写进广告，客户端据此避开「报道永远送不到」的存储节点
+                    flags: if cfg.hobby {
+                        0
+                    } else {
+                        seed_advertise_v2::FLAG_RELAY
+                    },
+                    name_hash: [0u8; 4],
+                };
+                node.start_advertising(spec, cfg.advertise_epoch).await;
+            }
+            node.spawn_maintenance();
+            if !cfg.peers.is_empty() {
+                // 引导放后台：对端种子此刻不在线也不拖慢启动，之后由维护循环兜底
+                let (node, peers) = (node.clone(), cfg.peers.clone());
+                tokio::spawn(async move {
+                    node.discover(&peers).await;
+                    node.spread(&peers).await;
+                });
+            }
+        }
         NodeHandle { dht, observer, tcp }
     }
 }
@@ -777,6 +822,76 @@ mod tests {
 
         let _ = a_handle.leave();
         let _ = b_handle.leave();
+    }
+
+    /// 节点路径的种子发现接线：一个完整版种子、一个贡献模式种子，后者以前者为引导端点——
+    /// 双方最终互相收录；广告里的端口来自实际绑定，中转能力位如实反映模式。
+    #[tokio::test]
+    async fn run_node_advertises_and_seeds_find_each_other() {
+        use rand_core::OsRng;
+        use std::net::Ipv4Addr;
+
+        fn config(hobby: bool, peers: Vec<SocketAddr>) -> NodeConfig {
+            NodeConfig {
+                role: NodeRole::Seed,
+                bind: "127.0.0.1:0".to_string(),
+                stun: Some(0),
+                tcp_signal: Some(0),
+                hobby,
+                observer_policy: ObserverPolicy::default(),
+                advertise: Some(Ipv4Addr::LOCALHOST),
+                advertise_epoch: 1,
+                peers,
+            }
+        }
+
+        let (engine, _ev) = Engine::new();
+        let full = engine
+            .run_node(config(false, Vec::new()), NodeIdentity::generate(&mut OsRng))
+            .await;
+        let full_dht = full.dht.clone().expect("DHT 应绑定成功");
+        let full_addr = full_dht.local_addr().unwrap();
+
+        let hobby = engine
+            .run_node(
+                config(true, vec![full_addr]),
+                NodeIdentity::generate(&mut OsRng),
+            )
+            .await;
+        let hobby_dht = hobby.dht.clone().expect("DHT 应绑定成功");
+
+        // 引导在后台进行：轮询等待双方互相收录
+        let mut found = None;
+        for _ in 0..150 {
+            let on_full = full_dht
+                .seeds()
+                .await
+                .into_iter()
+                .find(|s| s.node_id == hobby_dht.node_id());
+            let on_hobby = hobby_dht
+                .seeds()
+                .await
+                .into_iter()
+                .find(|s| s.node_id == full_dht.node_id());
+            if let (Some(a), Some(b)) = (on_full, on_hobby) {
+                found = Some((a, b));
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let (hobby_seen, full_seen) = found.expect("两个种子应互相收录");
+
+        assert_eq!(hobby_seen.addr, hobby_dht.local_addr().unwrap());
+        assert!(!hobby_seen.relays(), "贡献模式不得宣称可中转");
+        assert_eq!(
+            hobby_seen.observer_addr().map(|a| a.port()),
+            hobby.observer.as_ref().map(|o| o.local_addr().unwrap().port()),
+            "广告里的观察者端口 = 实际绑定端口"
+        );
+        assert_eq!(hobby_seen.tcp_addr(), hobby.tcp);
+        assert!(full_seen.relays());
+        assert_eq!(full_seen.tcp_addr(), full.tcp);
+        assert_eq!(full_seen.addr, full_addr);
     }
 
     /// 竞速交付：UDP 无对端（死路）→ TCP 兜底路径命中 → 交付 Tcp 链路（Degraded 档）。

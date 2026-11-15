@@ -15,3 +15,5 @@ wgp-client.key
 # 运行期产物
 *.log
 *.jsonl
+# 节点广告纪元（启动计数，与身份文件同目录；见 server.rs::next_advertise_epoch）
+*.epoch

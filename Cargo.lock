@@ -588,6 +588,7 @@ dependencies = [
  "tokio",
  "wgp-core",
  "wgp-dht",
+ "wgp-proto",
 ]
 
 [[package]]

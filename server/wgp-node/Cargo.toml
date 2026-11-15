@@ -8,5 +8,6 @@ description = "折跃门服务端节点程序（双形态：wgp-node 静态IP完
 [dependencies]
 wgp-core = { path = "../../kernel/wgp-core", default-features = false, features = ["node"] }
 wgp-dht = { path = "../../kernel/wgp-dht" }
+wgp-proto = { path = "../../kernel/wgp-proto" }
 rand_core = { workspace = true }
 tokio = { workspace = true }
