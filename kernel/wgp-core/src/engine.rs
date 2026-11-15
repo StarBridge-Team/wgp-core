@@ -92,6 +92,10 @@ const JOIN_POLL_ROUNDS: u32 = 20;
 #[cfg(feature = "client")]
 const JOIN_REREQUEST_EVERY: u32 = 5;
 
+/// 节点入网引导的重试间隔（毫秒）：一个引导端点都没问到时，依次等这么久再试一次；
+/// 用完之后交给 20s 一轮的周期维护。
+const BOOTSTRAP_RETRY_WAITS_MS: [u64; 6] = [0, 300, 700, 1_500, 3_000, 6_000];
+
 /// 进程级单调毫秒（禁止读系统时钟；03 §3.3.2 硬约束）
 #[cfg(feature = "client")]
 fn engine_now_ms() -> u64 {
@@ -560,10 +564,18 @@ impl Engine {
             }
             node.spawn_maintenance();
             if !cfg.peers.is_empty() {
-                // 引导放后台：对端种子此刻不在线也不拖慢启动，之后由维护循环兜底
+                // 引导放后台：对端种子此刻不在线也不拖慢启动。
+                // 一个都没问到时按短退避再试几次，不干等周期维护——常见于几个种子同时启动、
+                // 对方的端口还没开。这段时间里种子目录是残缺的：两个只认识不同种子的客户端
+                // 各自看不到对方那个种子，会把同一个房间建在两个存储节点上。
                 let (node, peers) = (node.clone(), cfg.peers.clone());
                 tokio::spawn(async move {
-                    node.discover(&peers).await;
+                    for wait_ms in BOOTSTRAP_RETRY_WAITS_MS {
+                        tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+                        if node.discover(&peers).await > 0 {
+                            break;
+                        }
+                    }
                     node.spread(&peers).await;
                 });
             }
@@ -893,6 +905,71 @@ mod tests {
         assert!(full_seen.relays());
         assert_eq!(full_seen.tcp_addr(), full.tcp);
         assert_eq!(full_seen.addr, full_addr);
+    }
+
+    /// 引导端点比自己晚启动（几个种子同时起来时谁先谁后是随机的）：第一次引导问不到人，
+    /// 应当很快重试，而不是等 20s 一轮的周期维护才认识对方。
+    #[tokio::test]
+    async fn run_node_retries_bootstrap_when_the_peer_starts_late() {
+        use crate::transport::test_ports::unique_loopback_udp_addr;
+        use rand_core::OsRng;
+        use std::net::Ipv4Addr;
+
+        fn config(bind: String, peers: Vec<SocketAddr>) -> NodeConfig {
+            NodeConfig {
+                role: NodeRole::Seed,
+                bind,
+                stun: None,
+                tcp_signal: None,
+                hobby: false,
+                observer_policy: ObserverPolicy::default(),
+                advertise: Some(Ipv4Addr::LOCALHOST),
+                advertise_epoch: 1,
+                peers,
+            }
+        }
+
+        let (engine, _ev) = Engine::new();
+        // 先起的节点把「还没启动的那个」当引导端点
+        let late_addr = unique_loopback_udp_addr();
+        let early = engine
+            .run_node(
+                config("127.0.0.1:0".to_string(), vec![late_addr]),
+                NodeIdentity::generate(&mut OsRng),
+            )
+            .await;
+        let early_dht = early.dht.clone().expect("DHT 应绑定成功");
+
+        // 等到第一次引导已经发出去（必然落空），再让对方上线
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let late = engine
+            .run_node(
+                config(late_addr.to_string(), Vec::new()),
+                NodeIdentity::generate(&mut OsRng),
+            )
+            .await;
+        let late_dht = late.dht.clone().expect("DHT 应绑定成功");
+
+        // 重试生效的话几秒内互相收录；只靠周期维护要等 20s
+        let mut met = false;
+        for _ in 0..400 {
+            let early_knows = early_dht
+                .seeds()
+                .await
+                .iter()
+                .any(|s| s.node_id == late_dht.node_id());
+            let late_knows = late_dht
+                .seeds()
+                .await
+                .iter()
+                .any(|s| s.node_id == early_dht.node_id());
+            if early_knows && late_knows {
+                met = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(met, "引导端点晚启动时，两个种子应在几秒内互相收录");
     }
 
     /// 竞速交付：UDP 无对端（死路）→ TCP 兜底路径命中 → 交付 Tcp 链路（Degraded 档）。

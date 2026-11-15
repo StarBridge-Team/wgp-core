@@ -872,7 +872,8 @@ impl DhtNode {
 
     /// 入网引导（07 §5）：以 `entry`（用户配置的入口端点）为起点建立种子目录。
     /// 入口端点登记为 pinned；向每个入口索取种子广告，再向新学到的种子问一层（让目录不局限于
-    /// 入口自己认识的那几个）；更远的由周期维护慢慢补。返回目录内的种子数。
+    /// 入口自己认识的那几个）；更远的由周期维护慢慢补。正在宣告的节点最后把自己的广告推给
+    /// 已知种子。返回目录内的种子数。
     pub async fn discover(self: &Arc<Self>, entry: &[SocketAddr]) -> usize {
         self.pin_seeds(entry).await;
         let me = self.node_id();
@@ -886,6 +887,9 @@ impl DhtNode {
             self.ask_many(std::mem::take(&mut frontier), me).await;
             frontier = self.seeds().await.into_iter().map(|s| s.addr).collect();
         }
+        // 正在宣告的节点顺手把自己的广告推给刚认识的种子：启动时那一轮推送可能发生在对方上线之前，
+        // 不补这一下，对方要等到下一个推送周期（60s）才知道我们（未宣告则无事发生）
+        self.push_advert().await;
         self.seeds.lock().await.len()
     }
 

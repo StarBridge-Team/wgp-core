@@ -1,4 +1,4 @@
-//! 测试专用：发放本进程内不重复的回环 TCP 端口。
+//! 测试专用：发放本进程内不重复的回环端口（TCP 为主，UDP 同理）。
 //!
 //! 不用「绑 0 号端口、取到端口号再释放」的办法占坑：那样拿到的端口落在系统的动态端口范围里，
 //! 释放之后系统可以把它发给别人，包括并行运行的另一个测试（Linux 的动态端口是随机发的）。
@@ -13,7 +13,7 @@
 use std::collections::hash_map::RandomState;
 use std::collections::HashSet;
 use std::hash::BuildHasher;
-use std::net::{Ipv4Addr, SocketAddr, TcpListener};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, UdpSocket};
 use std::ops::Range;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -31,8 +31,17 @@ pub(crate) fn is_free(port: u16) -> bool {
     TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok()
 }
 
-/// 取一个本进程内不会再发第二次的回环地址
+/// 取一个本进程内不会再发第二次的回环地址（TCP）
 pub(crate) fn unique_loopback_addr() -> SocketAddr {
+    draw_unique(is_free)
+}
+
+/// 同上，给 UDP 用：返回时该端口此刻没有被任何 UDP socket 占用
+pub(crate) fn unique_loopback_udp_addr() -> SocketAddr {
+    draw_unique(|port| UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).is_ok())
+}
+
+fn draw_unique(free: impl Fn(u16) -> bool) -> SocketAddr {
     // 每个进程一组随机密钥：各次测试进程抽到的端口序列互不相同
     static KEYS: OnceLock<RandomState> = OnceLock::new();
     static ISSUED: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
@@ -49,7 +58,7 @@ pub(crate) fn unique_loopback_addr() -> SocketAddr {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(port);
-        if fresh && is_free(port) {
+        if fresh && free(port) {
             return SocketAddr::from((Ipv4Addr::LOCALHOST, port));
         }
     }
