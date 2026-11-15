@@ -4,8 +4,10 @@
 
 .DESCRIPTION
   Steps:
-    1. cargo build --release --locked   (wgp-client, wgp-node, wgp-node-hobby)
-    2. smoke checks on the built binaries (version output, room-code test vector)
+    1. cargo build --release --locked   (wgp-client, wgp-node, wgp-node-hobby) into target\package,
+       with the builder's home directory remapped out of the binaries
+    2. smoke checks on the built binaries (version output, room-code test vector, no dependency
+       on the VC++ runtime, no local home directory inside)
     3. copy binaries + README + LICENSE into dist\wgp-<version>-<commit>-<host triple>\
     4. write BUILD-INFO.txt and SHA256SUMS.txt, then zip the folder
   Nothing is uploaded or published: the output stays on this machine (dist\ is git-ignored).
@@ -17,6 +19,7 @@
   powershell -ExecutionPolicy Bypass -File scripts\package.ps1 -SkipBuild -NoZip
 #>
 param(
+    # package what is already in target\package\release instead of building
     [switch]$SkipBuild,
     [switch]$NoZip
 )
@@ -25,7 +28,10 @@ $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
 $root = Split-Path -Parent $PSScriptRoot
-$bin = Join-Path $root 'target\release'
+# Packages are built in their own target dir: the path-remapping flags used below would otherwise
+# invalidate the everyday build cache in target\release on every switch.
+$targetDir = Join-Path $root 'target\package'
+$bin = Join-Path $targetDir 'release'
 $binaries = @('wgp-client.exe', 'wgp-node.exe', 'wgp-node-hobby.exe')
 $utf8 = New-Object Text.UTF8Encoding $false
 
@@ -68,7 +74,19 @@ try {
     # ---- build ----
     if (-not $SkipBuild) {
         Write-Host '== build (release, locked)'
-        $build = Invoke-Native 'cargo' @('build', '--release', '--locked', '--bins')
+        # Panic-location strings contain the cargo registry and rustup paths, i.e. the builder's home
+        # directory and user name. Remap them: these binaries are meant to be handed to other people.
+        # When several remaps match, rustc applies the last one, so the more specific ones come last.
+        $remaps = @()
+        foreach ($pair in @(@($env:USERPROFILE, '~'), @($env:CARGO_HOME, '~/.cargo'), @($env:RUSTUP_HOME, '~/.rustup'))) {
+            if ($pair[0] -and $pair[0] -notmatch "'") { $remaps += "'--remap-path-prefix=$($pair[0])=$($pair[1])'" }
+        }
+        $buildArgs = @('build', '--release', '--locked', '--bins', '--target-dir', $targetDir)
+        if ($remaps.Count -gt 0) {
+            # cargo joins these with the rustflags from .cargo\config.toml (static CRT); it does not replace them
+            $buildArgs += @('--config', "target.$triple.rustflags=[$($remaps -join ',')]")
+        }
+        $build = Invoke-Native 'cargo' $buildArgs
         $build.Lines | Select-Object -Last 3 | ForEach-Object { Write-Host "   $_" }
         if ($build.Code -ne 0) { throw "cargo build failed (exit $($build.Code))" }
     }
@@ -84,6 +102,13 @@ try {
             throw "$name --version failed: '$line' (exit $($out.Code))"
         }
         Write-Host "   $line"
+        # what ships must run on a machine without the VC++ redistributable (static CRT, see
+        # .cargo\config.toml) and must not carry the builder's home directory
+        $image = [Text.Encoding]::GetEncoding(28591).GetString([IO.File]::ReadAllBytes($exe))
+        if ($image -match '(?i)vcruntime\d+\.dll') { throw "$name depends on the VC++ runtime (a static CRT is expected)" }
+        if ($env:USERPROFILE -and $image.IndexOf($env:USERPROFILE, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            throw "$name embeds the local home directory ($env:USERPROFILE)"
+        }
     }
     # room-code test vector (docs/13): name = U+793A U+4F8B U+623F U+95F4, key = 123456
     $roomName = -join ([char[]](0x793A, 0x4F8B, 0x623F, 0x95F4))
@@ -114,7 +139,7 @@ try {
         "dirty   : $dirty",
         "target  : $triple",
         "rustc   : $rustcVersion",
-        'profile : release (lto, codegen-units=1), built with --locked'
+        'profile : release (lto, codegen-units=1), static CRT, built with --locked'
     )
     [IO.File]::WriteAllLines((Join-Path $pkg 'BUILD-INFO.txt'), $info, $utf8)
 

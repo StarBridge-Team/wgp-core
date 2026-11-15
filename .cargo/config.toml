@@ -1,0 +1,5 @@
+# Windows（MSVC）：静态链接 C 运行时。
+# 默认是动态链接，产物会依赖 vcruntime140.dll——没装过 VC++ 运行库的机器上双击就报「找不到 DLL」。
+# 我们的程序是发给别人解压即用的，所以本机构建、CI 与发版统一静态链接（Linux 发版包本来就是 musl 静态）。
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static"]
