@@ -12,7 +12,8 @@
 //!
 //! 通用选项：
 //!   --seed <list>      种子端点（逗号/分号/空白分隔；udp://host:port | tcp://host:port）
-//!   --storage <ep>     显式指定房间键存储节点（默认取最快 UDP 种子）
+//!   --storage <ep>     显式指定房间键存储节点（默认在已知种子里按房间键确定性选点）
+//!   --observer <list>  观察者端点（默认用发现到的种子自带的观察者）
 //!   --identity <path>  身份文件（默认 {DEFAULT_IDENTITY_FILE}；首启生成）
 //!   --expose <spec>    暴露本机 TCP 服务给房间成员（如房主的 25565）
 //!   --forward <spec>   本地监听并转发到对端暴露的端口（游戏直连 localhost）
@@ -31,7 +32,9 @@ use wgp_core::{
     measure_seeds, peer_id_from_node, resolve_endpoint, types::LinkSink, Engine, EngineEvent,
     PeerId, RoomCode, SeedPick, SessionOrchestrator,
 };
-use wgp_dht::{DhtNode, NodeId, NodeIdentity, RoomRuntime};
+use wgp_dht::{
+    room_key, DhtNode, NodeId, NodeIdentity, RoomRuntime, SeedInfo, StorageCandidate,
+};
 use wgp_port::{
     close_code, Carrier, CloseReason, ExposeRule, ForwardRule, PortConfig, PortEvent, PortHub,
     Proto,
@@ -49,6 +52,8 @@ const INCOMING_SETTLE: Duration = Duration::from_secs(2);
 const RETRY_BACKOFF_SECS: [u64; 3] = [3, 10, 30];
 /// 退出前留给「关闭通知」发出去的时间
 const SHUTDOWN_FLUSH: Duration = Duration::from_millis(300);
+/// 未指定 --observer 时，最多自动选用几个发现到的观察者
+const MAX_AUTO_OBSERVERS: usize = 3;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -406,9 +411,28 @@ async fn async_move(
         eprintln!("[warn] 全部种子端点不可达（继续尝试显式 --storage）");
     }
 
-    // ③ 房间键存储节点：显式优先，否则取最快 UDP 种子（v1 房间 RPC 走 UDP）
-    let storage = resolve_storage(&node, &picks, opts.storage.as_deref()).await?;
-    println!("[存储] 房间键存储节点 = {storage}");
+    // ②b 种子发现（07 §5 第③层）：以配置的 UDP 种子为入口，学到它们认识的其他种子，并启动
+    // 后台维护（探活 + 保住到各种子的 NAT 映射）。入口种子没有宣告自己时目录为空，一切照旧——
+    // 只认手工配置的那几个。
+    let entries: Vec<SocketAddr> = picks
+        .iter()
+        .filter(|p| p.endpoint.scheme == SeedScheme::Udp)
+        .map(|p| p.addr)
+        .collect();
+    if !entries.is_empty() {
+        node.discover(&entries).await;
+        // 再问一遍「离这个房间最近的种子」：种子很多时，让各端对选点的看法一致
+        node.seek_seeds(NodeId(room_key(&code))).await;
+    }
+    node.spawn_maintenance();
+    let seeds = node.seeds().await;
+    for seed in &seeds {
+        println!("[发现] {}", describe_seed(seed));
+    }
+
+    // ③ 房间键存储节点：显式优先；否则在已知种子里按房间键确定性选点（v1 房间 RPC 走 UDP）
+    let storage =
+        resolve_storage(&node, &code, &entries, &seeds, opts.storage.as_deref()).await?;
 
     // 预热：让存储节点学习本端身份（失败不致命）
     let _ = node.ping(storage).await;
@@ -444,7 +468,20 @@ async fn async_move(
     // ⑥ 装配线：成员感知 + 自动打洞（mesh 每对端一个监管任务），打通的链路交付给端口转发中枢。
     // 观察者由 `--observer` 显式注入；缺省为空则跳过 NAT 探测，
     // 由引擎按 T1-T4 判定自动降级到 TCP 兜底——不让用户为打洞必须配齐 STUN。
-    let observers = parse_observers(opts.observer.as_deref());
+    let explicit_observers = parse_observers(opts.observer.as_deref());
+    let auto = explicit_observers.is_empty();
+    let observers = choose_observers(explicit_observers, &seeds);
+    if auto {
+        if observers.is_empty() {
+            println!(
+                "[观察者] 未指定，也没有发现带观察者的种子：将跳过 NAT 探测、只能尝试 TCP 兜底\
+                 （可用 --observer <IP:端口> 指定）"
+            );
+        } else {
+            let list: Vec<String> = observers.iter().map(|a| a.to_string()).collect();
+            println!("[观察者] 自动选用 {}", list.join(", "));
+        }
+    }
     let tcp_seed = picks
         .iter()
         .find(|p| p.endpoint.scheme == SeedScheme::Tcp)
@@ -458,6 +495,16 @@ async fn async_move(
         states: PeerStates::default(),
     });
     tokio::spawn(member_watch(node.clone(), storage, my_id, session.clone()));
+
+    // 后台扩散：沿 FIND_NODE 再认识一圈节点，把入口种子不认识的宣告者也纳入种子目录
+    if !entries.is_empty() {
+        let (node, entries) = (node.clone(), entries.clone());
+        tokio::spawn(async move {
+            node.spread(&entries).await;
+        });
+    }
+    let mut seed_changes = node.watch_seeds();
+    let mut shown_seeds = seed_addrs(&seeds);
 
     println!("[房间] 驻留中——打印链路/房间/转发事件；按 Ctrl+C 退出");
     let mut events = engine.subscribe();
@@ -478,6 +525,15 @@ async fn async_move(
                 render_port(&ev);
                 session.states.apply(&ev, &hub);
             }
+            Ok(()) = seed_changes.changed() => {
+                // 目录的变更通知也包括「同一种子换了新广告」：只在成员确实变了时才提示
+                let now = seed_addrs(&node.seeds().await);
+                if now != shown_seeds {
+                    let list: Vec<String> = now.iter().map(|a| a.to_string()).collect();
+                    println!("[发现] 种子目录更新：{} 个（{}）", now.len(), list.join(", "));
+                    shown_seeds = now;
+                }
+            }
         }
     }
     // 先关隧道：对端立刻得知本端退出，而不必等到超时才发现
@@ -487,22 +543,115 @@ async fn async_move(
     Ok(())
 }
 
-/// 解析房间键存储节点地址（显式 > 最快 UDP 种子）
+/// 确定房间键存储节点：显式 `--storage` 优先；否则在已知种子（手工配置的 + 发现的）里由内核
+/// 按房间键选点——已有本房间的跟随之，没有则取离房间键最近的可达种子。
+/// 两端只要认识的种子一样，选中的就是同一个（不再取决于各自测速谁最快）。
 async fn resolve_storage(
-    _node: &Arc<DhtNode>,
-    picks: &[SeedPick],
+    node: &Arc<DhtNode>,
+    code: &str,
+    entries: &[SocketAddr],
+    seeds: &[SeedInfo],
     explicit: Option<&str>,
 ) -> Result<SocketAddr, String> {
     if let Some(s) = explicit {
         let ep = SeedEndpoint::parse(s).map_err(|e| format!("--storage 解析失败：{e:?}"))?;
-        return resolve_endpoint(&ep)
+        let addr = resolve_endpoint(&ep)
             .await
-            .ok_or_else(|| format!("--storage 无法解析为地址：{s}"));
+            .ok_or_else(|| format!("--storage 无法解析为地址：{s}"))?;
+        println!("[存储] 房间键存储节点 = {addr}（--storage 指定）");
+        return Ok(addr);
     }
-    if let Some(p) = picks.iter().find(|p| p.endpoint.scheme == SeedScheme::Udp) {
-        return Ok(p.addr);
+    let candidates = storage_candidates(&node.known_nodes().await, entries, seeds);
+    if candidates.is_empty() {
+        return Err(
+            "无可用 UDP 种子端点：v1 房间键存储走 UDP RPC，请提供 `--seed udp://host:port`"
+                .to_string(),
+        );
     }
-    Err("无可用 UDP 种子端点：v1 房间键存储走 UDP RPC，请提供 `--seed udp://host:port`".to_string())
+    let pick = RoomRuntime::locate(node, code, &candidates)
+        .await
+        .ok_or("已知种子全部不可达，无法读写房间记录")?;
+    println!(
+        "[存储] 房间键存储节点 = {}（{}）",
+        pick.candidate.addr,
+        if pick.existing {
+            "房间已在该节点上，跟随"
+        } else {
+            "房间尚不存在，按房间键选定"
+        }
+    );
+    if pick.candidate.relays == Some(false) {
+        eprintln!(
+            "[warn] 该存储节点是贡献模式（不中转信令）：其他成员的报道与协商消息送不到，\
+             房间里只会有你自己。请至少配置一个完整版种子（wgp-node）"
+        );
+    }
+    Ok(pick.candidate.addr)
+}
+
+/// 汇集存储候选：发现的种子（广告里带中转能力）+ 手工配置但没有宣告自己的入口种子
+/// （身份取自测速时的应答，中转能力未知）。同一地址以广告为准。
+fn storage_candidates(
+    known: &[(NodeId, SocketAddr)],
+    entries: &[SocketAddr],
+    seeds: &[SeedInfo],
+) -> Vec<StorageCandidate> {
+    let mut out: Vec<StorageCandidate> = seeds
+        .iter()
+        .map(|s| StorageCandidate {
+            node_id: s.node_id,
+            addr: s.addr,
+            relays: Some(s.relays()),
+        })
+        .collect();
+    for addr in entries {
+        if out.iter().any(|c| c.addr == *addr) {
+            continue;
+        }
+        if let Some((id, _)) = known.iter().find(|(_, at)| at == addr) {
+            out.push(StorageCandidate {
+                node_id: *id,
+                addr: *addr,
+                relays: None,
+            });
+        }
+    }
+    out
+}
+
+/// 观察者：显式 `--observer` 优先；否则用发现到的种子自带的观察者（目录已按往返耗时排序，取前几个）
+fn choose_observers(explicit: Vec<SocketAddr>, seeds: &[SeedInfo]) -> Vec<SocketAddr> {
+    if !explicit.is_empty() {
+        return explicit;
+    }
+    seeds
+        .iter()
+        .filter_map(SeedInfo::observer_addr)
+        .take(MAX_AUTO_OBSERVERS)
+        .collect()
+}
+
+/// 目录成员的地址集合（排序后便于比较「成员有没有变」）
+fn seed_addrs(seeds: &[SeedInfo]) -> Vec<SocketAddr> {
+    let mut addrs: Vec<SocketAddr> = seeds.iter().map(|s| s.addr).collect();
+    addrs.sort();
+    addrs
+}
+
+fn describe_seed(seed: &SeedInfo) -> String {
+    let observer = match seed.observer_addr() {
+        Some(addr) => format!("观察者 :{}", addr.port()),
+        None => "无观察者".to_string(),
+    };
+    let rtt = match seed.rtt_ms {
+        Some(ms) => format!("，往返 {ms}ms"),
+        None => String::new(),
+    };
+    format!(
+        "种子 {}（{observer}，{}{rtt}）",
+        seed.addr,
+        if seed.relays() { "可中转" } else { "不中转" }
+    )
 }
 
 fn parse_observers(list: Option<&str>) -> Vec<SocketAddr> {
@@ -916,8 +1065,9 @@ fn print_help() {
            -s, --seed <list>      种子端点（可重复；也支持逗号/分号/空白分隔）\n\
                                   udp://host:port 或 tcp://host:port\n\
            -p, --peers <list>     等价 --seed（EasyTier 习惯）\n\
-           --storage <ep>         显式房间键存储节点（默认取最快 UDP 种子）\n\
-           --observer <list>      观察者/STUN 端点，逗号分隔 ip:port（缺省跳过 NAT 探测，自动降级 TCP 兜底）\n\
+           --storage <ep>         显式房间键存储节点（默认在已知种子里按房间键选定，两端结果一致）\n\
+           --observer <list>      观察者/STUN 端点，逗号分隔 ip:port\n\
+                                  （缺省用发现到的种子自带的观察者；一个也没有则跳过 NAT 探测、只试 TCP 兜底）\n\
            -i, --identity <path>  身份文件（默认 {DEFAULT_IDENTITY_FILE}）\n\
            --once                 入表后立即退出（默认驻留并打印事件）\n\
            -h, --help             显示本帮助\n\
@@ -933,9 +1083,10 @@ fn print_help() {
            wgp-client join U/C2G9-GYET-311W-R636 -p udp://轻松.躺进.icu:11010\n\
          \n\
          联机示例（Minecraft Java 版，服务器在房主本机 25565）：\n\
-           房主：wgp-client 开房 -n 我的房间 -k 密钥 -p udp://<种子>:11010 --observer <种子IP>:3478 --expose 25565\n\
-           朋友：wgp-client join -n 我的房间 -k 密钥 -p udp://<种子>:11010 --observer <种子IP>:3478 --forward 25565\n\
-           朋友在游戏里连接 localhost:25565 即可"
+           房主：wgp-client 开房 -n 我的房间 -k 密钥 -p udp://<种子>:11010 --expose 25565\n\
+           朋友：wgp-client join -n 我的房间 -k 密钥 -p udp://<种子>:11010 --forward 25565\n\
+           朋友在游戏里连接 localhost:25565 即可\n\
+           （种子没有用 --advertise 宣告自己时，两端都要加 --observer <种子IP>:3478）"
     );
 }
 
@@ -1118,6 +1269,72 @@ mod tests {
         let none = parse_opts(&v(&[])).unwrap();
         let cfg = build_port_config(&none).unwrap();
         assert!(cfg.expose_tcp.is_empty() && cfg.forward_tcp.is_empty());
+    }
+
+    fn seed_info(byte: u8, port: u16, stun_port: u16, relays: bool) -> SeedInfo {
+        SeedInfo {
+            node_id: NodeId([byte; 32]),
+            pubkey: [byte; 32],
+            addr: addr(&format!("203.0.113.{byte}:{port}")),
+            stun_port,
+            tcp_port: 0,
+            priority: 0,
+            flags: if relays { 0x01 } else { 0 },
+            epoch: 1,
+            rtt_ms: Some(u32::from(byte)),
+        }
+    }
+
+    #[test]
+    fn storage_candidates_merge_discovered_and_configured_seeds() {
+        let discovered = [seed_info(1, 11010, 3478, true), seed_info(2, 11010, 0, false)];
+        // 配置了三个入口：一个就是已发现的 1 号；一个没有宣告但测速时应答过；一个没应答过
+        let silent_seed = addr("198.51.100.9:11010");
+        let dead_seed = addr("198.51.100.10:11010");
+        let entries = [discovered[0].addr, silent_seed, dead_seed];
+        let known = [(NodeId([9; 32]), silent_seed), (NodeId([1; 32]), discovered[0].addr)];
+
+        let got = storage_candidates(&known, &entries, &discovered);
+        assert_eq!(got.len(), 3, "已发现的不重复计入；没应答过的（身份未知）不计入");
+        // 广告里的中转能力如实带上；手工配置而未宣告的种子能力未知
+        assert_eq!(got[0].relays, Some(true));
+        assert_eq!(got[1].relays, Some(false));
+        assert_eq!(
+            got[2],
+            StorageCandidate {
+                node_id: NodeId([9; 32]),
+                addr: silent_seed,
+                relays: None,
+            }
+        );
+        // 没有任何已知种子：候选为空（调用方报错，而不是猜一个）
+        assert!(storage_candidates(&[], &[dead_seed], &[]).is_empty());
+    }
+
+    #[test]
+    fn observers_explicit_wins_else_taken_from_discovered_seeds() {
+        let seeds = [
+            seed_info(1, 11010, 3478, true),
+            seed_info(2, 11010, 0, true), // 这个种子不提供观察者
+            seed_info(3, 11010, 3479, false),
+            seed_info(4, 11010, 3480, true),
+            seed_info(5, 11010, 3481, true),
+        ];
+        // 显式指定：原样使用，不掺入发现的
+        let explicit = vec![addr("192.0.2.1:3478")];
+        assert_eq!(choose_observers(explicit.clone(), &seeds), explicit);
+        // 未指定：取发现的种子里带观察者的前 MAX_AUTO_OBSERVERS 个（端口来自广告，IP 同种子）
+        assert_eq!(
+            choose_observers(Vec::new(), &seeds),
+            vec![
+                addr("203.0.113.1:3478"),
+                addr("203.0.113.3:3479"),
+                addr("203.0.113.4:3480"),
+            ]
+        );
+        assert!(choose_observers(Vec::new(), &[]).is_empty());
+        assert!(describe_seed(&seeds[1]).contains("无观察者"));
+        assert!(describe_seed(&seeds[2]).contains("不中转"));
     }
 
     #[test]
