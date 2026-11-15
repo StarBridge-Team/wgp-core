@@ -87,26 +87,27 @@ impl<'a> PunchRunner<'a> {
                 break;
             }
 
-            // ② 本波监听窗口：等对端探针（验签由 recv_verified 内建）
-            let deadline = timeout(window_ms, async {
+            // ② 本波监听窗口：等对端探针（验签由 recv_verified 内建）。
+            // 不算数的包一律丢弃后继续等到窗口结束——格式不对 / 伪造的、源 IP 不是对端的，
+            // 以及自己发出的探针折返（loopback / 异常路由下会发生，不得计命中）。
+            // 它们不能提前结束本波监听，否则随后才到的真对端探针就被错过了。
+            let self_addr = self.carrier.local_addr().ok();
+            let hit = timeout(window_ms, async {
                 loop {
                     match self.carrier.recv_verified().await {
-                        Some((_p, src)) => return Some(src),
-                        None => continue, // malformed/伪造包——静默丢弃
+                        Some((_p, src)) if src.ip() == peer_ip && Some(src) != self_addr => {
+                            return src;
+                        }
+                        _ => continue,
                     }
                 }
             });
 
-            if let Ok(Some(src)) = deadline.await {
-                // 自包头排除：loopback/异常路由下自己发出的探针折返不得计命中
-                let self_addr = self.carrier.local_addr().ok();
-                if src.ip() == peer_ip && Some(src) != self_addr {
-                    hits += 1;
-                    peer_addr = Some(src);
-                    // 命中即停（先通先用；同档更优链路不重复交付，14 §10 条款 1）
-                    break;
-                }
-                // 源 IP 不匹配或自折返：忽略（乱包/其他会话）
+            if let Ok(src) = hit.await {
+                hits += 1;
+                peer_addr = Some(src);
+                // 命中即停（先通先用；同档更优链路不重复交付，14 §10 条款 1）
+                break;
             }
         }
 
@@ -123,7 +124,12 @@ impl<'a> PunchRunner<'a> {
 mod tests {
     use super::*;
 
-    const SHARED_KEY: [u8; 32] = [0x51; 32];
+    // 每个测试一把密钥：这些测试并行运行，又都往回环的一批伪随机端口上发探针，
+    // 共用密钥的话，一个测试的探针落到另一个测试的 socket 上会被当成合法命中。
+    const HIT_KEY: [u8; 32] = [0x51; 32];
+    const BUDGET_KEY: [u8; 32] = [0x52; 32];
+    const FORGED_KEY: [u8; 32] = [0x53; 32];
+    const ECHO_KEY: [u8; 32] = [0x54; 32];
 
     fn probe_bytes_is_valid(carrier: &UdpProbeCarrier, buf: &[u8]) -> bool {
         carrier.on_probe("0.0.0.0:0".parse().unwrap(), buf)
@@ -131,10 +137,10 @@ mod tests {
 
     #[tokio::test]
     async fn wave_exec_hits_peer_reply() {
-        let a = UdpProbeCarrier::bind("127.0.0.1:0".parse().unwrap(), SHARED_KEY, [1, 2, 3, 4])
+        let a = UdpProbeCarrier::bind("127.0.0.1:0".parse().unwrap(), HIT_KEY, [1, 2, 3, 4])
             .await
             .unwrap();
-        let b = UdpProbeCarrier::bind("127.0.0.1:0".parse().unwrap(), SHARED_KEY, [5, 6, 7, 8])
+        let b = UdpProbeCarrier::bind("127.0.0.1:0".parse().unwrap(), HIT_KEY, [5, 6, 7, 8])
             .await
             .unwrap();
         let a_addr = a.local_addr().unwrap();
@@ -159,7 +165,7 @@ mod tests {
 
     #[tokio::test]
     async fn budget_cap_limits_packets() {
-        let a = UdpProbeCarrier::bind("127.0.0.1:0".parse().unwrap(), SHARED_KEY, [1, 2, 3, 4])
+        let a = UdpProbeCarrier::bind("127.0.0.1:0".parse().unwrap(), BUDGET_KEY, [1, 2, 3, 4])
             .await
             .unwrap();
         let peer_ip = "127.0.0.1".parse::<IpAddr>().unwrap();
@@ -177,7 +183,7 @@ mod tests {
 
     #[tokio::test]
     async fn forged_probe_never_counts_as_hit() {
-        let a = UdpProbeCarrier::bind("127.0.0.1:0".parse().unwrap(), SHARED_KEY, [1, 2, 3, 4])
+        let a = UdpProbeCarrier::bind("127.0.0.1:0".parse().unwrap(), FORGED_KEY, [1, 2, 3, 4])
             .await
             .unwrap();
         let a_addr = a.local_addr().unwrap();
@@ -207,5 +213,35 @@ mod tests {
             p
         };
         assert!(!probe_bytes_is_valid(&a, &evil_probe));
+    }
+
+    /// 自己发出的探针折返回来（撒网端口恰好撞上自己的端口时会发生）：不计命中，
+    /// 也不能就此结束监听——随后到达的真对端探针仍要被接住。
+    #[tokio::test]
+    async fn own_probe_echo_does_not_end_the_listening_window() {
+        let a = UdpProbeCarrier::bind("127.0.0.1:0".parse().unwrap(), ECHO_KEY, [1, 2, 3, 4])
+            .await
+            .unwrap();
+        let b = UdpProbeCarrier::bind("127.0.0.1:0".parse().unwrap(), ECHO_KEY, [5, 6, 7, 8])
+            .await
+            .unwrap();
+        let a_addr = a.local_addr().unwrap();
+        let b_addr = b.local_addr().unwrap();
+
+        // 先给 A 塞一枚「A 自己签发、从 A 自己的地址发来」的探针，再让 B 在窗口内回发
+        let own = a.craft();
+        a.socket().send_to(&own, a_addr).await.unwrap();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let probe = b.craft();
+            b.socket().send_to(&probe, a_addr).await.unwrap();
+        });
+
+        let mut budget = BudgetScheduler::new();
+        let mut runner = PunchRunner::new(&a, &mut budget);
+        let outcome = runner.run_waves(None, b_addr.ip(), 42).await;
+
+        assert_eq!(outcome.peer_addr, Some(b_addr), "命中的应是对端 B，而不是自己的折返");
+        assert_eq!(outcome.hits, 1);
     }
 }

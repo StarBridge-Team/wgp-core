@@ -689,7 +689,8 @@ mod tests {
     async fn engine_reports_lost_when_no_peer() {
         let (engine, _events) = Engine::new();
         let peer_id: PeerId = [8u8; 16];
-        let a = UdpProbeCarrier::bind("127.0.0.1:0".parse().unwrap(), SHARED_KEY, [1, 1, 1, 1])
+        // 不与别的测试共用探针密钥：并行运行时，别人撒网的探针落到这个 socket 上会被当成命中
+        let a = UdpProbeCarrier::bind("127.0.0.1:0".parse().unwrap(), [0x72; 32], [1, 1, 1, 1])
             .await
             .unwrap();
 
