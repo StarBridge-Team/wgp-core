@@ -32,6 +32,9 @@ pub enum RoomError {
 /// 选点时最多向多少个候选（离房间键最近的）发起查询
 const LOCATE_MAX_QUERIES: usize = 8;
 
+/// upkeep 每隔多少轮向存储节点重新登记一次自己的地址（默认 2s 一轮，即约 6s 一次）
+const REGISTER_EVERY_ROUNDS: u32 = 3;
+
 /// 房间存储节点的候选（v1：房间记录只放在公网可达的种子上）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StorageCandidate {
@@ -297,6 +300,10 @@ impl RoomRuntime {
     /// ① 锚点：处理入站报道 + 租约续期
     /// ② 成员：监控租约过期 → 继位尝试
     /// ③ 全员：向锚点补报道（若自己尚未入表）
+    ///
+    /// 另外兼顾存储节点重启（它的房间记录与地址簿都只在内存里）：
+    /// - 全员定期向它重新登记自己的地址，否则别人经它中转给我们的报道与协商消息会被丢掉；
+    /// - 记录不见了，锚点凭上一次读到的那份原样恢复（成员表保留，各成员不必重新报道）。
     pub async fn upkeep(
         &self,
         code: String,
@@ -309,10 +316,20 @@ impl RoomRuntime {
         let mut last_renew_ms: Option<u64> = None;
         // 成员侧掉线判定：本地观测租约多久没变（跨进程的时钟不可比）
         let mut lease_watch = LeaseWatch::new();
+        // 上一次从存储节点读到的记录（恢复房间用）
+        let mut last_seen: Option<RoomRecord> = None;
+        let mut round: u32 = 0;
         loop {
             tokio::select! {
                 _ = stop.changed() => break,
                 _ = tokio::time::sleep(Duration::from_millis(interval_ms)) => {}
+            }
+            round = round.wrapping_add(1);
+
+            // ⓪ 向存储节点重新登记地址：它按「身份 → 地址」把报道与协商消息中转给我们，而地址只从
+            // PING / STORE 里学；它一重启，地址簿就空了。顺带保住本端到它的 NAT 映射。
+            if round % REGISTER_EVERY_ROUNDS == 0 {
+                let _ = self.node.ping(self.storage).await;
             }
 
             // ① 锚点职责：处理报道队列
@@ -323,9 +340,24 @@ impl RoomRuntime {
             }
 
             let now = now_fn();
-            let Ok(record) = self.fetch(&code).await else {
-                continue; // 存储节点暂不可达：下轮重试
+            let record = match self.fetch(&code).await {
+                Ok(record) => record,
+                Err(RoomError::NotFound) => {
+                    // 记录不见了：存储节点多半重启过。我是锚点就凭上一次读到的那份恢复房间；
+                    // 我是成员就等锚点恢复——在那之前新来的人会另建一份，届时走下面的补报道并入
+                    let mine = last_seen
+                        .as_ref()
+                        .filter(|last| last.lease.anchor == self.my_id());
+                    if let Some(last) = mine {
+                        if self.renew(&code, last, now).await.is_ok() {
+                            last_renew_ms = Some(now);
+                        }
+                    }
+                    continue;
+                }
+                Err(_) => continue, // 存储节点暂不可达：下轮重试
             };
+            last_seen = Some(record.clone());
 
             if record.lease.anchor == self.my_id() {
                 // ② 我是锚点：续期（按 LEASE_INTERVAL_S 节流）
@@ -761,6 +793,111 @@ mod tests {
             .collect();
         assert!(RoomRuntime::locate(&client, CODE, &dead).await.is_none());
         assert!(RoomRuntime::locate(&client, CODE, &[]).await.is_none());
+    }
+
+    /// 三个独立节点：存储节点、锚点、成员（存储节点不兼任房间里的任何角色）
+    async fn storage_anchor_member() -> (Arc<DhtNode>, Arc<DhtNode>, Arc<DhtNode>) {
+        let storage = spawn_node().await;
+        let anchor = spawn_node().await;
+        let member = spawn_node().await;
+        let at = storage.local_addr().unwrap();
+        anchor.ping(at).await.unwrap();
+        member.ping(at).await.unwrap();
+        (storage, anchor, member)
+    }
+
+    fn spawn_upkeep(
+        rt: RoomRuntime,
+        code: &'static str,
+    ) -> (watch::Sender<bool>, tokio::task::JoinHandle<()>) {
+        let (stop, stop_rx) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            rt.upkeep(code.to_string(), 20, stop_rx, || 1_000).await;
+        });
+        (stop, task)
+    }
+
+    /// 存储节点重启（房间记录只在它的内存里）：锚点应凭上一次读到的记录把房间恢复出来，
+    /// 成员表原样保留——否则房间从此「不存在」，新来的人只能另建一个。
+    #[tokio::test]
+    async fn anchor_restores_the_room_after_the_storage_node_loses_it() {
+        const CODE: &str = "U/RESTORE-TEST-0001-AA11";
+        let (storage, anchor, member) = storage_anchor_member().await;
+        let at = storage.local_addr().unwrap();
+        let anchor_rt = RoomRuntime::new(anchor.clone(), at);
+        let rec = anchor_rt.create(CODE, 1_000).await.unwrap();
+        anchor_rt
+            .add_member(CODE, &rec, node_id_of(&member), pk_of(&member), 1_000)
+            .await
+            .unwrap();
+
+        let (anchor_stop, anchor_task) = spawn_upkeep(RoomRuntime::new(anchor.clone(), at), CODE);
+        let (member_stop, member_task) = spawn_upkeep(RoomRuntime::new(member.clone(), at), CODE);
+        // 让两边的 upkeep 都至少读到过一次记录
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        storage.forget_volatile_state().await;
+        assert_eq!(anchor_rt.fetch(CODE).await, Err(RoomError::NotFound), "前提：记录确实丢了");
+
+        let mut restored = None;
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            if let Ok(record) = anchor_rt.fetch(CODE).await {
+                restored = Some(record);
+                break;
+            }
+        }
+        let restored = restored.expect("锚点应把房间恢复出来");
+        assert_eq!(restored.lease.anchor, node_id_of(&anchor), "恢复后锚点不变");
+        assert_eq!(restored.lease.epoch, rec.lease.epoch, "恢复不是换届");
+        assert_eq!(restored.members.len(), 2, "成员表原样保留");
+        assert!(restored.members.iter().any(|(id, _)| *id == node_id_of(&member)));
+
+        anchor_stop.send(true).unwrap();
+        member_stop.send(true).unwrap();
+        anchor_task.await.unwrap();
+        member_task.await.unwrap();
+    }
+
+    /// 存储节点重启后地址簿是空的：成员要自己重新登记，否则别人经它中转给成员的消息会被丢掉
+    /// （成员只读房间记录，而读请求不带身份，存储节点学不到它的地址）。
+    #[tokio::test]
+    async fn member_reregisters_with_the_storage_node_after_it_restarts() {
+        const CODE: &str = "U/REREG-TEST-0001-BB22";
+        let (storage, anchor, member) = storage_anchor_member().await;
+        let at = storage.local_addr().unwrap();
+        let anchor_rt = RoomRuntime::new(anchor.clone(), at);
+        let rec = anchor_rt.create(CODE, 1_000).await.unwrap();
+        anchor_rt
+            .add_member(CODE, &rec, node_id_of(&member), pk_of(&member), 1_000)
+            .await
+            .unwrap();
+        // 只跑成员的 upkeep：它不是锚点，不会写记录，登记地址只能靠定期的 PING
+        let (member_stop, member_task) = spawn_upkeep(RoomRuntime::new(member.clone(), at), CODE);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        storage.forget_volatile_state().await;
+
+        // 经存储节点给成员中转一条消息，直到送达（重新登记之前会被静默丢弃）。
+        // target 填成员、但载荷不是合法报道：成员的 upkeep 取走后验签不过即丢，所以这里看存储节点
+        // 的地址簿是否重新认识了成员
+        let mut known = false;
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            if storage
+                .known_nodes()
+                .await
+                .iter()
+                .any(|(id, addr)| *id == node_id_of(&member) && *addr == member.local_addr().unwrap())
+            {
+                known = true;
+                break;
+            }
+        }
+        assert!(known, "成员应在几轮 upkeep 内重新出现在存储节点的地址簿里");
+
+        member_stop.send(true).unwrap();
+        member_task.await.unwrap();
     }
 
     #[tokio::test]

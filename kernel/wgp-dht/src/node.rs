@@ -228,6 +228,13 @@ impl DhtNode {
         self.txid.fetch_add(1, Ordering::Relaxed) + 1
     }
 
+    /// 测试用：模拟进程重启——丢掉全部只存在于内存里的状态（KV、地址簿），身份不变
+    #[cfg(test)]
+    pub(crate) async fn forget_volatile_state(&self) {
+        self.kv.lock().await.clear();
+        self.addr_book.lock().await.clear();
+    }
+
     /// 学习（身份 ↔ 地址）：仅经身份绑定校验的 ping/pong/store 路径调用。
     /// UDP 入站：路由表 + 地址簿（可被 Forward 中转寻址）。
     /// TCP 入站：只入路由表——TCP 源地址不是可达的 UDP 端点，写地址簿会毒化转发路由。
