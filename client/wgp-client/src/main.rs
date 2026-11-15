@@ -33,7 +33,7 @@ use wgp_core::{
     PeerId, RoomCode, SeedPick, SessionOrchestrator,
 };
 use wgp_dht::{
-    room_key, DhtNode, NodeId, NodeIdentity, RoomRuntime, SeedInfo, StorageCandidate,
+    room_key, DhtNode, NodeId, NodeIdentity, RoomError, RoomRuntime, SeedInfo, StorageCandidate,
 };
 use wgp_port::{
     close_code, Carrier, CloseReason, ExposeRule, ForwardRule, PortConfig, PortEvent, PortHub,
@@ -52,6 +52,11 @@ const INCOMING_SETTLE: Duration = Duration::from_secs(2);
 const RETRY_BACKOFF_SECS: [u64; 3] = [3, 10, 30];
 /// 退出前留给「关闭通知」发出去的时间
 const SHUTDOWN_FLUSH: Duration = Duration::from_millis(300);
+/// 「加入」时在已知种子上没找到房间：程序会照常建房等人，但用户多半以为自己已经进了别人的房间
+const NO_ROOM_NOTICE: &str = "[提示] 没有找到这个房间，现在房间里只有你自己。\
+     如果是要加入别人开的房间：请核对房间码（或房间名与密钥），确认对方已经在线、\
+     并且双方填的种子互相认识。保持运行即可，对方上线后会自动连上";
+
 /// 未指定 --observer 时，最多自动选用几个发现到的观察者
 const MAX_AUTO_OBSERVERS: usize = 3;
 
@@ -304,11 +309,48 @@ fn cmd_host(args: &[String]) -> Result<(), String> {
         .unwrap_or_else(random_hex16);
 
     let code = derive_room_code(&name, &key);
+    // 转发规则写错了在这里就报，不等到打印完加入命令之后
+    let port_cfg = build_port_config(&opts)?;
     println!("房间名  : {name}");
     println!("房间密钥: {key}");
     println!("房间码  : {code}");
-    println!("—— 把「房间码」分享给同伴，对方执行 `wgp-client join {code}` 即可加入 ——");
-    run_room(&code, opts)
+    println!("—— 把下面这一行发给同伴，对方原样执行即可加入 ——");
+    println!(
+        "{}",
+        join_command(&code, &seed_string(&opts), opts.observer.as_deref(), &port_cfg)
+    );
+    run_room(&code, opts, false)
+}
+
+/// 种子端点串：命令行优先，其次环境变量 WGP_SEED
+fn seed_string(opts: &Opts) -> String {
+    opts.seed
+        .clone()
+        .or_else(|| std::env::var("WGP_SEED").ok())
+        .unwrap_or_default()
+}
+
+/// 给同伴的加入命令：把房主这边已经确定的东西都带上——种子、手工指定的观察者、与暴露端口对应的
+/// 转发规则。只给一个房间码的话，同伴还得自己知道种子地址、知道该转发哪个端口。
+fn join_command(code: &str, seeds: &str, observer: Option<&str>, cfg: &PortConfig) -> String {
+    let mut cmd = format!("wgp-client join {code}");
+    let (endpoints, _) = SeedEndpoint::parse_list(seeds);
+    if !endpoints.is_empty() {
+        let list: Vec<String> = endpoints.iter().map(SeedEndpoint::display).collect();
+        cmd.push_str(&format!(" -p {}", list.join(",")));
+    }
+    let observers = parse_observers(observer);
+    if !observers.is_empty() {
+        let list: Vec<String> = observers.iter().map(SocketAddr::to_string).collect();
+        cmd.push_str(&format!(" --observer {}", list.join(",")));
+    }
+    for rule in &cfg.expose_tcp {
+        cmd.push_str(&format!(" --forward {}", rule.port));
+    }
+    for rule in &cfg.expose_udp {
+        cmd.push_str(&format!(" --forward-udp {}", rule.port));
+    }
+    cmd
 }
 
 /// 加入房间
@@ -320,7 +362,7 @@ fn cmd_join(args: &[String]) -> Result<(), String> {
     let opts = parse_opts(args)?;
     let code = resolve_join_code(&opts)?;
     println!("房间码  : {code}");
-    run_room(&code, opts)
+    run_room(&code, opts, true)
 }
 
 /// 解析加入目标：显式房间码优先，否则由「网络名 + 网络密钥」在本地派生
@@ -347,12 +389,9 @@ fn resolve_join_code(opts: &Opts) -> Result<String, String> {
 // 房间会话（装配内核 + 数据面 + 呈现事件）
 // ---------------------------------------------------------------------------
 
-fn run_room(code: &str, opts: Opts) -> Result<(), String> {
-    let seed_str = opts
-        .seed
-        .clone()
-        .or_else(|| std::env::var("WGP_SEED").ok())
-        .unwrap_or_default();
+/// `joining`：本次是「加入」而不是「开房」——加入时没找到房间要提醒用户（见 async_move）
+fn run_room(code: &str, opts: Opts, joining: bool) -> Result<(), String> {
+    let seed_str = seed_string(&opts);
     let (endpoints, bad) = SeedEndpoint::parse_list(&seed_str);
     for b in &bad {
         eprintln!("[warn] 忽略非法种子端点：{b}");
@@ -383,6 +422,7 @@ fn run_room(code: &str, opts: Opts) -> Result<(), String> {
         endpoints,
         opts,
         port_cfg,
+        joining,
     ))
 }
 
@@ -392,6 +432,7 @@ async fn async_move(
     endpoints: Vec<SeedEndpoint>,
     opts: Opts,
     port_cfg: PortConfig,
+    joining: bool,
 ) -> Result<(), String> {
     // ① 本进程 DHT 节点（绑定随机端口）
     let node = DhtNode::bind(identity, "0.0.0.0:0".parse().unwrap())
@@ -431,7 +472,7 @@ async fn async_move(
     }
 
     // ③ 房间键存储节点：显式优先；否则在已知种子里按房间键确定性选点（v1 房间 RPC 走 UDP）
-    let storage =
+    let (storage, room_exists) =
         resolve_storage(&node, &code, &entries, &seeds, opts.storage.as_deref()).await?;
 
     // 预热：让存储节点学习本端身份（失败不致命）
@@ -446,6 +487,12 @@ async fn async_move(
     for rule in &port_cfg.expose_udp {
         println!("[转发] 暴露 UDP 端口 {} → 本机 {}", rule.port, rule.target);
     }
+    // 本端转发了对端的哪些端口：隧道就绪时用来提示「对端暴露了、本端却没转发」的端口
+    let forwarded = Forwarded {
+        tcp: port_cfg.forward_tcp.iter().map(|r| r.remote_port).collect(),
+        udp: port_cfg.forward_udp.iter().map(|r| r.remote_port).collect(),
+    };
+    let mut hinted: HashSet<(bool, u16)> = HashSet::new();
     let (hub, mut port_events) = PortHub::start(my_peer, port_cfg)
         .await
         .map_err(|e| format!("端口转发启动失败：{e}"))?;
@@ -457,8 +504,11 @@ async fn async_move(
     let handle = engine
         .join_room(RoomCode(code.clone()), None)
         .await
-        .map_err(|e| format!("加入房间失败：{e:?}"))?;
+        .map_err(|e| describe_join_error(&e, storage))?;
     println!("[房间] 已入表，当前成员数 = {}", handle.members);
+    if joining && room_exists == Some(false) {
+        println!("{NO_ROOM_NOTICE}");
+    }
 
     if opts.once {
         let _ = handle.leave();
@@ -523,6 +573,9 @@ async fn async_move(
             },
             Some(ev) = port_events.recv() => {
                 render_port(&ev);
+                if let Some(hint) = unforwarded_hint(&ev, &forwarded, &mut hinted) {
+                    println!("{hint}");
+                }
                 session.states.apply(&ev, &hub);
             }
             Ok(()) = seed_changes.changed() => {
@@ -543,24 +596,81 @@ async fn async_move(
     Ok(())
 }
 
+/// 入表失败的原因说明（给人看的：指出最可能的原因，而不是只报一个内部错误名）
+fn describe_join_error(error: &RoomError, storage: SocketAddr) -> String {
+    match error {
+        // 房间记录读到了、报道也发了，但等到超时都没有被写进成员表
+        RoomError::NotFound => format!(
+            "加入房间失败：报道没有得到房主的处理（等待入表超时）。\
+             可能的原因：房主已经离线；或者存放房间的种子 {storage} 不中转信令（贡献节点）"
+        ),
+        RoomError::StoreFailed => format!(
+            "加入房间失败：存储节点 {storage} 没有应答——种子不可达，或本机到它的 UDP 被拦截"
+        ),
+        RoomError::PreemptedByOther => {
+            "加入房间失败：建房时被别人抢先（同名房间刚刚被创建），请重试".to_string()
+        }
+        other => format!("加入房间失败：{other:?}"),
+    }
+}
+
+/// 本端转发了对端的哪些端口
+struct Forwarded {
+    tcp: HashSet<u16>,
+    udp: HashSet<u16>,
+}
+
+/// 隧道就绪时，对端暴露了端口而本端没有转发它：给出一次用法提示。
+/// 不提示的话，隧道通了用户也不知道下一步——对端的服务在本机上并没有入口。
+fn unforwarded_hint(
+    ev: &PortEvent,
+    forwarded: &Forwarded,
+    hinted: &mut HashSet<(bool, u16)>,
+) -> Option<String> {
+    let PortEvent::TunnelReady { tcp, udp, .. } = ev else {
+        return None;
+    };
+    let mut flags: Vec<String> = Vec::new();
+    for port in tcp {
+        if !forwarded.tcp.contains(port) && hinted.insert((false, *port)) {
+            flags.push(format!("--forward {port}"));
+        }
+    }
+    for port in udp {
+        if !forwarded.udp.contains(port) && hinted.insert((true, *port)) {
+            flags.push(format!("--forward-udp {port}"));
+        }
+    }
+    if flags.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "[提示] 对端暴露了端口，但本端没有转发它，现在还用不了。加上 `{}` 重新运行，\
+         就能在本机用 127.0.0.1:<端口> 访问对端的服务",
+        flags.join(" ")
+    ))
+}
+
 /// 确定房间键存储节点：显式 `--storage` 优先；否则在已知种子（手工配置的 + 发现的）里由内核
 /// 按房间键选点——已有本房间的跟随之；没有则在可达种子里先看中转能力（明确可中转 > 不知道 >
 /// 明确不中转），同一档内取离房间键最近者。
 /// 两端只要认识的种子一样，选中的就是同一个（不再取决于各自测速谁最快）。
+/// 返回 (存储节点, 房间此刻是否已经在它上面；显式指定时没有查，为 None)。
 async fn resolve_storage(
     node: &Arc<DhtNode>,
     code: &str,
     entries: &[SocketAddr],
     seeds: &[SeedInfo],
     explicit: Option<&str>,
-) -> Result<SocketAddr, String> {
+) -> Result<(SocketAddr, Option<bool>), String> {
     if let Some(s) = explicit {
         let ep = SeedEndpoint::parse(s).map_err(|e| format!("--storage 解析失败：{e:?}"))?;
         let addr = resolve_endpoint(&ep)
             .await
             .ok_or_else(|| format!("--storage 无法解析为地址：{s}"))?;
         println!("[存储] 房间键存储节点 = {addr}（--storage 指定）");
-        return Ok(addr);
+        // 没有查过房间在不在
+        return Ok((addr, None));
     }
     let candidates = storage_candidates(&node.known_nodes().await, entries, seeds);
     if candidates.is_empty() {
@@ -587,7 +697,7 @@ async fn resolve_storage(
              房间里只会有你自己。请至少配置一个完整版种子（wgp-node）"
         );
     }
-    Ok(pick.candidate.addr)
+    Ok((pick.candidate.addr, Some(pick.existing)))
 }
 
 /// 汇集存储候选：发现的种子（广告里带中转能力）+ 手工配置但没有宣告自己的入口种子
@@ -1360,5 +1470,85 @@ mod tests {
         assert_eq!(granted, RETRY_BACKOFF_SECS.len());
         // 用尽后继续询问仍是 None（不回绕）
         assert!(schedule_retry(&mut retries, "test").is_none());
+    }
+
+    #[test]
+    fn join_command_carries_seeds_observer_and_ports() {
+        let o = parse_opts(&v(&[
+            "-p",
+            "udp://seed.example:11010",
+            "--peers",
+            "tcp://seed.example:3481",
+            "--observer",
+            "192.0.2.7:3478",
+            "--expose",
+            "25565",
+            "--expose",
+            "8080=192.168.1.20:80",
+            "--expose-udp",
+            "19132",
+        ]))
+        .unwrap();
+        let cfg = build_port_config(&o).unwrap();
+        let cmd = join_command(
+            "U/C2G9-GYET-311W-R636",
+            o.seed.as_deref().unwrap(),
+            o.observer.as_deref(),
+            &cfg,
+        );
+        assert_eq!(
+            cmd,
+            "wgp-client join U/C2G9-GYET-311W-R636 \
+             -p udp://seed.example:11010,tcp://seed.example:3481 \
+             --observer 192.0.2.7:3478 --forward 25565 --forward 8080 --forward-udp 19132"
+        );
+        // 生成的命令行能被本程序自己解析回去，且转发规则合法
+        let args: Vec<String> = cmd.split(' ').skip(2).map(str::to_string).collect();
+        let parsed = parse_opts(&args).unwrap();
+        assert_eq!(resolve_join_code(&parsed).unwrap(), "U/C2G9-GYET-311W-R636");
+        let joiner_cfg = build_port_config(&parsed).unwrap();
+        assert_eq!(joiner_cfg.forward_tcp.len(), 2);
+        assert_eq!(joiner_cfg.forward_udp.len(), 1);
+    }
+
+    #[test]
+    fn join_command_without_extras_is_just_the_code() {
+        let cmd = join_command("U/C2G9-GYET-311W-R636", "", None, &PortConfig::default());
+        assert_eq!(cmd, "wgp-client join U/C2G9-GYET-311W-R636");
+    }
+
+    #[test]
+    fn unforwarded_hint_names_missing_ports_once() {
+        let forwarded = Forwarded {
+            tcp: [25565u16].into_iter().collect(),
+            udp: HashSet::new(),
+        };
+        let mut hinted = HashSet::new();
+        let ready = PortEvent::TunnelReady {
+            peer: [7u8; 16],
+            tcp: vec![25565, 8080],
+            udp: vec![19132],
+        };
+        let hint = unforwarded_hint(&ready, &forwarded, &mut hinted).expect("有没转发的端口应提示");
+        assert!(hint.contains("--forward 8080"), "{hint}");
+        assert!(hint.contains("--forward-udp 19132"), "{hint}");
+        assert!(!hint.contains("--forward 25565"), "已经转发的端口不该出现：{hint}");
+        // 重连后同样的端口不再重复提示
+        assert!(unforwarded_hint(&ready, &forwarded, &mut hinted).is_none());
+        // 全都转发了：不提示
+        let all = Forwarded {
+            tcp: [25565u16, 8080].into_iter().collect(),
+            udp: [19132u16].into_iter().collect(),
+        };
+        assert!(unforwarded_hint(&ready, &all, &mut HashSet::new()).is_none());
+    }
+
+    #[test]
+    fn join_errors_are_explained() {
+        let storage: SocketAddr = "192.0.2.1:11010".parse().unwrap();
+        let timeout = describe_join_error(&RoomError::NotFound, storage);
+        assert!(timeout.contains("入表超时") && timeout.contains("192.0.2.1:11010"), "{timeout}");
+        let unreachable = describe_join_error(&RoomError::StoreFailed, storage);
+        assert!(unreachable.contains("没有应答"), "{unreachable}");
     }
 }
