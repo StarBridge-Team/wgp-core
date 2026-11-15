@@ -4,6 +4,9 @@
 # 预编译对照件（来自 external release 包，不入库）
 /release-prebuilt/
 
+# 打包产物（scripts/package.ps1 生成，不入库）
+/dist/
+
 # 节点/客户端身份私钥，绝不入库
 node_identity.key
 wgp-client.key
