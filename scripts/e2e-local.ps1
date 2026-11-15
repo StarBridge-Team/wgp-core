@@ -32,10 +32,14 @@
   powershell -ExecutionPolicy Bypass -File scripts\e2e-local.ps1
   powershell -ExecutionPolicy Bypass -File scripts\e2e-local.ps1 -Discovery
   powershell -ExecutionPolicy Bypass -File scripts\e2e-local.ps1 -Configuration release -Bytes 67108864
+  powershell -ExecutionPolicy Bypass -File scripts\e2e-local.ps1 -BinDir target\i686-pc-windows-msvc\release
 #>
 param(
     [ValidateSet('debug', 'release')]
     [string]$Configuration = 'debug',
+    # test the binaries in this directory instead of target\<Configuration> (implies -SkipBuild);
+    # it must contain wgp-node.exe, wgp-node-hobby.exe, wgp-client.exe and examples\echo_tool.exe
+    [string]$BinDir = '',
     [int]$SeedPort = 21010,
     [int]$StunPort = 23478,
     [int]$TcpPort = 23481,
@@ -61,6 +65,10 @@ $ErrorActionPreference = 'Stop'
 
 $root = Split-Path -Parent $PSScriptRoot
 $bin = Join-Path $root "target\$Configuration"
+if ($BinDir -ne '') {
+    $bin = (Resolve-Path $BinDir).Path
+    $SkipBuild = $true
+}
 $work = Join-Path ([IO.Path]::GetTempPath()) ('wgp-e2e-' + [Guid]::NewGuid().ToString('N').Substring(0, 8))
 New-Item -ItemType Directory -Path $work | Out-Null
 $script:procs = @()
