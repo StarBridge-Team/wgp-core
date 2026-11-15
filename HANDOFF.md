@@ -71,8 +71,12 @@ mesh-tun-proto 一行未改。
 | 10 | TCP 兜底只做主动连接；一波里的多个端口并行尝试却没开端口共用 | Linux 上 SYN 不交叉就被 RST，回环与公网直连主机上打不通（Windows 会自行重发 SYN，掩盖了问题）；并行尝试实际只有第一个端口在试 |
 | 11 | 串行探测执行器收到第一枚验签通过的包就结束监听 | 自己的探针折返回来时，随后到达的真对端探针被错过（该执行器目前只有测试在用） |
 | 12 | 节点入网引导只做一次 | 几个种子同时启动时 20～60 秒内互不认识；这期间两个只认识不同种子的客户端会把同一个房间建到两个存储节点上 |
+| 13 | 存储节点重启后房间不恢复 | 房间记录与地址簿都只在种子的内存里：重启后记录没人重建，新来的人另起一个房间；老成员的地址要 20 秒后才重新登记，期间协商反复失败 |
 
-第 10～12 项是第一次在 Linux 上跑全套测试与端到端时查出来的（此前只在 Windows 上跑过）。
+第 10～13 项是第一次在 Linux 上跑全套测试、端到端与场景测试时查出来的（此前只在 Windows 上跑过）。
+
+**客户端易用性**（同一轮）：房主启动后直接打印一行完整的加入命令（含种子与转发端口），同伴原样执行即可；
+隧道通了但没转发对端暴露的端口、用「加入」却没找到房间、入表失败，这三种情况现在都有明确的说明。
 
 第 6 项改了报文格式（JoinRequest v2），**新旧客户端不能混用**。API 漂移全部登记在
 [`docs/14`](docs/14-内核API文档.md) §12.1。
@@ -81,11 +85,12 @@ mesh-tun-proto 一行未改。
 
 | 验证项 | 结果 |
 |---|---|
-| `cargo test --workspace` | **Windows 291 / Linux 290，0 failed**（Linux 少的一个是只在 Windows 编译的用例；另有 `bridge/wgp-et-bridge` 4 个） |
+| `cargo test --workspace` | **Windows 297 / Linux 296，0 failed**（Linux 少的一个是只在 Windows 编译的用例；另有 `bridge/wgp-et-bridge` 4 个） |
 | wgp-core 整套测试并行重复运行 | Windows 30 遍、Linux 150 遍，0 失败（修复第 11 项之前：Linux 150 遍里失败 2 遍） |
 | `cargo check --workspace --all-targets` | 0 warning；`x86_64-unknown-linux-gnu` 目标同样 0 warning |
 | Windows 端到端（`scripts\e2e-local.ps1`） | 单种子 / `-Discovery` / `-Discovery -Hobby` 全部 PASS |
 | Linux 端到端（`scripts/e2e-local.sh`） | WSL2 Ubuntu 24.04（musl 静态二进制）与云端原生 Linux（rustc 1.100）：三种模式全部 PASS；双种子模式在原生 Linux 上连跑 25 遍 0 失败（修复第 12 项之前：18 遍里失败 2 遍） |
+| 种子重启场景（原生 Linux，临时脚本：房主 + 成员 → 重启种子 → 新成员加入） | 新成员在种子恢复 0～3 秒后加入，7 次全部连上房主；恢复 2 秒以后加入的能看到全部老成员（修复第 13 项之前始终只看到自己） |
 | 吞吐（release，回环，经转发口） | Windows 单向约 33 MiB/s；WSL 约 18 MiB/s |
 | 仅 hobby 种子 | **复现失败**：第二个成员始终进不了房间（见 §3.2） |
 
@@ -210,7 +215,7 @@ mesh-tun-proto 一行未改。
 
 ```powershell
 cd 'E:\Work Files\Code\Rust\wgp'
-cargo test --workspace                                                    # Windows 291 / Linux 290 绿
+cargo test --workspace                                                    # Windows 297 / Linux 296 绿
 powershell -ExecutionPolicy Bypass -File scripts\e2e-local.ps1            # 单种子全流程
 powershell -ExecutionPolicy Bypass -File scripts\e2e-local.ps1 -Discovery # 双种子发现
 ```

@@ -51,7 +51,7 @@ nat/                  NAT 实测数据
 ## 构建与测试
 
 ```bash
-cargo test --workspace        # Windows 291 个 / Linux 290 个测试，全部跑在回环上
+cargo test --workspace        # Windows 297 个 / Linux 296 个测试，全部跑在回环上
 cargo build --release         # LTO release，产出 wgp-node / wgp-node-hobby / wgp-client
 ```
 
