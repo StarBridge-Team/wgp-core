@@ -139,7 +139,9 @@ wgp-node-hobby --bind 0.0.0.0:11010 --stun 3478 --tcp 3481
 
 步骤：`firewall-hobby.bat`（管理员）→ 光猫/路由器端口映射（以 `wgp-node.conf` 中的端口为准，映射到本机内网 IP）→ 双击 `start-hobby.bat` → 日志出现 `已就绪（种子+观察者+承诺兜底）` 即成功。细节（自启、公网 IP 变动、卸载）见包内 `README.md`。
 
-> 每次重新 `cargo build --release` 后，记得把新的 `target/release/wgp-node-hobby.exe` 拷入本目录，保持包内二进制与源码一致。
+> 服务端代码有改动后，记得重新构建并把新的 `wgp-node-hobby.exe` 拷入本目录，保持包内二进制与源码一致。
+> 请用 `scripts\package.ps1` 构建、取 `target\package\release\wgp-node-hobby.exe`：这样编出来的程序不依赖 VC++ 运行库，
+> 也不会把构建者本机的用户目录路径带进仓库（直接 `cargo build --release` 的产物里有）。
 
 ## 7.2 Linux 一键部署（参数化，不写死端口）
 
