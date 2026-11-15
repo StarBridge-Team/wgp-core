@@ -176,7 +176,7 @@ start_bg echo-udp "$BIN/examples/echo_tool" serve-udp "$UDP_SERVICE_PORT"
 step 'seed node ready' wait_log node "$MARK_NODE_READY" 15 || exit 1
 if [ "$DISCOVERY" -eq 1 ]; then
   step 'second seed ready' wait_log node2 "$MARK_NODE_READY" 15 || exit 1
-  step 'the two seeds discovered each other' seeds_met
+  step 'the two seeds discovered each other' seeds_met || exit 1
 fi
 
 client_args host host.key "$HOST_SEED" --expose "$SERVICE_PORT" --expose-udp "$UDP_SERVICE_PORT"

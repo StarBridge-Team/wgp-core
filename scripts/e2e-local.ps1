@@ -218,9 +218,10 @@ try {
     if ($Discovery) {
         $ready2 = Step 'second seed ready' { Wait-Log 'node2' $PatNodeReady 15 }
         if (-not $ready2) { throw 'second seed did not become ready' }
-        Step 'the two seeds discovered each other' {
+        $met = Step 'the two seeds discovered each other' {
             (Wait-Log 'node' $PatSeedDirOne 15) -and (Wait-Log 'node2' $PatSeedDirOne 15)
-        } | Out-Null
+        }
+        if (-not $met) { throw 'the two seeds did not discover each other' }
     }
 
     Start-Bg 'host' (Join-Path $bin 'wgp-client.exe') (Client-Args 'host' 'host.key' $hostSeed @(
