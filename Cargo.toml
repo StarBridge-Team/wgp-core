@@ -5,6 +5,7 @@ members = [
     "kernel/wgp-punch",
     "kernel/wgp-dht",
     "kernel/wgp-core",
+    "bridge/wgp-port",
     "server/wgp-node",
     "client/wgp-client",
 ]

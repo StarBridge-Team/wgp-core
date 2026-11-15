@@ -590,6 +590,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "wgp-port"
+version = "0.1.0"
+dependencies = [
+ "rand_core",
+ "socket2 0.5.10",
+ "tokio",
+ "wgp-core",
+ "wgp-crypto",
+ "wgp-dht",
+ "wgp-proto",
+ "zeroize",
+]
+
+[[package]]
 name = "wgp-proto"
 version = "0.1.0"
 

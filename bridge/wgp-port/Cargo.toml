@@ -1,0 +1,20 @@
+[package]
+name = "wgp-port"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "折跃门数据面：PunchedLink → 加密隧道（UDP 可靠层 / TCP 记录流）→ 多路复用 → 端口转发（外围，不属内核）"
+
+[dependencies]
+wgp-core = { path = "../../kernel/wgp-core" }
+wgp-crypto = { path = "../../kernel/wgp-crypto" }
+wgp-proto = { path = "../../kernel/wgp-proto" }
+tokio = { workspace = true }
+socket2 = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+wgp-dht = { path = "../../kernel/wgp-dht" }
+rand_core = { workspace = true }
