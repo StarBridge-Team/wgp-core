@@ -67,18 +67,25 @@ mesh-tun-proto 一行未改。
 | 6 | **报道请求明文携带房间码** | 房间码是会话密钥派生的口令，经种子中转等于交给种子；读代码推断可据此做中间人，未写攻击实测 |
 | 7 | 租约过期判定跨进程比较单调时钟 | 成员进程比锚点老会误夺锚点；比锚点新则锚点掉线后很久判不出 |
 | 8 | 加入房间时报道只发一次 | 丢一个包就「入表超时」 |
+| 9 | 没宣告自己的贡献节点被当成可中转 | 房间可能建在它上面（看房间键离谁近），第二个成员进不来，且没有告警 |
+| 10 | TCP 兜底只做主动连接；一波里的多个端口并行尝试却没开端口共用 | Linux 上 SYN 不交叉就被 RST，回环与公网直连主机上打不通（Windows 会自行重发 SYN，掩盖了问题）；并行尝试实际只有第一个端口在试 |
+| 11 | 串行探测执行器收到第一枚验签通过的包就结束监听 | 自己的探针折返回来时，随后到达的真对端探针被错过（该执行器目前只有测试在用） |
+| 12 | 节点入网引导只做一次 | 几个种子同时启动时 20～60 秒内互不认识；这期间两个只认识不同种子的客户端会把同一个房间建到两个存储节点上 |
+
+第 10～12 项是第一次在 Linux 上跑全套测试与端到端时查出来的（此前只在 Windows 上跑过）。
 
 第 6 项改了报文格式（JoinRequest v2），**新旧客户端不能混用**。API 漂移全部登记在
 [`docs/14`](docs/14-内核API文档.md) §12.1。
 
-### 2.4 验证范围（全部在本机，全部是回环）
+### 2.4 验证范围（全部是回环；Windows 与 WSL 在开发机，原生 Linux 在一台云端虚拟机）
 
 | 验证项 | 结果 |
 |---|---|
-| `cargo test --workspace` | **286 passed / 0 failed**（另有 `bridge/wgp-et-bridge` 4 个） |
+| `cargo test --workspace` | **Windows 291 / Linux 290，0 failed**（Linux 少的一个是只在 Windows 编译的用例；另有 `bridge/wgp-et-bridge` 4 个） |
+| wgp-core 整套测试并行重复运行 | Windows 30 遍、Linux 150 遍，0 失败（修复第 11 项之前：Linux 150 遍里失败 2 遍） |
 | `cargo check --workspace --all-targets` | 0 warning；`x86_64-unknown-linux-gnu` 目标同样 0 warning |
 | Windows 端到端（`scripts\e2e-local.ps1`） | 单种子 / `-Discovery` / `-Discovery -Hobby` 全部 PASS |
-| Linux 端到端（`scripts/e2e-local.sh`，WSL2 Ubuntu 24.04，musl 静态二进制） | 三种模式全部 PASS——这是项目第一次在 Linux 上运行 |
+| Linux 端到端（`scripts/e2e-local.sh`） | WSL2 Ubuntu 24.04（musl 静态二进制）与云端原生 Linux（rustc 1.100）：三种模式全部 PASS；双种子模式在原生 Linux 上连跑 25 遍 0 失败（修复第 12 项之前：18 遍里失败 2 遍） |
 | 吞吐（release，回环，经转发口） | Windows 单向约 33 MiB/s；WSL 约 18 MiB/s |
 | 仅 hobby 种子 | **复现失败**：第二个成员始终进不了房间（见 §3.2） |
 
@@ -104,12 +111,13 @@ mesh-tun-proto 一行未改。
 | 4 | FIND_NODE / FIND_VALUE 应答远大于请求 | UDP 源地址可伪造，这两个既有 RPC 是约 20 倍的反射放大器。新增的 FIND_SEEDS 已按「应答不长于请求」设计，旧的没动（改了就是协议变更） |
 | 5 | 观察者限频与用量不匹配 | 默认每 IP 12 次 / 10s，而每次协商每端要 4 次：同一公网 IP 下多人或多对端并发协商会被限 |
 | 6 | 弱房间名 / 密钥可被离线猜解 | 存储节点知道 room_key（房间码的哈希），可对弱口令做字典攻击。「开房」不给密钥时默认随机生成 |
-| 7 | 房间记录仍是单存储点（K=1） | 存储节点掉线则房间不可达；两端认识的种子不一样时靠「跟随既有房间」缓解，不能根除分裂 |
+| 7 | 房间记录仍是单存储点（K=1） | 存储节点掉线则房间不可达；两端认识的种子不一样时靠「跟随既有房间」缓解，不能根除分裂。一旦同一个房间被建到了两个种子上，之后即使种子目录补全也不会自愈 |
 | 8 | 协商最后一帧丢失 | 「两将军」问题：一端以为完成、另一端超时；靠客户端的重试兜底 |
 | 9 | Unix 的 ICMP 逃生后端收不到包 | socket 设了非阻塞又立即同步读；该载体本来也没有接线 |
 | 10 | 重度乱序下可靠层吞吐低 | 标准阈值把乱序判成丢包；调优要等真实数据 |
 | 11 | `--advertise` 只支持固定 IPv4 | 家宽动态 IP 的节点换了地址要重启；外部端口必须与本机端口一致 |
 | 12 | P0 不校验信任 | 任何人都能宣告自己是种子并可能被选为存储节点；目录只代表「存在且连得上」 |
+| 13 | `rust-version = "1.75"` 与锁文件不符 | 锁定的 `zeroize_derive 1.5.0` 要求 Rust 1.85 以上（用 1.83 构建会在解析依赖时失败）。基线就是如此；CI 用最新稳定版，不受影响 |
 
 ### 3.3 没做的
 
@@ -202,7 +210,7 @@ mesh-tun-proto 一行未改。
 
 ```powershell
 cd 'E:\Work Files\Code\Rust\wgp'
-cargo test --workspace                                                    # 286 绿
+cargo test --workspace                                                    # Windows 291 / Linux 290 绿
 powershell -ExecutionPolicy Bypass -File scripts\e2e-local.ps1            # 单种子全流程
 powershell -ExecutionPolicy Bypass -File scripts\e2e-local.ps1 -Discovery # 双种子发现
 ```

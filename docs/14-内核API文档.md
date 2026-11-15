@@ -266,8 +266,11 @@ impl Engine {
 | `join_room` 入表 | 报道发一次，轮询 3s | 轮询 6s，每 1.5s 补发报道 | 报道无应答，丢一个包即失败 |
 | 种子广告 | V1（91B，无公钥），从未发送 | V2（type `0x21`，123B，自带公钥，布局见 17 §10）；RPC `FIND_SEEDS(0x39)` / `SEEDS(0x3A)`（应答不长于请求）；`SeedDirectory`；`DhtNode::{start_advertising, find_seeds, discover, seek_seeds, lookup_node, spread, spawn_maintenance, seeds, watch_seeds}` | 17 P0：让节点互相发现 |
 | `NodeConfig` | 6 个字段 | 新增 `advertise / advertise_epoch / peers` | 同上；纪元由外围持久化（启动计数）后注入 |
+| `TcpProbeCarrier` | 只主动连接，靠 SYN 交叉（simultaneous open）建立；一波里的多个端口并行尝试时绑同一个源端口，却没开端口共用 | 同端口「监听 + 主动连接」，先通先用；监听口先验对端探针、通过后才回我方探针；socket 开 SO_REUSEADDR（Unix 另加 SO_REUSEPORT）；一次 `punch_port` 总时限 990ms；返回流的对端以 `peer_addr()` 为准 | Linux 上 SYN 不交叉就被本机 RST 拒绝，回环与公网直连主机上必然失败（Windows 会自行重发 SYN，掩盖了问题）；并行尝试互相挤占端口，实际只有第一个端口在试 |
+| `PunchRunner::run_waves` | 收到第一枚验签通过的包就结束本波监听，再判断它算不算命中 | 不算数的包（自己的探针折返、源 IP 不是对端）丢弃后继续等到窗口结束 | 撒网端口撞上自己的端口时，自己的探针折返会让随后到达的真对端探针被错过。引擎实际使用的竞速执行器（`race.rs`）本来就是这样处理的 |
+| 节点入网引导（`run_node` / `DhtNode::discover`） | 引导只做一次；自己的广告只在启动时与每 60s 推送 | 一个引导端点都没问到时按 0 / 0.3 / 0.7 / 1.5 / 3 / 6 秒重试，之后交给周期维护；`discover` 结束时把自己的广告推给已知种子 | 几个种子同时启动、对方端口还没开时，要 20～60 秒才互相认识；这期间两个只认识不同种子的客户端会把同一个房间建到两个存储节点上 |
 | 房间存储节点 | 外围取「测速最快的 UDP 种子」 | `RoomRuntime::locate(node, code, candidates)`：已有该房间记录的优先；否则可达候选按中转能力分档（明确可中转 > 不知道 > 明确不中转），同档取离房间键最近者。仍是单存储点 | 两端必须选中同一个才能相遇 |
 
-**已验证边界（诚实声明）**：截至 2026-11-15，全部 286 个测试与端到端脚本都跑在回环上（Windows，以及 WSL2 里的 Linux）；跨平台性由"零平台依赖代码 + tokio 抽象"保证，Linux 侧以 [部署清单](../server/deploy/DEPLOY.md) 第 0 步"编译测试先行"为验证门。
+**已验证边界（诚实声明）**：截至 2026-11-15，全部测试（Windows 291 个、Linux 290 个）与端到端脚本都跑在回环上（Windows、WSL2 里的 Linux、一台云端虚拟机上的原生 Linux）；跨平台性由"零平台依赖代码 + tokio 抽象"保证，Linux 侧以 [部署清单](../server/deploy/DEPLOY.md) 第 0 步"编译测试先行"为验证门。
 
 *文档结束*
