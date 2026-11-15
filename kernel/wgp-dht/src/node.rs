@@ -3,22 +3,30 @@
 //! 学习语义：仅 PING/PONG 双向学习（sender_id ↔ src 入地址簿）；
 //! Forward 不做身份学习（防垃圾投递毒化地址簿），fire-and-forget 邮件语义，
 //! 上层信令自持超时重发（sig::Commit REQUIRE_ACK / 3s 超时）。
+//!
+//! 种子发现（07 §5 第③层 / 17 P0）：公网节点把自己的签名广告周期推给已知种子；任何节点都可以
+//! 向别人索取它已知的种子广告（FIND_SEEDS）。一条广告要进种子目录，必须验签通过，并且广告主
+//! 确实在所报地址上应答 PING。P0 不做信任评分：目录里的种子只代表「存在且可达」，不代表可信。
 
+use crate::advertise::{sign_advertise_v2, verify_advertise_v2, AdvertiseSpec};
+use crate::directory::{advert_addr, RawAdvert, SeedDirectory, SeedInfo, Verdict};
 use crate::id::{node_id_from_verifying, NodeId, NodeIdentity};
 use crate::kbucket::RoutingTable;
 use ed25519_dalek::VerifyingKey;
-use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, watch, Mutex, Semaphore};
+use tokio::task::JoinSet;
 use wgp_proto::dht::{
-    FindNodeBody, FindValueBody, ForwardBody, NeighborsBody, NodeEntry, PingBody, RpcBody,
-    RpcPacket, StoreBody, ValueBody,
+    FindNodeBody, FindSeedsBody, FindValueBody, ForwardBody, NeighborsBody, NodeEntry, PingBody, RpcBody,
+    RpcPacket, SeedsBody, StoreBody, ValueBody, SEEDS_MAX,
 };
+use wgp_proto::packet::{classify, seed_advertise_v2, SeedAdvertiseV2};
 
 /// RPC 超时/失败
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +62,26 @@ const KV_MAX_ENTRIES: usize = 4096;
 /// KV 条目写入时间戳（用于 TTL 清扫与最旧淘汰）
 type KvEntry = (Vec<u8>, Instant);
 
+// —— 种子发现（17 P0） ——
+/// 存活复验的并发上限（每条新广告触发一次 PING；超出即丢弃，等广告主下一轮重发）
+const VERIFY_CONCURRENCY: usize = 8;
+/// 主动推送来的广告每秒最多验签多少条（挡住用广告洪流消耗 CPU；超出静默丢弃）
+const ADVERT_VERIFY_PER_SEC: u32 = 64;
+/// 用户配置的入口端点数上限
+const PINNED_MAX: usize = 16;
+/// 维护节拍：探活已知种子（也是本端到种子的 NAT 映射保活周期）
+const MAINTAIN_TICK: Duration = Duration::from_secs(20);
+/// 每多少拍推送一次自己的广告（60s）
+const ADVERTISE_EVERY_TICKS: u32 = 3;
+/// 每多少拍向已知种子重新索取一次目录（5min），学到后来加入的节点
+const PULL_EVERY_TICKS: u32 = 15;
+/// 一次引导 / 补全最多向多少个节点索取种子广告
+const DISCOVER_MAX_ASKS: usize = 8;
+/// 迭代节点查找：每轮并发数 / 最多轮数 / 最多接触的节点数
+const LOOKUP_ALPHA: usize = 3;
+const LOOKUP_MAX_ROUNDS: usize = 4;
+const LOOKUP_MAX_CONTACTS: usize = 12;
+
 /// 应答投递出口：UDP 回源地址 / TCP 连接的写端。
 ///
 /// 关键：TCP 连接携带的源 IP:port 与 UDP NAT 映射**无关**（TCP 源端口 ≠ UDP 源端口），
@@ -79,6 +107,7 @@ enum Pending {
     Neighbors(oneshot::Sender<Vec<NodeEntry>>),
     Value(oneshot::Sender<ValueBody>),
     StoreAck(oneshot::Sender<()>),
+    Seeds(oneshot::Sender<Vec<RawAdvert>>),
 }
 
 /// 中继策略（07 §6 贡献模式：家庭带宽节点拒绝 Forward 中转——
@@ -110,6 +139,21 @@ pub struct DhtNode {
     inbox_rx: Mutex<mpsc::Receiver<ForwardBody>>,
     /// 中继开关（默认 Allow；贡献模式置 Deny）
     relay_allow: AtomicBool,
+    /// 种子目录（17 P0：验签 + 存活复验后入表）
+    seeds: Mutex<SeedDirectory>,
+    /// 目录变更通知（值 = 变更代数）
+    seeds_gen: watch::Sender<u64>,
+    /// 正在做存活复验的广告主（去重：同一广告主同时只探一次）
+    verifying: Mutex<HashSet<NodeId>>,
+    verify_slots: Arc<Semaphore>,
+    /// 推送广告的验签限速（窗口起点, 窗口内已验条数）
+    advert_gate: Mutex<(Instant, u32)>,
+    /// 用户显式配置的入口端点（--seed / --peers）
+    pinned: Mutex<HashSet<SocketAddr>>,
+    /// 本节点的广告原文（None = 不宣告：NAT 后的客户端）
+    own_advert: Mutex<Option<RawAdvert>>,
+    /// 维护循环是否已启动
+    maintaining: AtomicBool,
 }
 
 /// 默认收件队列容量
@@ -133,6 +177,14 @@ impl DhtNode {
             inbox_tx,
             inbox_rx: Mutex::new(inbox_rx),
             relay_allow: AtomicBool::new(true),
+            seeds: Mutex::new(SeedDirectory::new()),
+            seeds_gen: watch::channel(0u64).0,
+            verifying: Mutex::new(HashSet::new()),
+            verify_slots: Arc::new(Semaphore::new(VERIFY_CONCURRENCY)),
+            advert_gate: Mutex::new((Instant::now(), 0)),
+            pinned: Mutex::new(HashSet::new()),
+            own_advert: Mutex::new(None),
+            maintaining: AtomicBool::new(false),
         });
 
         // 读循环：RPC 为主；非 RPC 且为 Binding Request → 观察者应答（同 socket 3478 场景）
@@ -146,6 +198,11 @@ impl DhtNode {
                 };
                 if let Some(pkt) = RpcPacket::decode(&buf[..n]) {
                     loop_node.dispatch(pkt, Sink::Udp(src)).await;
+                } else if n == seed_advertise_v2::LEN
+                    && classify(&buf[..n]) == Some(seed_advertise_v2::TYPE)
+                {
+                    // 别的节点推送来的种子广告（非 RPC：定长报文，无应答）
+                    loop_node.on_pushed_advert(&buf[..n]).await;
                 } else if let Some(resp) = crate::observe::try_answer_stun(&buf[..n], src) {
                     let _ = loop_node.socket.send_to(&resp, src).await;
                 }
@@ -512,6 +569,15 @@ impl DhtNode {
                     let _ = tx.send(body);
                 }
             }
+            RpcBody::FindSeeds(body) => {
+                self.answer_seeds(body, &sink, pkt.header.txid).await;
+            }
+            RpcBody::Seeds(body) => {
+                if let Some(Pending::Seeds(tx)) = self.pending.lock().await.remove(&pkt.header.txid)
+                {
+                    let _ = tx.send(body.adverts);
+                }
+            }
         }
     }
 
@@ -705,6 +771,501 @@ impl DhtNode {
     }
 }
 
+// —————————————— 种子发现（07 §5 第③层 / 17 P0） ——————————————
+
+/// 一条入站广告验签之后的去向
+enum AdvertStep {
+    /// 无效：验签失败 / 是自己的广告 / 所报地址不可用
+    Rejected,
+    /// 广告主已在目录中（重放、迟到，或已就地刷新）
+    Known,
+    /// 新广告主，或换了端点：要先探活
+    Probe(Candidate),
+}
+
+/// 等待存活复验的广告
+struct Candidate {
+    id: NodeId,
+    adv: SeedAdvertiseV2,
+    raw: RawAdvert,
+    addr: SocketAddr,
+}
+
+/// 广告所报端点是否可用作目的地址（只做格式层面的排除；是否可达由探活回答）
+fn is_usable_endpoint(addr: SocketAddr) -> bool {
+    match addr.ip() {
+        IpAddr::V4(ip) => {
+            addr.port() != 0 && !ip.is_unspecified() && !ip.is_broadcast() && !ip.is_multicast()
+        }
+        IpAddr::V6(_) => false,
+    }
+}
+
+/// 固定窗口限速：`gate` = (窗口起点, 窗口内已放行数)；每秒至多放行 ADVERT_VERIFY_PER_SEC 次
+fn gate_admit(gate: &mut (Instant, u32), now: Instant) -> bool {
+    if now.duration_since(gate.0) >= Duration::from_secs(1) {
+        *gate = (now, 0);
+    }
+    if gate.1 >= ADVERT_VERIFY_PER_SEC {
+        return false;
+    }
+    gate.1 += 1;
+    true
+}
+
+fn rtt_millis(rtt: Duration) -> u32 {
+    u32::try_from(rtt.as_millis()).unwrap_or(u32::MAX)
+}
+
+impl DhtNode {
+    /// 种子目录快照（按探活往返耗时升序）
+    pub async fn seeds(&self) -> Vec<SeedInfo> {
+        self.seeds.lock().await.list()
+    }
+
+    /// 订阅目录变更。值只是变更代数，含义仅为「有变化了，请重新读一次 seeds()」
+    pub fn watch_seeds(&self) -> watch::Receiver<u64> {
+        self.seeds_gen.subscribe()
+    }
+
+    /// 本节点当前的广告原文（未宣告为 None）
+    pub async fn own_advert(&self) -> Option<RawAdvert> {
+        *self.own_advert.lock().await
+    }
+
+    /// 登记用户显式配置的入口端点（--seed / --peers）。它们在目录满员时不被挤出；即使尚未
+    /// 宣告自己，维护循环也会周期探活它们（保住到它们的 NAT 映射）并询问其种子目录。
+    pub async fn pin_seeds(&self, addrs: &[SocketAddr]) {
+        let mut pinned = self.pinned.lock().await;
+        for addr in addrs {
+            if pinned.len() >= PINNED_MAX {
+                break;
+            }
+            pinned.insert(*addr);
+        }
+    }
+
+    /// 开始对外宣告本节点（仅公网可达的节点调用；地址与端口由部署层给出）。
+    ///
+    /// `epoch`：广告纪元。接收端只采纳比已有的更大的纪元，所以同一身份每次重启（或广告内容
+    /// 变化）都要传入更大的值。内核既不读系统时钟（H5）也不落盘：由外围持久化一个启动计数后
+    /// 注入（wgp-node 的做法见 server.rs）。纪元回退的后果只是：已经认识本节点的人继续沿用
+    /// 旧广告，直到旧端点探活失败被逐出后才重新采纳。
+    ///
+    /// 广告由维护循环周期推给已知种子与入口端点；调用后立即推送一轮。
+    pub async fn start_advertising(&self, spec: AdvertiseSpec, epoch: u64) {
+        let raw = sign_advertise_v2(&self.identity, &spec, epoch.max(1));
+        *self.own_advert.lock().await = Some(raw);
+        self.push_advert().await;
+    }
+
+    /// 向 `dest` 索取它已知的、离 `target` 最近的种子广告，把通过验签与存活复验的写入目录。
+    /// 返回对方给出的广告中、此刻已在本地目录里的条数（全部探活有结果后才返回）。
+    pub async fn find_seeds(
+        self: &Arc<Self>,
+        dest: SocketAddr,
+        target: NodeId,
+    ) -> Result<usize, RpcError> {
+        let adverts = self.request_seeds(dest, target, SEEDS_MAX).await?;
+        Ok(self.absorb_adverts(adverts).await)
+    }
+
+    /// 入网引导（07 §5）：以 `entry`（用户配置的入口端点）为起点建立种子目录。
+    /// 入口端点登记为 pinned；向每个入口索取种子广告，再向新学到的种子问一层（让目录不局限于
+    /// 入口自己认识的那几个）；更远的由周期维护慢慢补。返回目录内的种子数。
+    pub async fn discover(self: &Arc<Self>, entry: &[SocketAddr]) -> usize {
+        self.pin_seeds(entry).await;
+        let me = self.node_id();
+        let mut asked: HashSet<SocketAddr> = HashSet::new();
+        let mut frontier: Vec<SocketAddr> = entry.to_vec();
+        for _ in 0..2 {
+            frontier.retain(|addr| asked.len() < DISCOVER_MAX_ASKS && asked.insert(*addr));
+            if frontier.is_empty() {
+                break;
+            }
+            self.ask_many(std::mem::take(&mut frontier), me).await;
+            frontier = self.seeds().await.into_iter().map(|s| s.addr).collect();
+        }
+        self.seeds.lock().await.len()
+    }
+
+    /// 为某个键（如房间键）补全它附近的种子：向已知种子各问一次「离 `target` 最近的有哪些」。
+    /// 种子很少时与 discover 的结果相同；种子多到一次问不全时，这一步让各客户端对「谁离这个键
+    /// 最近」的看法收敛。返回目录内的种子数。
+    pub async fn seek_seeds(self: &Arc<Self>, target: NodeId) -> usize {
+        let mut addrs = self.known_seed_addrs().await;
+        addrs.truncate(DISCOVER_MAX_ASKS);
+        self.ask_many(addrs, target).await;
+        self.seeds.lock().await.len()
+    }
+
+    /// 迭代节点查找（Kademlia FIND_NODE 扩散）：从 `entry` 出发，逐轮向离 `target` 最近的未访问
+    /// 候选发 FIND_NODE，用应答里的节点扩充候选，直到候选耗尽或触及轮数 / 接触数上限。
+    ///
+    /// 每个候选先 PING：应答者的身份过了绑定校验才算数（转述来的身份与实际应答者不符即丢弃），
+    /// 同时也让对方认识我们。应答里常常夹着 NAT 后的客户端——它们多半连不上，所以规模刻意压得
+    /// 很小，也不做「没有更近的候选就停」的提前终止。返回已验证的节点，按与 target 的距离升序。
+    pub async fn lookup_node(
+        self: &Arc<Self>,
+        target: NodeId,
+        entry: &[SocketAddr],
+    ) -> Vec<(NodeId, SocketAddr)> {
+        let me = self.node_id();
+        let mut seen: HashSet<SocketAddr> = entry.iter().copied().collect();
+        // (转述者声称的身份, 地址)；入口端点的身份未知（None），排序时排最前
+        let mut pending: Vec<(Option<NodeId>, SocketAddr)> =
+            seen.iter().map(|addr| (None, *addr)).collect();
+        let mut verified: Vec<(NodeId, SocketAddr)> = Vec::new();
+        let mut contacts = 0usize;
+
+        for _ in 0..LOOKUP_MAX_ROUNDS {
+            pending.sort_by_key(|(id, _)| id.map(|id| id.xor_distance(&target)));
+            let take = LOOKUP_ALPHA
+                .min(pending.len())
+                .min(LOOKUP_MAX_CONTACTS - contacts);
+            if take == 0 {
+                break;
+            }
+            contacts += take;
+            let mut asks = JoinSet::new();
+            for (claimed, addr) in pending.drain(..take) {
+                let node = self.clone();
+                asks.spawn(async move {
+                    let pong = node.ping(addr).await.ok()?;
+                    if claimed.is_some_and(|id| id != pong.node_id) {
+                        return None;
+                    }
+                    let neighbors = node.find_node(addr, target).await.unwrap_or_default();
+                    Some((pong.node_id, addr, neighbors))
+                });
+            }
+            while let Some(done) = asks.join_next().await {
+                let Ok(Some((id, addr, neighbors))) = done else {
+                    continue;
+                };
+                if !verified.iter().any(|(known, _)| *known == id) {
+                    verified.push((id, addr));
+                }
+                for entry in neighbors {
+                    let addr = SocketAddr::from((entry.ipv4, entry.port));
+                    if entry.id != me.0 && is_usable_endpoint(addr) && seen.insert(addr) {
+                        pending.push((Some(NodeId(entry.id)), addr));
+                    }
+                }
+            }
+        }
+        verified.sort_by_key(|(id, _)| id.xor_distance(&target));
+        verified
+    }
+
+    /// 扩散：以自身 ID 为目标做一次迭代查找，把沿途可达的节点认识一遍，再向其中还不在种子目录里的
+    /// 节点索取种子广告——入口种子不认识、但路由上够得着的宣告者，靠这一步进入目录。
+    /// 返回沿途验证过的节点数。耗时取决于不可达候选的超时，适合放在后台跑。
+    pub async fn spread(self: &Arc<Self>, entry: &[SocketAddr]) -> usize {
+        let me = self.node_id();
+        let reached = self.lookup_node(me, entry).await;
+        let listed: HashSet<SocketAddr> = self.seeds().await.into_iter().map(|s| s.addr).collect();
+        let fresh: Vec<SocketAddr> = reached
+            .iter()
+            .map(|(_, addr)| *addr)
+            .filter(|addr| !listed.contains(addr) && !entry.contains(addr))
+            .collect();
+        self.ask_many(fresh, me).await;
+        reached.len()
+    }
+
+    /// 启动后台维护（幂等）：
+    /// - 每 20s 探活目录里的种子与用户配置的入口端点——顺带保住本端到它们的 NAT 映射
+    ///   （种子要靠这条映射把别人的 Forward 投递过来）；连续 3 次不应答的种子逐出目录；
+    /// - 正在宣告的节点每 60s 把自己的广告推给已知种子与入口端点；
+    /// - 每 5 分钟向已知种子重新索取目录，学到后来加入的节点。
+    ///
+    /// 这些都是低频信令，与打洞探针无关，不占用打洞发包预算（H6）。
+    pub fn spawn_maintenance(self: &Arc<Self>) {
+        if self.maintaining.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let weak: Weak<Self> = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut tick: u32 = 0;
+            loop {
+                tokio::time::sleep(MAINTAIN_TICK).await;
+                let Some(node) = weak.upgrade() else {
+                    break;
+                };
+                tick = tick.wrapping_add(1);
+                node.probe_known_seeds().await;
+                if tick % ADVERTISE_EVERY_TICKS == 0 {
+                    node.push_advert().await;
+                }
+                if tick % PULL_EVERY_TICKS == 0 {
+                    let mut addrs = node.known_seed_addrs().await;
+                    addrs.truncate(DISCOVER_MAX_ASKS);
+                    let me = node.node_id();
+                    node.ask_many(addrs, me).await;
+                }
+            }
+        });
+    }
+
+    fn bump_seeds(&self) {
+        self.seeds_gen.send_modify(|gen| *gen = gen.wrapping_add(1));
+    }
+
+    async fn ping_timed(&self, dest: SocketAddr) -> Result<(PongInfo, Duration), RpcError> {
+        let start = Instant::now();
+        let pong = self.ping(dest).await?;
+        Ok((pong, start.elapsed()))
+    }
+
+    /// 已知种子的地址：目录条目（往返耗时升序）在前，尚未进目录的入口端点在后
+    async fn known_seed_addrs(&self) -> Vec<SocketAddr> {
+        let mut addrs: Vec<SocketAddr> = self.seeds().await.into_iter().map(|s| s.addr).collect();
+        let mut extra: Vec<SocketAddr> = self
+            .pinned
+            .lock()
+            .await
+            .iter()
+            .copied()
+            .filter(|addr| !addrs.contains(addr))
+            .collect();
+        extra.sort();
+        addrs.extend(extra);
+        addrs
+    }
+
+    /// 发 FIND_SEEDS 并等应答。请求按想要的条数填充（防反射放大，见 FindSeedsBody）
+    async fn request_seeds(
+        &self,
+        dest: SocketAddr,
+        target: NodeId,
+        count: usize,
+    ) -> Result<Vec<RawAdvert>, RpcError> {
+        let txid = self.next_txid();
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().await.insert(txid, Pending::Seeds(tx));
+        let pkt = RpcPacket::find_seeds(txid, FindSeedsBody::for_count(target.0, count));
+        if self.socket.send_to(&pkt.encode(), dest).await.is_err() {
+            self.pending.lock().await.remove(&txid);
+            return Err(RpcError::NoRoute);
+        }
+        match tokio::time::timeout(Duration::from_millis(1500), rx).await {
+            Ok(Ok(adverts)) => Ok(adverts),
+            _ => {
+                self.pending.lock().await.remove(&txid);
+                Err(RpcError::Timeout)
+            }
+        }
+    }
+
+    /// 应答 FIND_SEEDS：自己的广告（若在宣告）与目录条目一起按与 target 的距离排序，
+    /// 条数不超过请求的填充所允许的额度——应答永远不长于请求
+    async fn answer_seeds(&self, req: FindSeedsBody, sink: &Sink, txid: u32) {
+        let own = self.own_advert().await.map(|raw| (self.node_id(), raw));
+        let adverts = self
+            .seeds
+            .lock()
+            .await
+            .closest_raw(&NodeId(req.target), req.quota(), own);
+        let pkt = RpcPacket::seeds(txid, SeedsBody { adverts });
+        self.sink_send(sink, pkt.encode()).await;
+    }
+
+    /// 验签一条入站广告，并按目录现状决定去向（同端点的更新广告在这里就地刷新）
+    async fn examine_advert(&self, raw: &[u8]) -> AdvertStep {
+        let Some((adv, id)) = verify_advertise_v2(raw) else {
+            return AdvertStep::Rejected;
+        };
+        let addr = advert_addr(&adv);
+        if id == self.node_id() || !is_usable_endpoint(addr) {
+            return AdvertStep::Rejected;
+        }
+        let mut packet: RawAdvert = [0u8; seed_advertise_v2::LEN];
+        packet.copy_from_slice(raw);
+
+        let mut seeds = self.seeds.lock().await;
+        match seeds.judge(&id, &adv) {
+            Verdict::Stale => AdvertStep::Known,
+            Verdict::Refresh => {
+                seeds.refresh(&id, &adv, packet);
+                drop(seeds);
+                self.bump_seeds();
+                AdvertStep::Known
+            }
+            Verdict::Probe => AdvertStep::Probe(Candidate {
+                id,
+                adv,
+                raw: packet,
+                addr,
+            }),
+        }
+    }
+
+    /// 存活复验：在广告所报端点上 PING，应答必须来自该端点且身份就是广告主，通过即入目录。
+    /// 同一广告主同时只探一次；并发满额时直接放弃（广告主会重发，不值得排队）。
+    async fn probe_and_admit(&self, candidate: Candidate) -> bool {
+        if !self.verifying.lock().await.insert(candidate.id) {
+            return false;
+        }
+        let admitted = match self.verify_slots.clone().try_acquire_owned() {
+            Ok(_slot) => self.probe_candidate(&candidate).await,
+            Err(_) => false,
+        };
+        self.verifying.lock().await.remove(&candidate.id);
+        admitted
+    }
+
+    async fn probe_candidate(&self, candidate: &Candidate) -> bool {
+        let Ok((pong, rtt)) = self.ping_timed(candidate.addr).await else {
+            return false;
+        };
+        if pong.node_id != candidate.id || pong.addr != candidate.addr {
+            return false;
+        }
+        let pinned = self.pinned.lock().await.contains(&candidate.addr);
+        let admitted = self.seeds.lock().await.admit(
+            candidate.id,
+            &candidate.adv,
+            candidate.raw,
+            Some(rtt_millis(rtt)),
+            pinned,
+        );
+        if admitted {
+            self.bump_seeds();
+        }
+        admitted
+    }
+
+    /// 处置一批应我方请求而来的广告：需要探活的并发探，全部有结果后返回「已在目录中」的条数
+    async fn absorb_adverts(self: &Arc<Self>, adverts: Vec<RawAdvert>) -> usize {
+        let mut known = 0usize;
+        let mut probes = JoinSet::new();
+        for raw in adverts {
+            match self.examine_advert(&raw).await {
+                AdvertStep::Known => known += 1,
+                AdvertStep::Probe(candidate) => {
+                    let node = self.clone();
+                    probes.spawn(async move { node.probe_and_admit(candidate).await });
+                }
+                AdvertStep::Rejected => {}
+            }
+        }
+        while let Some(done) = probes.join_next().await {
+            if matches!(done, Ok(true)) {
+                known += 1;
+            }
+        }
+        known
+    }
+
+    /// 向一组节点并发索取「离 target 最近的种子」，全部有结果后返回
+    async fn ask_many(self: &Arc<Self>, addrs: Vec<SocketAddr>, target: NodeId) {
+        let mut asks = JoinSet::new();
+        for addr in addrs {
+            let node = self.clone();
+            asks.spawn(async move {
+                let _ = node.find_seeds(addr, target).await;
+            });
+        }
+        while asks.join_next().await.is_some() {}
+    }
+
+    /// 别的节点主动推来的广告：先过限速再验签；需要探活的放到后台，绝不阻塞读循环
+    async fn on_pushed_advert(self: &Arc<Self>, raw: &[u8]) {
+        if !self.advert_gate_admit().await {
+            return;
+        }
+        if let AdvertStep::Probe(candidate) = self.examine_advert(raw).await {
+            let node = self.clone();
+            tokio::spawn(async move {
+                node.probe_and_admit(candidate).await;
+            });
+        }
+    }
+
+    /// 推送广告的验签限速：每秒至多 ADVERT_VERIFY_PER_SEC 条
+    async fn advert_gate_admit(&self) -> bool {
+        let mut gate = self.advert_gate.lock().await;
+        gate_admit(&mut gate, Instant::now())
+    }
+
+    /// 把自己的广告推给已知种子与入口端点（未宣告则无事发生）
+    async fn push_advert(&self) {
+        let Some(raw) = self.own_advert().await else {
+            return;
+        };
+        for addr in self.known_seed_addrs().await {
+            let _ = self.socket.send_to(&raw, addr).await;
+        }
+    }
+
+    /// 探活一轮：目录里的种子记账（往返耗时 / 连续失败逐出）；尚未进目录的入口端点只要应答了，
+    /// 就顺手问它要它自己的广告（它可能刚开始宣告，或者我们启动时它还没上线）
+    pub(crate) async fn probe_known_seeds(self: &Arc<Self>) {
+        let listed: Vec<(NodeId, SocketAddr)> = self
+            .seeds()
+            .await
+            .into_iter()
+            .map(|s| (s.node_id, s.addr))
+            .collect();
+        let unlisted: Vec<SocketAddr> = self
+            .pinned
+            .lock()
+            .await
+            .iter()
+            .copied()
+            .filter(|addr| !listed.iter().any(|(_, known)| known == addr))
+            .collect();
+
+        let mut probes = JoinSet::new();
+        for (id, addr) in listed {
+            let node = self.clone();
+            probes.spawn(async move { (Some(id), addr, node.ping_timed(addr).await) });
+        }
+        for addr in unlisted {
+            let node = self.clone();
+            probes.spawn(async move { (None, addr, node.ping_timed(addr).await) });
+        }
+
+        let mut changed = false;
+        let mut newcomers: Vec<(SocketAddr, NodeId)> = Vec::new();
+        while let Some(done) = probes.join_next().await {
+            let Ok((listed_as, addr, result)) = done else {
+                continue;
+            };
+            match (listed_as, result) {
+                (Some(id), Ok((pong, rtt))) if pong.node_id == id => {
+                    self.seeds.lock().await.mark_alive(&id, rtt_millis(rtt));
+                }
+                // 不应答，或该端点上已经换了别的身份：都算这个种子失联
+                (Some(id), _) => {
+                    if self.seeds.lock().await.mark_failed(&id) {
+                        self.forget(id).await;
+                        changed = true;
+                    }
+                }
+                (None, Ok((pong, _))) => newcomers.push((addr, pong.node_id)),
+                (None, Err(_)) => {}
+            }
+        }
+        if changed {
+            self.bump_seeds();
+        }
+        for (addr, id) in newcomers {
+            // 以对方自己的 ID 为目标、只要 1 条：它若在宣告，排最前的就是它自己的广告
+            if let Ok(adverts) = self.request_seeds(addr, id, 1).await {
+                self.absorb_adverts(adverts).await;
+            }
+        }
+    }
+
+    /// 忘掉一个失联的节点（路由表 + 地址簿）；它恢复后的下一次 PING / 广告会把它带回来
+    async fn forget(&self, id: NodeId) {
+        self.routing.lock().await.remove(&id);
+        self.addr_book.lock().await.remove(&id);
+    }
+}
+
 /// 写一帧：`[u16 BE 长度][payload]`
 async fn write_frame<W: AsyncWriteExt + Unpin>(w: &mut W, payload: &[u8]) -> std::io::Result<()> {
     let len = payload.len() as u16;
@@ -788,6 +1349,32 @@ mod tests {
 
     fn addr(n: u32) -> SocketAddr {
         ([127, 0, 0, 1], (n as u16) + 1024).into()
+    }
+
+    #[test]
+    fn pushed_advert_verification_is_rate_limited() {
+        let start = Instant::now();
+        let mut gate = (start, 0u32);
+        // 同一秒内：前 ADVERT_VERIFY_PER_SEC 条放行，其余丢弃
+        let admitted = (0..ADVERT_VERIFY_PER_SEC + 40)
+            .filter(|_| gate_admit(&mut gate, start + Duration::from_millis(500)))
+            .count();
+        assert_eq!(admitted as u32, ADVERT_VERIFY_PER_SEC);
+        assert!(!gate_admit(&mut gate, start + Duration::from_millis(999)));
+        // 窗口滚动后恢复
+        assert!(gate_admit(&mut gate, start + Duration::from_millis(1000)));
+    }
+
+    #[test]
+    fn endpoint_usability_filter() {
+        let ok = |s: &str| is_usable_endpoint(s.parse().unwrap());
+        assert!(ok("203.0.113.7:11010"));
+        assert!(ok("127.0.0.1:11010"), "回环地址不在格式层排除（本机联调要用；远程一侧探活自然失败）");
+        assert!(!ok("0.0.0.0:11010"));
+        assert!(!ok("255.255.255.255:11010"));
+        assert!(!ok("224.0.0.1:11010"));
+        assert!(!ok("203.0.113.7:0"));
+        assert!(!ok("[::1]:11010"));
     }
 
     #[test]

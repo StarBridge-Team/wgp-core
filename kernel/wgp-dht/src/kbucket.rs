@@ -60,6 +60,12 @@ impl RoutingTable {
         bucket.nodes.push(id);
     }
 
+    /// 移除节点（探活连续失败后由上层调用；不在表内则无事发生）
+    pub fn remove(&mut self, id: &NodeId) {
+        let idx = self.bucket_index(id);
+        self.buckets[idx].nodes.retain(|n| n != id);
+    }
+
     /// 与目标最近的 K 个已知节点（实现阶段：全表排序截断）
     pub fn closest_to(&self, target: &NodeId) -> Vec<NodeId> {
         let mut all: Vec<NodeId> = self.buckets.iter().flat_map(|b| b.nodes.iter().copied()).collect();
@@ -144,6 +150,24 @@ mod tests {
             rt.insert(NodeId(a));
         }
         assert_eq!(rt.buckets[0].nodes.len(), K);
+    }
+
+    #[test]
+    fn remove_frees_the_slot() {
+        let home = NodeId([0u8; 32]);
+        let mut rt = RoutingTable::new(home);
+        let a = id(0x10);
+        let b = id(0x11);
+        rt.insert(a);
+        rt.insert(b);
+        rt.remove(&a);
+        assert_eq!(rt.closest_to(&home), vec![b]);
+        rt.remove(&a); // 重复移除无副作用
+        rt.remove(&home);
+        assert_eq!(rt.closest_to(&home), vec![b]);
+        // 腾出的位置可以重新入表
+        rt.insert(a);
+        assert_eq!(rt.closest_to(&home).len(), 2);
     }
 
     #[test]

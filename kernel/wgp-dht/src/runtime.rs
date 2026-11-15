@@ -12,10 +12,12 @@ use crate::room::{
     room_key, sign_room, succession_line, verify_room, Lease, LeaseWatch, RoomRecord,
 };
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
+use tokio::task::JoinSet;
 use wgp_proto::consts::LEASE_INTERVAL_S;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,6 +27,33 @@ pub enum RoomError {
     StoreFailed,
     NotExpired,
     PreemptedByOther,
+}
+
+/// 选点时最多向多少个候选（离房间键最近的）发起查询
+const LOCATE_MAX_QUERIES: usize = 8;
+
+/// 房间存储节点的候选（v1：房间记录只放在公网可达的种子上）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StorageCandidate {
+    pub node_id: NodeId,
+    pub addr: SocketAddr,
+    /// 是否允许 Forward 中转；None = 不知道（没有广告的手工配置种子）
+    pub relays: Option<bool>,
+}
+
+/// 选点结果
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoragePick {
+    pub candidate: StorageCandidate,
+    /// true = 该节点上已有本房间的合法记录（跟随既有房间）
+    pub existing: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StorageProbe {
+    HasRoom,
+    Empty,
+    Unreachable,
 }
 
 /// 房间运行时：把房间语义绑定在具体 DHT 节点 + 存储节点上
@@ -43,6 +72,72 @@ impl RoomRuntime {
             identity,
             storage,
         }
+    }
+
+    /// 在候选种子里为房间选定存储节点（v1 仍是单存储点，仲裁语义不变）。
+    ///
+    /// 两个客户端只有选中同一个存储节点才能在同一个房间里相遇，所以选点必须是**确定**的，
+    /// 不能用「各自测速最快」这种因人而异的标准：
+    /// 1. 向离房间键最近的若干候选并发查询，**已有合法房间记录**的优先（取其中最近者）——
+    ///    双方认识的种子不完全一样时，宁可跟随既有房间，也不另起一个造成分裂；
+    /// 2. 都没有 → 取最近的可达候选，明确不中转的（贡献模式）排在后面：报道与协商消息要靠
+    ///    存储节点中转，选一个不中转的，房间里就永远只有自己。
+    ///
+    /// 全部候选不可达（或没有候选）返回 None。
+    pub async fn locate(
+        node: &Arc<DhtNode>,
+        code: &str,
+        candidates: &[StorageCandidate],
+    ) -> Option<StoragePick> {
+        let key = room_key(code);
+        let target = NodeId(key);
+        let mut ordered: Vec<StorageCandidate> = candidates.to_vec();
+        ordered.sort_by_key(|c| c.node_id.xor_distance(&target));
+        let mut seen = HashSet::new();
+        ordered.retain(|c| seen.insert(c.addr));
+        ordered.truncate(LOCATE_MAX_QUERIES);
+
+        let mut queries = JoinSet::new();
+        for (rank, candidate) in ordered.iter().enumerate() {
+            let node = node.clone();
+            let addr = candidate.addr;
+            queries.spawn(async move {
+                let state = match node.find_value(addr, key).await {
+                    Ok(v) if !v.value.is_empty() && verify_room(&v.value).is_some() => {
+                        StorageProbe::HasRoom
+                    }
+                    Ok(_) => StorageProbe::Empty,
+                    Err(_) => StorageProbe::Unreachable,
+                };
+                (rank, state)
+            });
+        }
+        let mut states = vec![StorageProbe::Unreachable; ordered.len()];
+        while let Some(done) = queries.join_next().await {
+            if let Ok((rank, state)) = done {
+                states[rank] = state;
+            }
+        }
+
+        let first = |want: &dyn Fn(&StorageCandidate, StorageProbe) -> bool| {
+            ordered
+                .iter()
+                .zip(&states)
+                .find(|(c, s)| want(c, **s))
+                .map(|(c, _)| *c)
+        };
+        if let Some(candidate) = first(&|_, s| s == StorageProbe::HasRoom) {
+            return Some(StoragePick {
+                candidate,
+                existing: true,
+            });
+        }
+        let candidate = first(&|c, s| s == StorageProbe::Empty && c.relays != Some(false))
+            .or_else(|| first(&|_, s| s == StorageProbe::Empty))?;
+        Some(StoragePick {
+            candidate,
+            existing: false,
+        })
     }
 
     fn my_id(&self) -> NodeId {
@@ -552,6 +647,98 @@ mod tests {
 
         bob_stop.send(true).unwrap();
         bob_task.await.unwrap();
+    }
+
+    /// 起 n 个节点充当存储候选（种子）
+    async fn storage_candidates(n: usize) -> Vec<(Arc<DhtNode>, StorageCandidate)> {
+        let mut out = Vec::new();
+        for _ in 0..n {
+            let node = spawn_node().await;
+            let candidate = StorageCandidate {
+                node_id: node.node_id(),
+                addr: node.local_addr().unwrap(),
+                relays: None,
+            };
+            out.push((node, candidate));
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn locate_is_deterministic_and_follows_existing_room() {
+        const CODE: &str = "U/LOCATE-TEST-0001-AA11";
+        let seeds = storage_candidates(4).await;
+        let candidates: Vec<StorageCandidate> = seeds.iter().map(|(_, c)| *c).collect();
+        let key = NodeId(room_key(CODE));
+        let closest = *candidates
+            .iter()
+            .min_by_key(|c| c.node_id.xor_distance(&key))
+            .unwrap();
+
+        let alice = spawn_node().await;
+        let bob = spawn_node().await;
+        // 还没有房间：两端各自选点，候选顺序不同也必须选中同一个（离房间键最近者）
+        let pick_a = RoomRuntime::locate(&alice, CODE, &candidates).await.unwrap();
+        let mut reversed = candidates.clone();
+        reversed.reverse();
+        let pick_b = RoomRuntime::locate(&bob, CODE, &reversed).await.unwrap();
+        assert_eq!(pick_a.candidate, closest);
+        assert_eq!(pick_b.candidate, closest);
+        assert!(!pick_a.existing && !pick_b.existing);
+
+        // 房间已经建在「不是最近」的节点上（建房者当时只认识它）：后来者跟随既有房间
+        let elsewhere = *candidates.iter().find(|c| **c != closest).unwrap();
+        RoomRuntime::new(alice.clone(), elsewhere.addr)
+            .create(CODE, 0)
+            .await
+            .unwrap();
+        let pick = RoomRuntime::locate(&bob, CODE, &candidates).await.unwrap();
+        assert_eq!(pick.candidate, elsewhere);
+        assert!(pick.existing);
+    }
+
+    #[tokio::test]
+    async fn locate_skips_unreachable_and_prefers_relaying_seed() {
+        const CODE: &str = "U/LOCATE-TEST-0002-BB22";
+        let seeds = storage_candidates(3).await;
+        let key = NodeId(room_key(CODE));
+        let mut ordered: Vec<StorageCandidate> = seeds.iter().map(|(_, c)| *c).collect();
+        ordered.sort_by_key(|c| c.node_id.xor_distance(&key));
+        let client = spawn_node().await;
+
+        // 最近的候选连不上 → 跳过，取下一个
+        let mut dead_first = ordered.clone();
+        dead_first[0].addr = "127.0.0.1:1".parse().unwrap();
+        let pick = RoomRuntime::locate(&client, CODE, &dead_first).await.unwrap();
+        assert_eq!(pick.candidate, ordered[1]);
+
+        // 最近的候选明确不中转（贡献模式）→ 建房时让位给能中转的
+        let mut hobby_first = ordered.clone();
+        hobby_first[0].relays = Some(false);
+        let pick = RoomRuntime::locate(&client, CODE, &hobby_first).await.unwrap();
+        assert_eq!(pick.candidate, hobby_first[1]);
+
+        // 全都不中转：仍取最近的（至少房主自己能入表，由外围给出明确提示）
+        let all_hobby: Vec<StorageCandidate> = ordered
+            .iter()
+            .map(|c| StorageCandidate {
+                relays: Some(false),
+                ..*c
+            })
+            .collect();
+        let pick = RoomRuntime::locate(&client, CODE, &all_hobby).await.unwrap();
+        assert_eq!(pick.candidate, all_hobby[0]);
+
+        // 全部不可达 / 没有候选 → None
+        let dead: Vec<StorageCandidate> = (1..=2u16)
+            .map(|port| StorageCandidate {
+                node_id: ordered[0].node_id,
+                addr: SocketAddr::from(([127, 0, 0, 1], port)),
+                relays: None,
+            })
+            .collect();
+        assert!(RoomRuntime::locate(&client, CODE, &dead).await.is_none());
+        assert!(RoomRuntime::locate(&client, CODE, &[]).await.is_none());
     }
 
     #[tokio::test]

@@ -2,6 +2,7 @@
 //! 头（7B）：magic(2)="WG" | type(1) | txid(4B)。
 //! 全部手写编解码；Neighbors 上限 K=20。
 
+use crate::packet::seed_advertise_v2;
 use crate::sig::SIG_MAGIC;
 
 pub const RPC_HEADER_LEN: usize = 7;
@@ -18,6 +19,9 @@ pub mod rpc_type {
     pub const STORED_ACK: u8 = 0x36;
     pub const FIND_VALUE: u8 = 0x37;
     pub const VALUE: u8 = 0x38;
+    /// 索取对方已知的种子广告（07 §5 第③层 / 17 P0）
+    pub const FIND_SEEDS: u8 = 0x39;
+    pub const SEEDS: u8 = 0x3A;
 }
 
 /// Kademlia 常量
@@ -291,6 +295,104 @@ impl ValueBody {
     }
 }
 
+// —— 种子目录交换（07 §5 第③层 / 17 P0） ——
+
+/// 单个 Seeds 应答最多携带的广告数（8 × 123B + 头 = 992B，不触发 IP 分片）
+pub const SEEDS_MAX: usize = 8;
+
+/// FindSeeds：target(32B) + 填充。应答为「对方已知的、离 target 最近的若干条种子广告」。
+///
+/// **防反射放大**：应答（最多 8 条 123B 广告）远大于一个 32B 的请求，而 UDP 源地址可以伪造——
+/// 不设防的话本 RPC 就是一个 20 多倍的流量放大器。因此规定**应答不得长于请求**：请求方想要
+/// 几条广告，就把请求填充到装得下几条广告的长度（[`FindSeedsBody::for_count`]），应答方按
+/// [`FindSeedsBody::quota`] 截断。填充内容不被解释。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FindSeedsBody {
+    pub target: [u8; 32],
+    /// 填充字节数
+    pub padding: u16,
+}
+
+impl FindSeedsBody {
+    pub const TARGET_LEN: usize = 32;
+    /// 请求体上限：恰好换回 SEEDS_MAX 条广告所需的长度
+    pub const BODY_MAX: usize = 1 + SEEDS_MAX * seed_advertise_v2::LEN;
+
+    /// 构造一个「想要 `count` 条广告」的请求（count 超过 SEEDS_MAX 按上限算）
+    pub fn for_count(target: [u8; 32], count: usize) -> Self {
+        let wanted = 1 + count.min(SEEDS_MAX) * seed_advertise_v2::LEN;
+        let body_len = wanted.max(Self::TARGET_LEN);
+        Self {
+            target,
+            padding: (body_len - Self::TARGET_LEN) as u16,
+        }
+    }
+
+    pub fn body_len(&self) -> usize {
+        Self::TARGET_LEN + self.padding as usize
+    }
+
+    /// 本请求允许换回的广告条数：保证「count(1B) + 条数 × 123B」不超过请求体长度
+    pub fn quota(&self) -> usize {
+        ((self.body_len() - 1) / seed_advertise_v2::LEN).min(SEEDS_MAX)
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = vec![0u8; self.body_len().min(Self::BODY_MAX)];
+        out[..Self::TARGET_LEN].copy_from_slice(&self.target);
+        out
+    }
+
+    pub fn decode(buf: &[u8]) -> Option<Self> {
+        if buf.len() < Self::TARGET_LEN || buf.len() > Self::BODY_MAX {
+            return None;
+        }
+        let mut target = [0u8; 32];
+        target.copy_from_slice(&buf[..Self::TARGET_LEN]);
+        Some(Self {
+            target,
+            padding: (buf.len() - Self::TARGET_LEN) as u16,
+        })
+    }
+}
+
+/// Seeds：count(1B) + count × 种子广告 V2 原文（123B）。
+/// 广告以原始字节转述——签名覆盖的就是这些字节，转述者改动任何一位都会被验签拒绝。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeedsBody {
+    pub adverts: Vec<[u8; seed_advertise_v2::LEN]>,
+}
+
+impl SeedsBody {
+    /// 超过 SEEDS_MAX 的部分静默截断（写端防御；读端见 decode 的拒绝逻辑）
+    pub fn encode(&self) -> Vec<u8> {
+        let count = self.adverts.len().min(SEEDS_MAX);
+        let mut out = Vec::with_capacity(1 + count * seed_advertise_v2::LEN);
+        out.push(count as u8);
+        for adv in &self.adverts[..count] {
+            out.extend_from_slice(adv);
+        }
+        out
+    }
+
+    pub fn decode(buf: &[u8]) -> Option<Self> {
+        let (&count, rest) = buf.split_first()?;
+        let count = count as usize;
+        if count > SEEDS_MAX || rest.len() != count * seed_advertise_v2::LEN {
+            return None;
+        }
+        let adverts = rest
+            .chunks_exact(seed_advertise_v2::LEN)
+            .map(|chunk| {
+                let mut adv = [0u8; seed_advertise_v2::LEN];
+                adv.copy_from_slice(chunk);
+                adv
+            })
+            .collect();
+        Some(Self { adverts })
+    }
+}
+
 // —— 统一信封 ————————————————————————————————
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -323,7 +425,9 @@ impl RpcHeader {
             | rpc_type::STORE
             | rpc_type::STORED_ACK
             | rpc_type::FIND_VALUE
-            | rpc_type::VALUE => Some(Self {
+            | rpc_type::VALUE
+            | rpc_type::FIND_SEEDS
+            | rpc_type::SEEDS => Some(Self {
                 kind,
                 txid: u32::from_be_bytes([buf[3], buf[4], buf[5], buf[6]]),
             }),
@@ -343,6 +447,8 @@ pub enum RpcBody {
     StoredAck,
     FindValue(FindValueBody),
     Value(ValueBody),
+    FindSeeds(FindSeedsBody),
+    Seeds(SeedsBody),
 }
 
 #[derive(Debug, Clone)]
@@ -415,6 +521,20 @@ impl RpcPacket {
         }
     }
 
+    pub fn find_seeds(txid: u32, body: FindSeedsBody) -> Self {
+        Self {
+            header: RpcHeader { kind: rpc_type::FIND_SEEDS, txid },
+            body: RpcBody::FindSeeds(body),
+        }
+    }
+
+    pub fn seeds(txid: u32, body: SeedsBody) -> Self {
+        Self {
+            header: RpcHeader { kind: rpc_type::SEEDS, txid },
+            body: RpcBody::Seeds(body),
+        }
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let body_bytes = match &self.body {
             RpcBody::Ping(b) | RpcBody::Pong(b) => {
@@ -437,6 +557,8 @@ impl RpcPacket {
                 out.to_vec()
             }
             RpcBody::Value(b) => b.encode(),
+            RpcBody::FindSeeds(b) => b.encode(),
+            RpcBody::Seeds(b) => b.encode(),
         };
         let mut out = Vec::with_capacity(RPC_HEADER_LEN + body_bytes.len());
         let mut hdr = [0u8; RPC_HEADER_LEN];
@@ -459,6 +581,8 @@ impl RpcPacket {
             rpc_type::STORED_ACK => RpcBody::StoredAck,
             rpc_type::FIND_VALUE => RpcBody::FindValue(FindValueBody::decode(body_bytes)?),
             rpc_type::VALUE => RpcBody::Value(ValueBody::decode(body_bytes)?),
+            rpc_type::FIND_SEEDS => RpcBody::FindSeeds(FindSeedsBody::decode(body_bytes)?),
+            rpc_type::SEEDS => RpcBody::Seeds(SeedsBody::decode(body_bytes)?),
             _ => return None,
         };
         Some(Self { header, body })
@@ -580,6 +704,73 @@ mod tests {
         buf[0..2].copy_from_slice(&SIG_MAGIC);
         buf[2] = 0xFF;
         assert!(RpcHeader::decode(&buf).is_none());
+    }
+
+    #[test]
+    fn find_seeds_reply_never_longer_than_request() {
+        // 防放大的核心不变量：任意合法请求，按 quota 构造的最大应答都不长于请求
+        for count in 0..=SEEDS_MAX + 3 {
+            let req = FindSeedsBody::for_count([0x42; 32], count);
+            let req_bytes = RpcPacket::find_seeds(1, req).encode();
+            let reply = SeedsBody {
+                adverts: vec![[0u8; seed_advertise_v2::LEN]; req.quota()],
+            };
+            let reply_bytes = RpcPacket::seeds(1, reply).encode();
+            assert!(
+                reply_bytes.len() <= req_bytes.len(),
+                "count={count}: 应答 {} > 请求 {}",
+                reply_bytes.len(),
+                req_bytes.len()
+            );
+            assert_eq!(req.quota(), count.min(SEEDS_MAX));
+        }
+        // 不填充的最小请求一条也换不到
+        let bare = FindSeedsBody { target: [0; 32], padding: 0 };
+        assert_eq!(bare.quota(), 0);
+    }
+
+    #[test]
+    fn find_seeds_roundtrip_and_bounds() {
+        let req = FindSeedsBody::for_count([0x17; 32], SEEDS_MAX);
+        assert_eq!(req.body_len(), FindSeedsBody::BODY_MAX);
+        let pkt = RpcPacket::find_seeds(77, req);
+        let dec = RpcPacket::decode(&pkt.encode()).unwrap();
+        assert_eq!(dec.header.txid, 77);
+        match dec.body {
+            RpcBody::FindSeeds(b) => assert_eq!(b, req),
+            _ => panic!("期望 FindSeeds"),
+        }
+        // 短于 target / 超过上限：拒绝
+        assert!(FindSeedsBody::decode(&[0u8; 31]).is_none());
+        assert!(FindSeedsBody::decode(&vec![0u8; FindSeedsBody::BODY_MAX + 1]).is_none());
+    }
+
+    #[test]
+    fn seeds_roundtrip_and_malformed_rejected() {
+        let mut a = [0u8; seed_advertise_v2::LEN];
+        let mut b = [0u8; seed_advertise_v2::LEN];
+        a[5] = 0xAA;
+        b[100] = 0xBB;
+        let body = SeedsBody { adverts: vec![a, b] };
+        let pkt = RpcPacket::seeds(9, body.clone());
+        match RpcPacket::decode(&pkt.encode()).unwrap().body {
+            RpcBody::Seeds(got) => assert_eq!(got, body, "广告原文必须逐字节保留"),
+            _ => panic!("期望 Seeds"),
+        }
+        // 空应答合法
+        assert_eq!(SeedsBody::decode(&[0]), Some(SeedsBody { adverts: vec![] }));
+        // 条数与长度不符 / 条数越限 / 空体：拒绝
+        assert!(SeedsBody::decode(&[]).is_none());
+        assert!(SeedsBody::decode(&[1]).is_none());
+        let mut short = vec![2u8];
+        short.extend_from_slice(&a);
+        assert!(SeedsBody::decode(&short).is_none());
+        let mut over = vec![(SEEDS_MAX + 1) as u8];
+        over.extend_from_slice(&vec![0u8; (SEEDS_MAX + 1) * seed_advertise_v2::LEN]);
+        assert!(SeedsBody::decode(&over).is_none());
+        // 写端超限截断
+        let many = SeedsBody { adverts: vec![a; SEEDS_MAX + 4] };
+        assert_eq!(SeedsBody::decode(&many.encode()).unwrap().adverts.len(), SEEDS_MAX);
     }
 
     #[test]

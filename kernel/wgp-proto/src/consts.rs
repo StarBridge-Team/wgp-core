@@ -26,3 +26,7 @@ pub const OLD_LINK_GRACE_S: u64 = 30;
 pub const LEASE_INTERVAL_S: u64 = 30;
 pub const LEASE_TIMEOUT_S: u64 = 75;
 pub const ROOM_KEY_DOMAIN: &[u8] = b"wgp/room/v1";
+
+// —— 种子发现（07 §5 第③层 / 17 P0） ——
+/// 种子广告 V2 的签名域分隔前缀（同一把身份密钥还要签房间记录与报道请求，前缀防跨用途挪用）
+pub const SEED_ADV_DOMAIN: &[u8] = b"wgp/seed-adv/v2";
