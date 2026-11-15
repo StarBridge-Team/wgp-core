@@ -6,10 +6,12 @@
 //!  - 加入报道：JoinRequest 经存储节点 Forward 路由至锚点（存储节点已学习
 //!    写入者身份），锚点验签后 add_member 重签重存。
 
-use crate::id::{NodeIdentity, NodeId};
+use crate::id::{node_id_from_verifying, NodeId, NodeIdentity};
 use crate::node::DhtNode;
-use crate::room::{room_key, sign_room, succession_line, verify_room, Lease, RoomRecord};
-use ed25519_dalek::Signature;
+use crate::room::{
+    room_key, sign_room, succession_line, verify_room, Lease, LeaseWatch, RoomRecord,
+};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -122,15 +124,18 @@ impl RoomRuntime {
         Ok(next)
     }
 
-    /// 继位尝试：租约过期后按继位链序出手（退避 = 链内序号 × 300ms），
-    /// 写后回读裁决——被抢先即认输。
+    /// 继位尝试。前提由调用方在本地观测得出：`current` 的租约已连续 `unchanged_ms` 毫秒没有变化
+    /// （见 [`LeaseWatch`]——不同进程的时钟不可比，掉线只能这样判）。
+    /// 按继位链序出手（退避 = 链内序号 × 300ms）；出手前复核存储节点上仍是观测到的那份租约，
+    /// 期间有人续期或接任即放弃；写后回读裁决——被抢先即认输。
     pub async fn try_takeover(
         &self,
         code: &str,
         current: &RoomRecord,
+        unchanged_ms: u64,
         now_ms: u64,
     ) -> Result<RoomRecord, RoomError> {
-        if !current.lease.expired(now_ms) {
+        if !LeaseWatch::is_stale(unchanged_ms) {
             return Err(RoomError::NotExpired);
         }
         let line = succession_line(current);
@@ -142,10 +147,10 @@ impl RoomRuntime {
         if my_pos > 0 {
             tokio::time::sleep(Duration::from_millis(300 * my_pos as u64)).await;
         }
-        // 提防等待期间已易主
+        // 提防等待期间已易主：租约只要动过（续期或换锚点），就不再是我们观测到的那份
         let latest = self.fetch(code).await?;
-        if !latest.lease.expired(now_ms) {
-            return Err(RoomError::NotExpired); // 新锚点已经续期
+        if latest.lease != current.lease {
+            return Err(RoomError::NotExpired);
         }
         let mut next = latest.clone();
         next.lease = Lease::new(current.lease.epoch + 1, self.my_id(), now_ms);
@@ -162,12 +167,7 @@ impl RoomRuntime {
     /// 加入报道：向锚点发送签名 JoinRequest（经存储节点 Forward 路由）。
     /// v1 无 ACK：请求方轮询 fetch 直至自己入表（upkeep 内实现）。
     pub async fn request_join(&self, code: &str, record: &RoomRecord) -> Result<(), RoomError> {
-        let payload = JoinRequest::sign(
-            &self.identity,
-            code,
-            self.my_id(),
-            &self.my_pk(),
-        );
+        let payload = JoinRequest::sign(&self.identity, code);
         self.node
             .forward_to(self.storage, record.lease.anchor, payload)
             .await
@@ -177,7 +177,7 @@ impl RoomRuntime {
     /// 锚点侧：处理入站 JoinRequest（upkeep 轮询 inbox 调用）。
     /// 验签 → add_member（仅当前锚点有效）→ 重签重存。
     async fn handle_join_request(&self, code: &str, payload: &[u8], now_ms: u64) -> bool {
-        let Some((member_id, member_pk)) = JoinRequest::verify(&self.identity, code, payload)
+        let Some((member_id, member_pk)) = JoinRequest::verify(code, payload)
         else {
             return false; // 伪造报道：静默丢弃
         };
@@ -206,8 +206,11 @@ impl RoomRuntime {
         mut stop: watch::Receiver<bool>,
         now_fn: impl Fn() -> u64,
     ) {
-        // 续期节流：报道处理每轮执行；republish 仅当距上次 ≥ 租约周期
-        let mut last_renew_ms = 0u64;
+        // 续期节流：报道处理每轮执行；republish 仅当距上次 ≥ 租约周期。首拍立即续期——
+        // 锚点进程重启后要尽快让成员看到租约在动，否则会被当成掉线
+        let mut last_renew_ms: Option<u64> = None;
+        // 成员侧掉线判定：本地观测租约多久没变（跨进程的时钟不可比）
+        let mut lease_watch = LeaseWatch::new();
         loop {
             tokio::select! {
                 _ = stop.changed() => break,
@@ -228,86 +231,75 @@ impl RoomRuntime {
 
             if record.lease.anchor == self.my_id() {
                 // ② 我是锚点：续期（按 LEASE_INTERVAL_S 节流）
-                if now.saturating_sub(last_renew_ms) >= LEASE_INTERVAL_S * 1000 {
-                    if self.renew(&code, &record, now).await.is_ok() {
-                        last_renew_ms = now;
-                    }
+                let due = last_renew_ms
+                    .map_or(true, |at| now.saturating_sub(at) >= LEASE_INTERVAL_S * 1000);
+                if due && self.renew(&code, &record, now).await.is_ok() {
+                    last_renew_ms = Some(now);
                 }
             } else {
                 // ③ 我是成员：监控 + 补报道
+                last_renew_ms = None;
                 if !record.members.iter().any(|(id, _)| *id == self.my_id()) {
                     let _ = self.request_join(&code, &record).await;
                 }
-                if record.lease.expired(now) {
-                    let _ = self.try_takeover(&code, &record, now).await;
+                let unchanged_ms = lease_watch.observe(&record.lease, now);
+                if LeaseWatch::is_stale(unchanged_ms) {
+                    let _ = self
+                        .try_takeover(&code, &record, unchanged_ms, now)
+                        .await;
                 }
             }
         }
     }
 }
 
-/// JoinRequest 载荷：
-/// magic(2 "WJ") | code_len(1) | code | member_id(32) | pubkey(32) | sig(64)
-/// sig = ed25519_sign(code || member_id || pubkey)（请求者长期身份）
+/// 加入报道载荷（v2，定长 163B）：
+///   magic(2 "WJ") | ver(1)=2 | room_key(32) | member_id(32) | pubkey(32) | sig(64)
+/// sig = ed25519_sign(前 99B)，由请求者的长期身份签发。
+///
+/// 载荷要经存储节点 Forward 中转，而中转者不可信。**房间码绝不能出现在这里**：它是混入会话
+/// 密钥派生的口令（装配线的 info_ctx），中转者一旦得知，就能对协商做中间人。v1 载荷带的正是
+/// 明文房间码；v2 改带 `room_key = SHA256(域 ‖ 房间码)`——存储节点本来就以它为键存取房间记录，
+/// 不增加任何信息。
 pub struct JoinRequest;
 
 impl JoinRequest {
-    pub fn sign(
-        identity: &NodeIdentity,
-        code: &str,
-        member_id: NodeId,
-        member_pk: &[u8],
-    ) -> Vec<u8> {
-        let code_bytes = code.as_bytes();
-        debug_assert!(code_bytes.len() <= 200);
-        let mut unsigned = Vec::with_capacity(2 + 1 + code_bytes.len() + 64);
-        unsigned.extend_from_slice(b"WJ");
-        unsigned.push(code_bytes.len() as u8);
-        unsigned.extend_from_slice(code_bytes);
-        unsigned.extend_from_slice(&member_id.0);
-        unsigned.extend_from_slice(&member_pk[..32.min(member_pk.len())]);
-        // 签名域 = 全部 unsigned 字段
-        let sig = identity.sign(&unsigned);
-        let mut out = unsigned;
+    pub const VERSION: u8 = 2;
+    pub const LEN: usize = 163;
+    const SIGNED_LEN: usize = 99;
+
+    /// 以 `identity` 的名义签发「加入 `code` 所指房间」的报道
+    pub fn sign(identity: &NodeIdentity, code: &str) -> Vec<u8> {
+        let mut out = Vec::with_capacity(Self::LEN);
+        out.extend_from_slice(b"WJ");
+        out.push(Self::VERSION);
+        out.extend_from_slice(&room_key(code));
+        out.extend_from_slice(&identity.node_id().0);
+        out.extend_from_slice(&identity.verifying_key().to_bytes());
+        let sig = identity.sign(&out);
         out.extend_from_slice(&sig.to_bytes());
         out
     }
 
-    /// 视为"验签者视角"：identity 用于验签（用成员公钥验证）
-    pub fn verify(
-        verifier: &NodeIdentity,
-        code: &str,
-        payload: &[u8],
-    ) -> Option<(NodeId, Vec<u8>)> {
-        if payload.len() < 2 + 1 + 64 + 64 {
+    /// 校验报道：格式与版本 → 房间键属于本房间 → member_id 与公钥绑定 → 签名。
+    /// 通过后返回 (成员 NodeId, 成员公钥)。
+    pub fn verify(code: &str, payload: &[u8]) -> Option<(NodeId, Vec<u8>)> {
+        if payload.len() != Self::LEN || &payload[0..2] != b"WJ" || payload[2] != Self::VERSION {
             return None;
         }
-        if &payload[0..2] != b"WJ" {
-            return None;
-        }
-        let code_len = payload[2] as usize;
-        if payload.len() != 2 + 1 + code_len + 64 + 64 {
-            return None;
-        }
-        if &payload[3..3 + code_len] != code.as_bytes() {
+        if payload[3..35] != room_key(code) {
             return None; // 报错房间：拒绝
         }
-        let member_id = NodeId(
-            payload[3 + code_len..3 + code_len + 32]
-                .try_into()
-                .ok()?,
-        );
-        let member_pk = payload[3 + code_len + 32..3 + code_len + 64].to_vec();
-        let sig_bytes: [u8; 64] = payload[3 + code_len + 64..].try_into().ok()?;
-        let sig = Signature::from_bytes(&sig_bytes);
-        let vk = ed25519_dalek::VerifyingKey::from_bytes(
-            member_pk.as_slice().try_into().ok()?,
-        )
-        .ok()?;
-        use ed25519_dalek::Verifier;
-        vk.verify(&payload[..3 + code_len + 64], &sig).ok()?;
-        let _ = verifier; // 验签不依赖本地身份（用对端公钥自证）
-        Some((member_id, member_pk))
+        let member_id = NodeId(payload[35..67].try_into().ok()?);
+        let member_pk: [u8; 32] = payload[67..99].try_into().ok()?;
+        let vk = VerifyingKey::from_bytes(&member_pk).ok()?;
+        // 身份绑定：不校验的话，任何人都能拿自己的密钥把「别人的 NodeId」塞进成员表
+        if node_id_from_verifying(&vk) != member_id {
+            return None;
+        }
+        let sig = Signature::from_bytes(payload[Self::SIGNED_LEN..].try_into().ok()?);
+        vk.verify(&payload[..Self::SIGNED_LEN], &sig).ok()?;
+        Some((member_id, member_pk.to_vec()))
     }
 }
 
@@ -422,41 +414,144 @@ mod tests {
 
     #[tokio::test]
     async fn takeover_when_owner_silent() {
+        const CODE: &str = "U/TEST-ROOM-0005-CD90";
+        let timeout_ms = wgp_proto::consts::LEASE_TIMEOUT_S * 1000;
         let (owner_rt, owner_node, bob_rt, bob_node, carol_rt) = setup().await;
-        let rec = owner_rt.create("U/TEST-ROOM-0005-CD90", 0).await.unwrap();
+        let rec = owner_rt.create(CODE, 0).await.unwrap();
         let rec = owner_rt
-            .add_member(
-                "U/TEST-ROOM-0005-CD90",
-                &rec,
-                node_id_of(&bob_node),
-                pk_of(&bob_node),
-                0,
-            )
+            .add_member(CODE, &rec, node_id_of(&bob_node), pk_of(&bob_node), 0)
             .await
             .unwrap();
-        let _ = &rec;
+        owner_rt
+            .add_member(CODE, &rec, carol_rt.my_id(), carol_rt.my_pk(), 0)
+            .await
+            .unwrap();
 
-        // 房主"掉线"：不再续期。时间越过 75s 租约。
-        let stale = bob_rt.fetch("U/TEST-ROOM-0005-CD90").await.unwrap();
-        assert!(stale.lease.expired(80_000));
-        // 未过期时绝不允许抢占
-        let too_early = bob_rt.try_takeover("U/TEST-ROOM-0005-CD90", &stale, 40_000).await;
+        // 房主"掉线"：此后不再续期。Bob 在本地观测到租约 40s 没变——还不到 75s，不许抢
+        let stale = bob_rt.fetch(CODE).await.unwrap();
+        let too_early = bob_rt.try_takeover(CODE, &stale, 40_000, 40_000).await;
         assert_eq!(too_early, Err(RoomError::NotExpired));
 
-        // Bob 抢占成功：epoch+1、锚点=Bob
+        // 观测满 75s：Bob 抢占成功——epoch+1、锚点=Bob、成员表原样继承
         let after = bob_rt
-            .try_takeover("U/TEST-ROOM-0005-CD90", &stale, 80_000)
+            .try_takeover(CODE, &stale, timeout_ms, 80_000)
             .await
             .unwrap();
         assert_eq!(after.lease.anchor, node_id_of(&bob_node));
-        assert!(after.lease.epoch > stale.lease.epoch);
+        assert_eq!(after.lease.epoch, stale.lease.epoch + 1);
+        assert_eq!(after.members, stale.members);
 
-        // Carol 此时再抢：新锚点已续期 → NotExpired
-        let carol_try = carol_rt
-            .try_takeover("U/TEST-ROOM-0005-CD90", &after, 80_000)
+        // Carol 手里还是那份旧快照，也观测满了 75s：出手前复核发现租约已变 → 放弃
+        let late = carol_rt
+            .try_takeover(CODE, &stale, timeout_ms, 80_000)
             .await;
-        assert_eq!(carol_try, Err(RoomError::NotExpired));
-        let _ = owner_node;
+        assert_eq!(late, Err(RoomError::NotExpired));
+        // Carol 看到新租约后重新计时：刚看到 = 0 → 不许抢
+        let fresh = carol_rt.try_takeover(CODE, &after, 0, 80_000).await;
+        assert_eq!(fresh, Err(RoomError::NotExpired));
+        assert_eq!(owner_rt.fetch(CODE).await.unwrap(), after, "记录未被 Carol 改动");
+
+        // 不在成员表里的人没有继位资格
+        let outsider = RoomRuntime::new(spawn_node().await, owner_node.local_addr().unwrap());
+        let denied = outsider
+            .try_takeover(CODE, &after, timeout_ms, 200_000)
+            .await;
+        assert_eq!(denied, Err(RoomError::PreemptedByOther));
+    }
+
+    /// 回归：成员进程与锚点进程的单调时基不同（这里成员比锚点"老"一小时）。
+    /// 旧实现拿记录里的到期时刻与本地时钟直接比较，成员一上来就把健康的锚点判成过期并夺位；
+    /// 现在只看本地观测到的「多久没续期」：锚点在续期就不动，锚点沉默满 75s 才接任。
+    #[tokio::test]
+    async fn member_with_different_clock_base_takes_over_only_after_real_silence() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        const CODE: &str = "U/SKEW-TEST-0001-EE55";
+        const MEMBER_CLOCK_AHEAD_MS: u64 = 3_600_000;
+
+        let (owner_rt, owner_node, bob_rt, bob_node, _) = setup().await;
+        let owner_rt = Arc::new(owner_rt);
+        let bob_rt = Arc::new(bob_rt);
+        let clock = Arc::new(AtomicU64::new(1_000));
+
+        let rec = owner_rt.create(CODE, 1_000).await.unwrap();
+        owner_rt
+            .add_member(CODE, &rec, node_id_of(&bob_node), pk_of(&bob_node), 1_000)
+            .await
+            .unwrap();
+
+        let (owner_stop, owner_stop_rx) = watch::channel(false);
+        let (bob_stop, bob_stop_rx) = watch::channel(false);
+        let owner_task = {
+            let (rt, clock) = (owner_rt.clone(), clock.clone());
+            tokio::spawn(async move {
+                rt.upkeep(CODE.to_string(), 40, owner_stop_rx, move || {
+                    clock.load(Ordering::Relaxed)
+                })
+                .await;
+            })
+        };
+        let bob_task = {
+            let (rt, clock) = (bob_rt.clone(), clock.clone());
+            tokio::spawn(async move {
+                rt.upkeep(CODE.to_string(), 40, bob_stop_rx, move || {
+                    clock.load(Ordering::Relaxed) + MEMBER_CLOCK_AHEAD_MS
+                })
+                .await;
+            })
+        };
+
+        // 锚点健在：时间推进 4 × 31s（远超 75s 租约），每步锚点都会续期——成员不得夺位
+        let mut last_expiry = owner_rt.fetch(CODE).await.unwrap().lease.expires_at_ms;
+        for step in 1..=4 {
+            clock.fetch_add(31_000, Ordering::Relaxed);
+            // 等锚点的这次续期落到存储节点，再留几拍让成员看到
+            let mut renewed = false;
+            for _ in 0..100 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                let lease = owner_rt.fetch(CODE).await.unwrap().lease;
+                if lease.expires_at_ms != last_expiry {
+                    last_expiry = lease.expires_at_ms;
+                    renewed = true;
+                    break;
+                }
+            }
+            assert!(renewed, "第 {step} 步：锚点应已续期");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let record = owner_rt.fetch(CODE).await.unwrap();
+            assert_eq!(
+                record.lease.anchor,
+                node_id_of(&owner_node),
+                "第 {step} 步：锚点健在时成员不得夺位"
+            );
+            assert_eq!(record.lease.epoch, 0);
+        }
+
+        // 锚点掉线：停止续期。沉默 40s——还不到 75s，成员继续等
+        owner_stop.send(true).unwrap();
+        owner_task.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await; // 让成员先看到最后一次续期
+        clock.fetch_add(40_000, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let record = bob_rt.fetch(CODE).await.unwrap();
+        assert_eq!(record.lease.anchor, node_id_of(&owner_node), "沉默未满 75s 不得接任");
+
+        // 再沉默 40s（累计 80s）：成员接任，epoch+1
+        clock.fetch_add(40_000, Ordering::Relaxed);
+        let mut taken = None;
+        for _ in 0..150 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let record = bob_rt.fetch(CODE).await.unwrap();
+            if record.lease.anchor == node_id_of(&bob_node) {
+                taken = Some(record);
+                break;
+            }
+        }
+        let taken = taken.expect("锚点沉默满 75s 后成员应接任");
+        assert_eq!(taken.lease.epoch, 1);
+        assert_eq!(taken.members.len(), 2, "成员表随接任继承");
+
+        bob_stop.send(true).unwrap();
+        bob_task.await.unwrap();
     }
 
     #[tokio::test]
@@ -466,30 +561,59 @@ mod tests {
         assert_eq!(r, Err(RoomError::NotFound));
     }
 
-    #[tokio::test]
-    async fn join_request_sign_verify_and_forgery_rejected() {
-        let mut rng = OsRng;
-        let bob_identity = NodeIdentity::generate(&mut rng);
-        let mallory = NodeIdentity::generate(&mut rng);
-        let bob_id = bob_identity.node_id();
-        let bob_pk = bob_identity.verifying_key().to_bytes().to_vec();
+    #[test]
+    fn join_request_sign_verify_and_forgery_rejected() {
+        const CODE: &str = "U/JOIN-TEST-0001-AA22";
+        let bob = NodeIdentity::generate(&mut OsRng);
+        let payload = JoinRequest::sign(&bob, CODE);
+        assert_eq!(payload.len(), JoinRequest::LEN);
 
-        let payload = JoinRequest::sign(&bob_identity, "U/JOIN-TEST-0001-AA22", bob_id, &bob_pk);
         // 合法自证：验签通过
-        let (got_id, got_pk) =
-            JoinRequest::verify(&bob_identity, "U/JOIN-TEST-0001-AA22", &payload).expect("合法报道应通过");
-        assert_eq!(got_id, bob_id);
-        assert_eq!(got_pk, bob_pk);
+        let (got_id, got_pk) = JoinRequest::verify(CODE, &payload).expect("合法报道应通过");
+        assert_eq!(got_id, bob.node_id());
+        assert_eq!(got_pk, bob.verifying_key().to_bytes().to_vec());
 
-        // 篡改公钥 → 拒
-        let mut tampered = payload.clone();
-        let code_len = tampered[2] as usize;
-        tampered[3 + code_len + 35] ^= 0xFF;
-        assert!(JoinRequest::verify(&bob_identity, "U/JOIN-TEST-0001-AA22", &tampered).is_none());
+        // 报错房间 → 拒
+        assert!(JoinRequest::verify("U/JOIN-TEST-0002-BB33", &payload).is_none());
 
-        // 用 Mallory 身份签 → 公钥自证失败
-        let forged = JoinRequest::sign(&mallory, "U/JOIN-TEST-0001-AA22", bob_id, &bob_pk);
-        assert!(JoinRequest::verify(&bob_identity, "U/JOIN-TEST-0001-AA22", &forged).is_none());
+        // 任一字节被篡改（魔数、版本、房间键、身份、公钥、签名）→ 拒
+        for offset in 0..payload.len() {
+            let mut tampered = payload.clone();
+            tampered[offset] ^= 0x01;
+            assert!(
+                JoinRequest::verify(CODE, &tampered).is_none(),
+                "偏移 {offset} 被篡改后仍通过"
+            );
+        }
+        // 长度不对 → 拒（含 v1 那种变长载荷）
+        assert!(JoinRequest::verify(CODE, &payload[..payload.len() - 1]).is_none());
+        let mut longer = payload.clone();
+        longer.push(0);
+        assert!(JoinRequest::verify(CODE, &longer).is_none());
+
+        // 冒名：Mallory 用自己的密钥签，却把 member_id 写成 Bob 的（签名本身有效）→ 身份绑定拒绝
+        let mallory = NodeIdentity::generate(&mut OsRng);
+        let mut forged = JoinRequest::sign(&mallory, CODE);
+        forged[35..67].copy_from_slice(&bob.node_id().0);
+        let resigned = mallory.sign(&forged[..99]);
+        forged[99..].copy_from_slice(&resigned.to_bytes());
+        assert!(
+            JoinRequest::verify(CODE, &forged).is_none(),
+            "member_id 必须等于 SHA256(公钥)"
+        );
+    }
+
+    /// 房间码是混入会话密钥派生的口令，绝不能出现在经第三方中转的报道载荷里
+    #[test]
+    fn join_request_never_carries_the_room_code() {
+        const CODE: &str = "U/C2G9-GYET-311W-R636";
+        let payload = JoinRequest::sign(&NodeIdentity::generate(&mut OsRng), CODE);
+        let contains = |needle: &[u8]| payload.windows(needle.len()).any(|w| w == needle);
+        assert!(!contains(CODE.as_bytes()), "载荷里出现了明文房间码");
+        assert!(!contains(&CODE.as_bytes()[2..]), "载荷里出现了房间码主体");
+        assert!(!contains(b"C2G9"), "载荷里出现了房间码片段");
+        // 只带房间键（存储节点本来就知道的那个哈希）
+        assert_eq!(&payload[3..35], &room_key(CODE));
     }
 
     /// upkeep 全生命周期：A 建房 → A、B 各跑 upkeep（100ms 周期）→
