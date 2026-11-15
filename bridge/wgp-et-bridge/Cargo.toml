@@ -1,0 +1,25 @@
+[package]
+name = "wgp-et-bridge"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "GPL-3.0-or-later"
+description = "折跃门 ⇄ EasyTier 协议兼容层（mesh-tun-proto）的桥接 PoC：把 ET 帧跑在 wgp 加密隧道上（路线图 M3）"
+publish = false
+
+# 独立 workspace，不进主 workspace：本包依赖 mesh-tun-proto——另一个仓库（私有），构建还需要 protoc。
+# 让主构建与 GitHub CI 依赖这两样东西不合适，所以单独构建（见 README.md）。
+[workspace]
+
+[dependencies]
+# 约定：mesh-tun-proto 检出在本仓库的同级目录（…/wgp 与 …/mesh-tun-proto 并排）
+mesh-tun-proto = { path = "../../../mesh-tun-proto" }
+wgp-port = { path = "../wgp-port" }
+anyhow = "1"
+bytes = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+
+[dev-dependencies]
+wgp-core = { path = "../../kernel/wgp-core" }
+wgp-dht = { path = "../../kernel/wgp-dht" }
+rand_core = { version = "0.6", features = ["getrandom"] }

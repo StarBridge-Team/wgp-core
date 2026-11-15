@@ -9,6 +9,7 @@ members = [
     "server/wgp-node",
     "client/wgp-client",
 ]
+exclude = ["bridge/wgp-et-bridge"]
 resolver = "2"
 
 [workspace.package]

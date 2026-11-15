@@ -17,3 +17,7 @@ wgp-client.key
 *.jsonl
 # 节点广告纪元（启动计数，与身份文件同目录；见 server.rs::next_advertise_epoch）
 *.epoch
+
+# ET bridge PoC: its own target dir and downloaded build tools (protoc)
+/bridge/wgp-et-bridge/target/
+/bridge/wgp-et-bridge/.tools/
