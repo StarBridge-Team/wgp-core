@@ -898,27 +898,21 @@ mod tests {
     /// 确定性构造：B 绑定"波内第一个端口"（同 seed 生成计划），A 侧 TCP 波首个尝试即命中。
     #[tokio::test]
     async fn engine_delivers_tcp_link_when_udp_dead() {
+        use crate::transport::test_ports::{is_free, unique_loopback_addr, PINNED_RANGE};
         use crate::transport::TcpProbeCarrier;
-        use tokio::net::TcpListener;
         use wgp_punch::plan_waves;
 
         let key: [u8; 32] = [0x31; 32];
-        let seed = 7u64;
-        let plan = plan_waves(None, seed, 47);
-        // 无数据模式：撒网在 wave3（wave1/2 为空），取第一个端口作确定性命中
-        let b_port = plan.wave3[0];
+        // 无数据模式：撒网在 wave3（wave1/2 为空），B 绑定计划里的第一个端口作确定性命中。
+        // 端口号由种子决定，所以反过来挑种子：要求该端口落在测试专用的指定端口区里且此刻空闲，
+        // 不去碰系统动态端口范围（那里的端口随时可能被并行的测试或别的程序拿到）。
+        let (seed, b_port) = (1u64..)
+            .map(|seed| (seed, plan_waves(None, seed, 47).wave3[0]))
+            .find(|(_, port)| PINNED_RANGE.contains(port) && is_free(*port))
+            .expect("总能找到一个种子，使撒网计划的首个端口落在指定端口区");
 
-        async fn reserve_port() -> u16 {
-            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let p = l.local_addr().unwrap().port();
-            drop(l);
-            p
-        }
-
-        let a_tcp_bind: std::net::SocketAddr =
-            format!("127.0.0.1:{}", reserve_port().await).parse().unwrap();
-        let b_tcp_bind: std::net::SocketAddr =
-            format!("127.0.0.1:{b_port}").parse().unwrap();
+        let a_tcp_bind = unique_loopback_addr();
+        let b_tcp_bind = std::net::SocketAddr::from(([127, 0, 0, 1], b_port));
 
         let tcp_a = TcpProbeCarrier::new(a_tcp_bind, key, [1, 1, 1, 1]);
         let tcp_b = TcpProbeCarrier::new(b_tcp_bind, key, [2, 2, 2, 2]);
