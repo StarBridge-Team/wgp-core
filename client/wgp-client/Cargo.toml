@@ -3,7 +3,7 @@ name = "wgp-client"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-description = "折跃门客户端命令行前端（基础开房/加入/链路状态；14 文档的参考外围）"
+description = "折跃门客户端命令行前端（开房/加入/端口转发；14 文档的参考外围）"
 
 [[bin]]
 name = "wgp-client"
@@ -13,5 +13,6 @@ path = "src/main.rs"
 wgp-core = { path = "../../kernel/wgp-core" }
 wgp-dht = { path = "../../kernel/wgp-dht" }
 wgp-proto = { path = "../../kernel/wgp-proto" }
+wgp-port = { path = "../../bridge/wgp-port" }
 rand_core = { workspace = true }
 tokio = { workspace = true }
