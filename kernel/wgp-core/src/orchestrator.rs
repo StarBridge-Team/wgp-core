@@ -108,6 +108,57 @@ mod frame {
             full_commit,
         })
     }
+
+    /// 解析端点帧体（kind 字节 + 47B 报告）；kind 不符或长度不对返回 None。
+    /// 帧体可能来自任何算得出会话 tag 的人，必须先验再切——直接 `&body[1..]`
+    /// 会被一个只含 tag 的 4 字节载荷打崩（切片越界 panic）。
+    pub fn parse_endpoints_frame(body: &[u8]) -> Option<Endpoints> {
+        let (&kind, rest) = body.split_first()?;
+        if kind != KIND_EP {
+            return None;
+        }
+        decode_endpoints(rest)
+    }
+}
+
+/// 对端只报告了实测映射端口、没有步长模型时，兜底模型取的置信度（中档：±400 窗口）
+const OBSERVED_PORT_CONFIDENCE: f64 = 0.5;
+
+/// 由对端的端点报告重建它的端口模型（供三波规划预测对端端口）。
+///
+/// 对端学出了步长模型就照搬；没学出（观察者丢包或限频导致三连测不全）但报告了实测映射
+/// 端口时，以该端口为中心、零步长兜底——锥形 NAT 下这个端口就是打洞目标，首包直打它，
+/// 其余在窗口内撒。旧实现在此情形下完全无视实测端口、全范围盲撒，最好打的锥形 NAT
+/// 反而打不通。只有连映射端口都没有（UDP 不通）才返回 None。
+fn peer_model_from(ep: &frame::Endpoints) -> Option<PortStepModel> {
+    if ep.has_model {
+        return Some(PortStepModel {
+            last_port: ep.last_port,
+            mean_delta: ep.mean_delta_q as f64 / 64.0,
+            delta_range: (0, 0),
+            trend: wgp_punch::Trend::Oscillating,
+            confidence: (ep.confidence as f64 / 100.0).clamp(0.0, 1.0),
+        });
+    }
+    if ep.udp_ok && ep.port != 0 {
+        return Some(PortStepModel {
+            last_port: ep.port,
+            mean_delta: 0.0,
+            delta_range: (0, 0),
+            trend: wgp_punch::Trend::Oscillating,
+            confidence: OBSERVED_PORT_CONFIDENCE,
+        });
+    }
+    None
+}
+
+/// 解析承诺/揭示帧体（kind 字节 + SigPacket）；非 SIG 帧或畸形返回 None
+fn parse_sig(body: &[u8]) -> Option<SigBody> {
+    let (&kind, rest) = body.split_first()?;
+    if kind != frame::KIND_SIG {
+        return None;
+    }
+    SigPacket::decode(rest).map(|pkt| pkt.body)
 }
 
 /// 确定性会话分派 tag（两端推导一致；按 NodeId 排序免疫方向性）
@@ -228,30 +279,13 @@ impl SessionOrchestrator {
             0,
         );
 
-        // ①a 交换承诺。accept 放宽到「Commit 或 Reveal」：对端可能因加入时序
-        // 已先行完成本阶段（先 Reveal 后我们再补 commit 收发），直接放行避免
-        // 阶段漂移死锁；MITM 防护由 EP 交换的 full_commit 复验兜底（128bit）。
-        if !self
-            .exchange(
-                &peer_node_id,
-                tag,
-                &mut rx,
-                frame::KIND_SIG,
-                &commit_pkt.encode(),
-                |body| {
-                    body.first().map(|k| *k == frame::KIND_SIG).unwrap_or(false)
-                        && matches!(
-                            SigPacket::decode(&body[1..]),
-                            Some(pkt) if matches!(pkt.body, SigBody::Commit(_) | SigBody::Reveal(_))
-                        )
-                },
-            )
-            .await
-        {
-            return Err(OrchestratorError::PeerGone);
-        }
-
-        // ①b 交换揭示 + 取对端公钥/nonce
+        // ①a 交换承诺。accept 放宽到「Commit 或 Reveal」：对端可能已先行进入揭示阶段
+        // （它收到了我方承诺，而它的承诺丢了、或被我方上一轮的被动监听消费了）。
+        // 此时必须把对端的揭示内容就地记下：对端一收到我方揭示就不再重发，
+        // 若在这里丢弃这份揭示，①b 将永远等不到第二份（旧实现即死锁于此）。
+        // 先见对端揭示再揭示自己不削弱承诺-揭示：对端公钥在它揭示时已定死，
+        // 无法再随我方公钥调整；MITM 防护由 EP 交换的 full_commit 复验兜底（128bit）。
+        let reveal_bytes = reveal_pkt.encode();
         let mut peer_pk_raw: Option<Vec<u8>> = None;
         let mut peer_nonce: Option<[u8; 32]> = None;
         if !self
@@ -260,19 +294,44 @@ impl SessionOrchestrator {
                 tag,
                 &mut rx,
                 frame::KIND_SIG,
-                &reveal_pkt.encode(),
-                |body| {
-                    if body.first() != Some(&frame::KIND_SIG) {
-                        return false;
+                &commit_pkt.encode(),
+                None,
+                |body| match parse_sig(body) {
+                    Some(SigBody::Commit(_)) => true,
+                    Some(SigBody::Reveal(r)) => {
+                        peer_pk_raw = Some(r.pubkey);
+                        peer_nonce = Some(r.nonce);
+                        true
                     }
-                    if let Some(pkt) = SigPacket::decode(&body[1..]) {
-                        if let SigBody::Reveal(r) = &pkt.body {
-                            peer_pk_raw = Some(r.pubkey.clone());
-                            peer_nonce = Some(r.nonce);
-                            return true;
-                        }
+                    _ => false,
+                },
+            )
+            .await
+        {
+            return Err(OrchestratorError::PeerGone);
+        }
+
+        // ①b 交换揭示 + 取对端公钥/nonce
+        if peer_pk_raw.is_some() {
+            // 对端揭示已在手：我方揭示发出即可前进。万一这一帧丢了，对端会继续重发
+            // 它的 SIG 帧，④ 阶段见到就补发（exchange 的 stale_reply）
+            self.send_frame(&peer_node_id, tag, frame::KIND_SIG, &reveal_bytes)
+                .await;
+        } else if !self
+            .exchange(
+                &peer_node_id,
+                tag,
+                &mut rx,
+                frame::KIND_SIG,
+                &reveal_bytes,
+                None,
+                |body| match parse_sig(body) {
+                    Some(SigBody::Reveal(r)) => {
+                        peer_pk_raw = Some(r.pubkey);
+                        peer_nonce = Some(r.nonce);
+                        true
                     }
-                    false
+                    _ => false,
                 },
             )
             .await
@@ -345,13 +404,14 @@ impl SessionOrchestrator {
                 &mut rx,
                 frame::KIND_EP,
                 &ep_bytes,
-                |body| {
-                    if let Some(ep) = frame::decode_endpoints(&body[1..]) {
+                // 对端若还在重发 SIG 帧，说明它没收到我方揭示：补发，否则它永远走不到本阶段
+                Some((frame::KIND_SIG, reveal_bytes.as_slice())),
+                |body| match frame::parse_endpoints_frame(body) {
+                    Some(ep) => {
                         peer_ep = Some(ep);
                         true
-                    } else {
-                        false
                     }
+                    None => false,
                 },
             )
             .await
@@ -385,17 +445,7 @@ impl SessionOrchestrator {
 
         // 撒网预测用「对端模型」（对端测的是它自己 NAT 的映射规律，
         // 由 EP 报告给我方；03 §3.4/§3.5 语义）
-        let peer_model = if peer_ep.has_model {
-            Some(PortStepModel {
-                last_port: peer_ep.last_port,
-                mean_delta: peer_ep.mean_delta_q as f64 / 64.0,
-                delta_range: (0, 0),
-                trend: wgp_punch::Trend::Oscillating,
-                confidence: (peer_ep.confidence as f64 / 100.0).clamp(0.0, 1.0),
-            })
-        } else {
-            None
-        };
+        let peer_model = peer_model_from(&peer_ep);
 
         // TCP 载体（竞速并行；绑定一个保留端口 = punch 源端口）
         let tcp = if race_cfg.tcp_on {
@@ -435,35 +485,88 @@ impl SessionOrchestrator {
         Ok(())
     }
 
+    /// 被动应答：等待对端向本端发起（或重新发起）协商，收到对端的承诺帧即返回 true。
+    ///
+    /// `connect_peer` 要求两端在约 4 秒的重传窗口内都在跑；两类情形会错过这个窗口：
+    ///  ① 入表时序错位——本端已超时放弃，对端才开始；
+    ///  ② 链路断了——先察觉的一端重新发起，另一端还以为链路健在（14 §10 条款 5 重连幂等）。
+    /// 外围在没有 `connect_peer` 在跑时挂上本方法，返回 true 就立刻调用 `connect_peer`：
+    /// 触发用的那一帧被本方法消费，但对端每 300ms 重传一次，后续帧会被接住。
+    ///
+    /// `settle`：挂上后的静默期，期间到达的帧一律忽略——刚结束的那轮协商可能还有迟到的
+    /// 重传帧在路上，不能把它们误判成新一轮发起（真正的发起会持续重传数秒，不怕错过开头）。
+    ///
+    /// 返回 false = 本会话的注册已被新的 `connect_peer` 顶替（调用方无需再做什么）。
+    /// 注意：本方法会注册会话 tag，**不得**与同一对端的 `connect_peer` 并发调用。
+    pub async fn wait_incoming(
+        &self,
+        room_code: &str,
+        peer_node_id: NodeId,
+        settle: Duration,
+    ) -> bool {
+        let tag = session_tag(room_code, self.node.node_id(), peer_node_id);
+        let mut rx = self.node.register_session(tag).await;
+        let armed_at = tokio::time::Instant::now();
+        loop {
+            let Some(msg) = rx.recv().await else {
+                return false;
+            };
+            if armed_at.elapsed() < settle {
+                continue;
+            }
+            let Some(body) = msg.payload.get(4..) else {
+                continue;
+            };
+            if matches!(parse_sig(body), Some(SigBody::Commit(_))) {
+                return true;
+            }
+        }
+    }
+
     /// 通用交换：重传本端帧（300ms ×14 ≈ 4.2s），直到对端帧通过 `accept`。
+    ///
+    /// `stale_reply` = (帧类型, 应答帧体)：本阶段收到对端该类型的帧，说明对端还停在
+    /// 更早的阶段（没收到我方对应的帧），就地补发应答，避免对端永远等不到。
+    #[allow(clippy::too_many_arguments)]
     async fn exchange(
         &self,
         peer: &NodeId,
         tag: u32,
         rx: &mut mpsc::UnboundedReceiver<ForwardBody>,
-        expect_kind: u8,
+        kind: u8,
         body: &[u8],
+        stale_reply: Option<(u8, &[u8])>,
         mut accept: impl FnMut(&[u8]) -> bool,
     ) -> bool {
-        let mut payload = Vec::with_capacity(5 + body.len());
-        payload.extend_from_slice(&tag.to_be_bytes());
-        payload.push(expect_kind);
-        payload.extend_from_slice(body);
-
         for _ in 0..14 {
-            self.send_forward(*peer, &payload).await;
-            let got = tokio::time::timeout(Duration::from_millis(300), rx.recv())
-                .await
-                .ok()
-                .flatten();
-            if let Some(m) = got {
-                let frame_body = &m.payload[4..]; // 前 4B 为分派 tag
+            self.send_frame(peer, tag, kind, body).await;
+            // 一个重传周期内逐帧判定：收到无关帧不提前进入下一次重传（否则对端的重传会
+            // 成倍消耗本端的重试次数，等待窗口被压缩）
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+            while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+                let Some(frame_body) = msg.payload.get(4..) else {
+                    continue; // 前 4B 为分派 tag
+                };
                 if accept(frame_body) {
                     return true;
+                }
+                if let Some((stale_kind, reply)) = stale_reply {
+                    if frame_body.first() == Some(&stale_kind) {
+                        self.send_frame(peer, tag, stale_kind, reply).await;
+                    }
                 }
             }
         }
         false
+    }
+
+    /// 发送一帧协商消息：tag(4B，由 DHT 分派层消费) | kind(1B) | body
+    async fn send_frame(&self, peer: &NodeId, tag: u32, kind: u8, body: &[u8]) {
+        let mut payload = Vec::with_capacity(5 + body.len());
+        payload.extend_from_slice(&tag.to_be_bytes());
+        payload.push(kind);
+        payload.extend_from_slice(body);
+        self.send_forward(*peer, &payload).await;
     }
 
     /// 向种子投递一条"致 peer"的载荷：UDP 为主；配置了 TCP 兜底时同发一份。
@@ -476,10 +579,6 @@ impl SessionOrchestrator {
     }
 }
 
-#[allow(unused)]
-fn _split_frame(buf: &[u8]) -> (u8, &[u8]) {
-    (buf[0], &buf[1..])
-}
 
 #[cfg(test)]
 mod tests {
@@ -631,6 +730,185 @@ mod tests {
         drop(ra_ranks);
 
         let _ = observer;
+    }
+
+    /// 被动应答：A 先发起并超时放弃之前，B 并没有在跑 connect_peer——B 只挂着
+    /// wait_incoming。B 被 A 的承诺帧触发后再调用 connect_peer，双方仍能完成装配并各自收到交付。
+    #[tokio::test]
+    async fn passive_side_is_woken_by_peer_commit() {
+        let seed = {
+            let mut rng = OsRng;
+            let id = NodeIdentity::generate(&mut rng);
+            DhtNode::bind(id, "127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap()
+        };
+        let seed_addr = seed.local_addr().unwrap();
+        let observer = ObserverServer::bind(0).await.expect("观察者启动");
+        let observer_addr: SocketAddr =
+            format!("127.0.0.1:{}", observer.local_addr().unwrap().port())
+                .parse()
+                .unwrap();
+        let a = spawn_client(seed_addr, vec![observer_addr]).await;
+        let b = spawn_client(seed_addr, vec![observer_addr]).await;
+        const ROOM: &str = "U/PASSIVE-0001-EE66";
+        let (a_node_id, b_node_id) = (a.node.node_id(), b.node.node_id());
+
+        let sink_a = Arc::new(CountSink {
+            count: AtomicUsize::new(0),
+            ranks: Mutex::new(Vec::new()),
+        });
+        let sink_b = Arc::new(CountSink {
+            count: AtomicUsize::new(0),
+            ranks: Mutex::new(Vec::new()),
+        });
+
+        // B：先只监听；被触发后才进入正式协商
+        let b_task = {
+            let orch = b.orchestrator;
+            let sink = sink_b.clone();
+            tokio::spawn(async move {
+                let woken = orch
+                    .wait_incoming(ROOM, a_node_id, Duration::from_millis(0))
+                    .await;
+                assert!(woken, "B 应被 A 的承诺帧唤醒");
+                orch.connect_peer(ROOM, a_node_id, sink).await
+            })
+        };
+        // 让 B 先挂上监听，再由 A 发起
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let a_result = a.orchestrator.connect_peer(ROOM, b_node_id, sink_a.clone()).await;
+        assert!(a_result.is_ok(), "A 侧装配应成功, got={a_result:?}");
+        let b_result = b_task.await.unwrap();
+        assert!(b_result.is_ok(), "B 侧装配应成功, got={b_result:?}");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while tokio::time::Instant::now() < deadline
+            && (sink_a.count.load(Ordering::SeqCst) == 0 || sink_b.count.load(Ordering::SeqCst) == 0)
+        {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(sink_a.count.load(Ordering::SeqCst) >= 1, "A 应收到链路交付");
+        assert!(sink_b.count.load(Ordering::SeqCst) >= 1, "B 应收到链路交付");
+        let _ = observer;
+    }
+
+    #[test]
+    fn peer_model_falls_back_to_observed_port() {
+        let base = frame::Endpoints {
+            ipv4: [1, 2, 3, 4],
+            port: 40123,
+            udp_ok: true,
+            tcp_ok: true,
+            has_model: false,
+            last_port: 0,
+            mean_delta_q: 0,
+            confidence: 0,
+            full_commit: [0; 32],
+        };
+        // 无模型但有实测端口 → 以实测端口为中心建模，三波首包直打该端口
+        let model = peer_model_from(&base).expect("应兜底建模");
+        assert_eq!(model.last_port, 40123);
+        let plan = wgp_punch::plan_waves(Some(&model), 7, 47);
+        assert_eq!(plan.wave1.first(), Some(&40123));
+
+        // 有模型：照搬对端报告
+        let learned = frame::Endpoints {
+            has_model: true,
+            last_port: 50_000,
+            mean_delta_q: 3 * 64,
+            confidence: 90,
+            ..base
+        };
+        let model = peer_model_from(&learned).unwrap();
+        assert_eq!(model.last_port, 50_000);
+        assert!((model.mean_delta - 3.0).abs() < 1e-9);
+        assert!((model.confidence - 0.9).abs() < 1e-9);
+
+        // UDP 不通 / 没有端口：无从预测
+        assert!(peer_model_from(&frame::Endpoints { udp_ok: false, ..base }).is_none());
+        assert!(peer_model_from(&frame::Endpoints { port: 0, ..base }).is_none());
+    }
+
+    /// 端点帧/承诺帧体来自网络，任何长度都必须安全解析（回归：空帧体曾触发切片越界 panic）
+    #[test]
+    fn frame_parsers_never_panic_on_short_input() {
+        assert!(frame::parse_endpoints_frame(&[]).is_none());
+        assert!(frame::parse_endpoints_frame(&[frame::KIND_EP]).is_none());
+        assert!(frame::parse_endpoints_frame(&[frame::KIND_EP, 1, 2, 3]).is_none());
+        // kind 不符：即使长度恰好也不当作端点帧
+        let mut wrong_kind = vec![frame::KIND_SIG];
+        wrong_kind.extend_from_slice(&[0u8; frame::EP_BODY_LEN]);
+        assert!(frame::parse_endpoints_frame(&wrong_kind).is_none());
+        let mut ok = vec![frame::KIND_EP];
+        ok.extend_from_slice(&[0u8; frame::EP_BODY_LEN]);
+        assert!(frame::parse_endpoints_frame(&ok).is_some());
+
+        assert!(parse_sig(&[]).is_none());
+        assert!(parse_sig(&[frame::KIND_SIG]).is_none());
+        assert!(parse_sig(&[frame::KIND_EP, 0, 0]).is_none());
+    }
+
+    /// 静默期内到达的帧（上一轮协商的迟到重传）不得触发；非承诺帧任何时候都不触发。
+    #[tokio::test]
+    async fn wait_incoming_ignores_stale_and_non_commit_frames() {
+        let seed = {
+            let mut rng = OsRng;
+            let id = NodeIdentity::generate(&mut rng);
+            DhtNode::bind(id, "127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap()
+        };
+        let seed_addr = seed.local_addr().unwrap();
+        let a = spawn_client(seed_addr, vec![]).await;
+        let b = spawn_client(seed_addr, vec![]).await;
+        const ROOM: &str = "U/PASSIVE-0002-FF77";
+        let (a_node_id, b_node_id) = (a.node.node_id(), b.node.node_id());
+        let tag = session_tag(ROOM, a_node_id, b_node_id);
+
+        let commit_payload = {
+            let pkt = SigPacket::commit(
+                CommitBody {
+                    peer_id: peer_id_from_node(&a_node_id),
+                    commit: [0x11; 16],
+                },
+                X25519Agreement.algo_id(),
+                0,
+            );
+            let mut p = tag.to_be_bytes().to_vec();
+            p.push(frame::KIND_SIG);
+            p.extend_from_slice(&pkt.encode());
+            p
+        };
+        let endpoint_payload = {
+            let mut p = tag.to_be_bytes().to_vec();
+            p.push(frame::KIND_EP);
+            p.extend_from_slice(&[0u8; frame::EP_BODY_LEN]);
+            p
+        };
+
+        let b_orch = b.orchestrator;
+        let waiter = tokio::spawn(async move {
+            b_orch
+                .wait_incoming(ROOM, a_node_id, Duration::from_millis(600))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // 静默期内的承诺帧 + 任意时刻的端点帧：都不应触发
+        a.orchestrator.send_forward(b_node_id, &commit_payload).await;
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        a.orchestrator.send_forward(b_node_id, &endpoint_payload).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!waiter.is_finished(), "静默期内的帧与非承诺帧不得触发");
+
+        // 静默期过后的承诺帧：触发
+        a.orchestrator.send_forward(b_node_id, &commit_payload).await;
+        let woken = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("应被触发")
+            .unwrap();
+        assert!(woken);
     }
 
     /// TCP 信令兜底：UDP 种子地址不可达（黑洞端口）时，
