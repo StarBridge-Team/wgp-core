@@ -1,5 +1,7 @@
 # 发版：推送 v* 标签时，为 8 个目标构建 → 验证 → 打包，并发布为 GitHub Release。
-# 也可以在 Actions 页面手动触发（workflow_dispatch）：只构建和验证，产物挂在该次运行上，不发布。
+# 不发布的演练（只构建和验证，产物挂在该次运行上）：
+#   - 在 Actions 页面手动触发（workflow_dispatch）；
+#   - 改到发版流程本身（本文件、构建配置、端到端脚本）的 PR 会自动跑一遍，免得打标签时才发现坏了。
 #
 # 发一个版本：
 #   git tag v0.1.0-preview.1 && git push origin v0.1.0-preview.1
@@ -11,7 +13,21 @@ name: Release
 on:
   push:
     tags: ['v*']
+  pull_request:
+    paths:
+      - '.github/workflows/release.yml'
+      - '.cargo/config.toml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'scripts/e2e-local.ps1'
+      - 'scripts/e2e-local.sh'
+      - 'scripts/package-readme.md'
   workflow_dispatch:
+
+# 同一个 PR 的新推送顶掉旧的演练；标签发版不取消
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -86,6 +102,19 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y -q qemu-user-static binfmt-support
 
+      # Windows 产物静态链接 C 运行时（.cargo/config.toml）：没装 VC++ 运行库的机器上也要能直接跑。
+      # 这是静态检查，构建机上跑不了的 ARM64 产物也一并检查。
+      - name: No VC++ runtime dependency (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $dir = "target\${{ matrix.target }}\release"
+          foreach ($exe in 'wgp-client.exe', 'wgp-node.exe', 'wgp-node-hobby.exe') {
+            $image = [Text.Encoding]::GetEncoding(28591).GetString([IO.File]::ReadAllBytes("$dir\$exe"))
+            if ($image -match '(?i)vcruntime\d+\.dll') { throw "$exe depends on the VC++ runtime (a static CRT is expected)" }
+            Write-Host "$exe has no VC++ runtime dependency"
+          }
+
       # —— 验证：版本输出 + 13 文档的房间码标准向量，再跑回环端到端（双种子发现模式）——
       - name: Smoke test (Windows)
         if: runner.os == 'Windows' && matrix.verify != 'none'
@@ -141,7 +170,7 @@ jobs:
             echo "commit  : $GITHUB_SHA"
             echo "target  : ${{ matrix.target }}"
             echo "rustc   : $(rustc --version)"
-            echo "profile : release (lto, codegen-units=1, stripped), built with --locked"
+            echo "profile : release (lto, codegen-units=1, stripped), statically linked C runtime, built with --locked"
             echo "verified: ${{ matrix.verify }} (e2e = native loopback end-to-end, qemu = same under QEMU user-mode emulation, none = build only)"
           } > "dist/$name/BUILD-INFO.txt"
           cd dist
