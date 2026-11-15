@@ -266,7 +266,7 @@ impl Engine {
 | `join_room` 入表 | 报道发一次，轮询 3s | 轮询 6s，每 1.5s 补发报道 | 报道无应答，丢一个包即失败 |
 | 种子广告 | V1（91B，无公钥），从未发送 | V2（type `0x21`，123B，自带公钥，布局见 17 §10）；RPC `FIND_SEEDS(0x39)` / `SEEDS(0x3A)`（应答不长于请求）；`SeedDirectory`；`DhtNode::{start_advertising, find_seeds, discover, seek_seeds, lookup_node, spread, spawn_maintenance, seeds, watch_seeds}` | 17 P0：让节点互相发现 |
 | `NodeConfig` | 6 个字段 | 新增 `advertise / advertise_epoch / peers` | 同上；纪元由外围持久化（启动计数）后注入 |
-| 房间存储节点 | 外围取「测速最快的 UDP 种子」 | `RoomRuntime::locate(node, code, candidates)`：已有该房间记录的优先，否则取离房间键最近的可达者，明确不中转的排后。仍是单存储点 | 两端必须选中同一个才能相遇 |
+| 房间存储节点 | 外围取「测速最快的 UDP 种子」 | `RoomRuntime::locate(node, code, candidates)`：已有该房间记录的优先；否则可达候选按中转能力分档（明确可中转 > 不知道 > 明确不中转），同档取离房间键最近者。仍是单存储点 | 两端必须选中同一个才能相遇 |
 
 **已验证边界（诚实声明）**：截至 2026-11-15，全部 286 个测试与端到端脚本都跑在回环上（Windows，以及 WSL2 里的 Linux）；跨平台性由"零平台依赖代码 + tokio 抽象"保证，Linux 侧以 [部署清单](../server/deploy/DEPLOY.md) 第 0 步"编译测试先行"为验证门。
 

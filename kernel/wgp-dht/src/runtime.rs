@@ -80,8 +80,10 @@ impl RoomRuntime {
     /// 不能用「各自测速最快」这种因人而异的标准：
     /// 1. 向离房间键最近的若干候选并发查询，**已有合法房间记录**的优先（取其中最近者）——
     ///    双方认识的种子不完全一样时，宁可跟随既有房间，也不另起一个造成分裂；
-    /// 2. 都没有 → 取最近的可达候选，明确不中转的（贡献模式）排在后面：报道与协商消息要靠
-    ///    存储节点中转，选一个不中转的，房间里就永远只有自己。
+    /// 2. 都没有 → 可达候选按中转能力分三档：明确可中转 > 不知道（没有广告的手工配置种子）>
+    ///    明确不中转（贡献模式），同一档内取离房间键最近者。报道与协商消息要靠存储节点中转，
+    ///    选一个不中转的，房间里就永远只有自己；而「不知道」的那个可能正是没有宣告自己的
+    ///    贡献节点（家宽没有固定地址，宣告不了），所以有明确可中转的就不碰运气。
     ///
     /// 全部候选不可达（或没有候选）返回 None。
     pub async fn locate(
@@ -132,8 +134,9 @@ impl RoomRuntime {
                 existing: true,
             });
         }
-        let candidate = first(&|c, s| s == StorageProbe::Empty && c.relays != Some(false))
-            .or_else(|| first(&|_, s| s == StorageProbe::Empty))?;
+        let candidate = [Some(true), None, Some(false)]
+            .into_iter()
+            .find_map(|relays| first(&|c, s| s == StorageProbe::Empty && c.relays == relays))?;
         Some(StoragePick {
             candidate,
             existing: false,
@@ -717,6 +720,25 @@ mod tests {
         hobby_first[0].relays = Some(false);
         let pick = RoomRuntime::locate(&client, CODE, &hobby_first).await.unwrap();
         assert_eq!(pick.candidate, hobby_first[1]);
+
+        // 最近的候选中转能力未知（没有宣告自己的手工配置种子，可能正是贡献节点），
+        // 稍远的一个明确可中转 → 取明确可中转的，不碰运气
+        let mut known_relay_second = ordered.clone();
+        known_relay_second[1].relays = Some(true);
+        let pick = RoomRuntime::locate(&client, CODE, &known_relay_second).await.unwrap();
+        assert_eq!(pick.candidate, known_relay_second[1]);
+
+        // 三档齐全：明确可中转 > 不知道 > 明确不中转，档位优先于距离
+        let mut tiers = ordered.clone();
+        tiers[0].relays = Some(false);
+        tiers[2].relays = Some(true);
+        let pick = RoomRuntime::locate(&client, CODE, &tiers).await.unwrap();
+        assert_eq!(pick.candidate, tiers[2]);
+        // 明确可中转的那个连不上 → 退到「不知道」的，而不是更近的贡献节点
+        let mut relay_dead = tiers.clone();
+        relay_dead[2].addr = "127.0.0.1:1".parse().unwrap();
+        let pick = RoomRuntime::locate(&client, CODE, &relay_dead).await.unwrap();
+        assert_eq!(pick.candidate, relay_dead[1]);
 
         // 全都不中转：仍取最近的（至少房主自己能入表，由外围给出明确提示）
         let all_hobby: Vec<StorageCandidate> = ordered
