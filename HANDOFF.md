@@ -190,7 +190,11 @@ mesh-tun-proto 一行未改。
   Windows：x86_64 / i686 / ARM64；Linux（musl 静态）：x86_64 / i686 / ARM64 / ARMv7 / 龙架构 64。
   龙架构 32 位与 Windows 32 位 ARM 没有带标准库的 Rust 目标，编不了。
   转正时把工作流里的 `PRERELEASE` 改为 `'false'`。
+  改到发版流程本身的 PR 会自动做一次不发布的全矩阵演练（构建 + 验证 + 打包，产物挂在该次运行上）。
+- **Windows 产物静态链接 C 运行时**（`.cargo/config.toml`）：不依赖目标机器上的 VC++ 运行库。
+  此前的构建（含 11-15 早些时候打的 `c85c207` 包）是动态链接，没装运行库的机器上会报找不到 `vcruntime140.dll`。
 - 本机只编 Windows x86_64：`powershell -ExecutionPolicy Bypass -File scripts\package.ps1`，产物在 `dist\`。
+  脚本在独立的 `target\package` 里构建，并把构建者的用户目录路径从程序里改写掉（否则本机用户名会跟着包发出去）。
 
 ---
 
