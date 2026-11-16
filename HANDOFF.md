@@ -248,7 +248,7 @@ mesh-tun-proto 一行未改。
 
 ```powershell
 cd 'E:\Work Files\Code\Rust\wgp'
-cargo test --workspace                                                    # Windows 297 / Linux 296 绿
+cargo test --workspace                                                    # Windows 363 绿
 powershell -ExecutionPolicy Bypass -File scripts\e2e-local.ps1            # 单种子全流程
 powershell -ExecutionPolicy Bypass -File scripts\e2e-local.ps1 -Discovery # 双种子发现
 ```
@@ -262,3 +262,29 @@ target\release\wgp-client join -n t -k k -p udp://127.0.0.1:11010 -i b.key --for
 ```
 
 加入方打印 `[隧道] 就绪` 之后，连 `127.0.0.1:25566` 就是连到房主本机的 25565。
+
+
+---
+
+## 8. 下次开工先做这几件事（2026-11-16 收工时的状态）
+
+**当前状态**：main 已合入（PR #1，merge commit 4489a9d）；CI（Windows/Linux 测试 + agent IPC 冒烟 + 交叉编译检查）
+与发版全矩阵演练（workflow_dispatch，run 43882937807：8 个目标全部 success、8 份产物 + 每目标 sha256 已上传）都是绿的。
+**标签还没打**——公开预览版发布是刻意留到下次的：
+
+`ash
+git tag v0.1.0-preview.1 && git push origin v0.1.0-preview.1     # 会真的发布公开 pre-release
+`
+
+打完标签要核对：Release 页面 8 个资产 + SHA256SUMS.txt + 每目标 .sha256；把 run/Release 链接补进本文 §6。
+
+之后按这个顺序：
+
+1. **真实 NAT 联调**（唯一还缺证据的一环）。需要一台可达的公网 Linux：放行 UDP 11010 / UDP 3478 / TCP 3481，
+   跑 wgp-node --bind 0.0.0.0:11010 --advertise <公网IP>。流程与要填的表见 scripts/nat-field-test.md
+   与 项目完整文档/18-NAT实测数据.md §7。之前配置的两台 VPS 都不可达（一台端口拒绝、一台只接受密码）。
+2. **把 wgp-client 改成 agent 的 IPC 客户端**：需要先把它里面的装配线（member_watch、PeerStates、事件渲染）
+   抽成库，否则 agent 与 CLI 会各维护一份。抽完之后 GUI 才有意义。
+3. 多进程阶段 2 / 3：TUN 特权 helper、ET 独立 worker（见 [项目完整文档/20-多进程运行与跨进程通信方案.md](项目完整文档/20-多进程运行与跨进程通信方案.md)）。
+4. 待决策项（§5）里最影响体验的是第 5 条：hobby 节点是否允许少量信令中转——它决定「只有 hobby 种子时能不能多人联机」。
+5. 小尾巴：GetSnapshot.links 恒空、LeaveRoom 不释放转发端口、多房间共用一份 Engine（见 §3.2 第 16 项）。
