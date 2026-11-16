@@ -112,7 +112,7 @@ jobs:
         shell: powershell
         run: |
           $dir = "target\${{ matrix.target }}\release"
-          foreach ($exe in 'wgp-client.exe', 'wgp-node.exe', 'wgp-node-hobby.exe') {
+          foreach ($exe in 'wgp-client.exe', 'wgp-node.exe', 'wgp-node-hobby.exe', 'wgp-agent.exe') {
             $image = [Text.Encoding]::GetEncoding(28591).GetString([IO.File]::ReadAllBytes("$dir\$exe"))
             if ($image -match '(?i)vcruntime\d+\.dll') { throw "$exe depends on the VC++ runtime (a static CRT is expected)" }
             Write-Host "$exe has no VC++ runtime dependency"
@@ -124,7 +124,7 @@ jobs:
         shell: powershell
         run: |
           $dir = "target\${{ matrix.target }}\release"
-          foreach ($exe in 'wgp-client.exe', 'wgp-node.exe', 'wgp-node-hobby.exe') {
+          foreach ($exe in 'wgp-client.exe', 'wgp-node.exe', 'wgp-node-hobby.exe', 'wgp-agent.exe') {
             & "$dir\$exe" --version
             if ($LASTEXITCODE -ne 0) { throw "$exe --version failed" }
           }
@@ -145,7 +145,7 @@ jobs:
         run: |
           dir="target/${{ matrix.target }}/release"
           file "$dir/wgp-node"
-          for exe in wgp-client wgp-node wgp-node-hobby; do "$dir/$exe" --version; done
+          for exe in wgp-client wgp-node wgp-node-hobby wgp-agent; do "$dir/$exe" --version; done
           code="$("$dir/wgp-client" code 示例房间 123456)"
           [ "$code" = "U/C2G9-GYET-311W-R636" ] || { echo "room-code vector mismatch: $code"; exit 1; }
           echo "room-code vector ok: $code"
@@ -162,7 +162,7 @@ jobs:
           ext=""
           [ "$RUNNER_OS" = Windows ] && ext=".exe"
           mkdir -p "dist/$name"
-          for exe in wgp-client wgp-node wgp-node-hobby; do
+          for exe in wgp-client wgp-node wgp-node-hobby wgp-agent; do
             cp "$dir/$exe$ext" "dist/$name/"
           done
           cp LICENSE "dist/$name/"

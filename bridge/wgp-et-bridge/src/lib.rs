@@ -31,9 +31,17 @@ pub const ET_TUNNEL_PORT: u16 = 11010;
 /// 单帧上限（与 mesh-tun-proto 的流式帧一致：16MiB）
 const MAX_FRAME: usize = 16 * 1024 * 1024;
 /// ET 节点线程的 tick 间隔（该库要求不超过 50ms）
-const TICK_INTERVAL: Duration = Duration::from_millis(10);
-/// 每次 tick 每条连接最多处理的帧数
+const TICK_INTERVAL: Duration = Duration::from_millis(40);
+/// 每次 tick 每条连接最多处理的帧数，也限制单轮命令队列处理量
 const TICK_FRAMES: usize = 64;
+/// 等待 ET 同步轮询的帧数。单帧最大 16MiB，因此每方向最多多保留一帧。
+const TRANSPORT_QUEUE_FRAMES: usize = 1;
+/// 待处理命令上限，避免调用方持续提交造成无界内存增长
+const COMMAND_QUEUE_CAPACITY: usize = 128;
+/// 事件队列上限，避免无人消费事件时持续占用内存
+const EVENT_QUEUE_CAPACITY: usize = 16;
+/// 用户数据命令上限，128 个槽位合计最多暂存 8MiB
+const MAX_COMMAND_DATA: usize = 64 * 1024;
 
 /// 把一帧编码成流上的字节：4B LE 长度（头 + 载荷）| 16B PeerManagerHeader | 载荷。
 /// 与 mesh-tun-proto / EasyTier 的 TCP 帧格式相同。
@@ -64,6 +72,9 @@ fn take_frame(buf: &[u8]) -> Result<Option<(PeerManagerHeader, Vec<u8>, usize)>,
     };
     let hdr = PeerManagerHeader::decode(body);
     let payload = body[PEER_MANAGER_HEADER_SIZE..].to_vec();
+    if hdr.len as usize != payload.len() {
+        return Err(BadFrame);
+    }
     Ok(Some((hdr, payload, 4 + total)))
 }
 
@@ -72,8 +83,8 @@ fn take_frame(buf: &[u8]) -> Result<Option<(PeerManagerHeader, Vec<u8>, usize)>,
 /// 隧道流是异步的，ET 库是同步轮询的：中间用两条通道隔开——读任务把流里的字节切成帧送进
 /// 同步队列（`recv_frame` 非阻塞地取），`send_frame` 把编码好的帧交给写任务。
 pub struct TunnelFrameTransport {
-    outbound: tokio_mpsc::UnboundedSender<Vec<u8>>,
-    inbound: std_mpsc::Receiver<(PeerManagerHeader, Vec<u8>)>,
+    outbound: tokio_mpsc::Sender<Vec<u8>>,
+    inbound: tokio_mpsc::Receiver<(PeerManagerHeader, Vec<u8>)>,
     label: String,
 }
 
@@ -82,8 +93,8 @@ impl TunnelFrameTransport {
     /// 流断开或收到非法帧时，下一次 `recv_frame` 返回错误，ET 节点据此判定对端下线。
     pub fn spawn(stream: TunnelStream, label: impl Into<String>) -> Self {
         let (mut reader, mut writer) = stream.split();
-        let (outbound, mut outbound_rx) = tokio_mpsc::unbounded_channel::<Vec<u8>>();
-        let (inbound_tx, inbound) = std_mpsc::channel();
+        let (outbound, mut outbound_rx) = tokio_mpsc::channel::<Vec<u8>>(TRANSPORT_QUEUE_FRAMES);
+        let (inbound_tx, inbound) = tokio_mpsc::channel(TRANSPORT_QUEUE_FRAMES);
 
         tokio::spawn(async move {
             while let Some(frame) = outbound_rx.recv().await {
@@ -97,17 +108,26 @@ impl TunnelFrameTransport {
         tokio::spawn(async move {
             let mut buf: Vec<u8> = Vec::new();
             while let Ok(Some(chunk)) = reader.read().await {
-                buf.extend_from_slice(&chunk);
-                loop {
-                    match take_frame(&buf) {
-                        Ok(Some((hdr, payload, used))) => {
-                            buf.drain(..used);
-                            if inbound_tx.send((hdr, payload)).is_err() {
-                                return;
+                let mut remaining: &[u8] = chunk.as_ref();
+                while !remaining.is_empty() {
+                    let capacity = (MAX_FRAME + 4).saturating_sub(buf.len());
+                    if capacity == 0 {
+                        return;
+                    }
+                    let take = capacity.min(remaining.len());
+                    buf.extend_from_slice(&remaining[..take]);
+                    remaining = &remaining[take..];
+                    loop {
+                        match take_frame(&buf) {
+                            Ok(Some((hdr, payload, used))) => {
+                                buf.drain(..used);
+                                if inbound_tx.send((hdr, payload)).await.is_err() {
+                                    return;
+                                }
                             }
+                            Ok(None) => break,
+                            Err(BadFrame) => return,
                         }
-                        Ok(None) => break,
-                        Err(BadFrame) => return,
                     }
                 }
             }
@@ -123,16 +143,24 @@ impl TunnelFrameTransport {
 
 impl MeshFrameTransport for TunnelFrameTransport {
     fn send_frame(&mut self, hdr: &PeerManagerHeader, payload: &[u8]) -> anyhow::Result<()> {
+        if hdr.len as usize != payload.len() {
+            return Err(anyhow!("ET frame header length does not match payload"));
+        }
+        if payload.len() + PEER_MANAGER_HEADER_SIZE > MAX_FRAME {
+            return Err(anyhow!("ET frame exceeds {MAX_FRAME} byte limit"));
+        }
         self.outbound
-            .send(encode_frame(hdr, payload))
-            .map_err(|_| anyhow!("wgp tunnel stream closed"))
+            .try_send(encode_frame(hdr, payload))
+            .map_err(|err| anyhow!("wgp tunnel outbound queue unavailable: {err}"))
     }
 
     fn recv_frame(&mut self) -> anyhow::Result<Option<(PeerManagerHeader, Vec<u8>)>> {
         match self.inbound.try_recv() {
             Ok(frame) => Ok(Some(frame)),
-            Err(std_mpsc::TryRecvError::Empty) => Ok(None),
-            Err(std_mpsc::TryRecvError::Disconnected) => Err(anyhow!("wgp tunnel stream closed")),
+            Err(tokio_mpsc::error::TryRecvError::Empty) => Ok(None),
+            Err(tokio_mpsc::error::TryRecvError::Disconnected) => {
+                Err(anyhow!("wgp tunnel stream closed"))
+            }
         }
     }
 
@@ -170,7 +198,7 @@ enum Command {
 /// 产品化时应把握手挪出主循环。
 pub struct EtNode {
     peer_id: u32,
-    commands: std_mpsc::Sender<Command>,
+    commands: std_mpsc::SyncSender<Command>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -179,9 +207,9 @@ impl EtNode {
     pub fn start(
         network: &str,
         secret: &str,
-    ) -> std::io::Result<(Self, tokio_mpsc::UnboundedReceiver<EtEvent>)> {
-        let (commands, command_rx) = std_mpsc::channel::<Command>();
-        let (events, event_rx) = tokio_mpsc::unbounded_channel::<EtEvent>();
+    ) -> std::io::Result<(Self, tokio_mpsc::Receiver<EtEvent>)> {
+        let (commands, command_rx) = std_mpsc::sync_channel::<Command>(COMMAND_QUEUE_CAPACITY);
+        let (events, event_rx) = tokio_mpsc::channel::<EtEvent>(EVENT_QUEUE_CAPACITY);
         let (id_tx, id_rx) = std_mpsc::channel::<u32>();
         let (network, secret) = (network.to_string(), secret.to_string());
 
@@ -194,41 +222,61 @@ impl EtNode {
                     return;
                 }
                 loop {
-                    loop {
-                        let event = match command_rx.try_recv() {
-                            Ok(Command::Attach(transport)) => {
-                                match node.add_custom_transport(Box::new(transport)) {
+                    let first = match command_rx.recv_timeout(TICK_INTERVAL) {
+                        Ok(command) => Some(command),
+                        Err(std_mpsc::RecvTimeoutError::Timeout) => None,
+                        Err(std_mpsc::RecvTimeoutError::Disconnected) => return,
+                    };
+                    let mut command = first;
+                    let mut handled = 0;
+                    while let Some(current) = command {
+                        handled += 1;
+                        let event = match current {
+                            Command::Attach(transport) => {
+                                Some(match node.add_custom_transport(Box::new(transport)) {
                                     Ok(peer_id) => EtEvent::Connected { peer_id },
                                     Err(e) => EtEvent::ConnectFailed {
                                         reason: e.to_string(),
                                     },
-                                }
+                                })
                             }
-                            Ok(Command::Send { to, data }) => match node.send_data_to(to, &data) {
-                                Ok(()) => continue,
-                                Err(e) => EtEvent::SendFailed {
-                                    to,
-                                    reason: e.to_string(),
-                                },
-                            },
-                            Ok(Command::Stop) | Err(std_mpsc::TryRecvError::Disconnected) => return,
-                            Err(std_mpsc::TryRecvError::Empty) => break,
+                            Command::Send { to, data } => {
+                                node.send_data_to(to, &data)
+                                    .err()
+                                    .map(|e| EtEvent::SendFailed {
+                                        to,
+                                        reason: e.to_string(),
+                                    })
+                            }
+                            Command::Stop => return,
                         };
-                        if events.send(event).is_err() {
-                            return;
+                        if let Some(event) = event {
+                            if events.try_send(event).is_err() {
+                                return;
+                            }
                         }
+                        if handled >= TICK_FRAMES {
+                            break;
+                        }
+                        command = match command_rx.try_recv() {
+                            Ok(command) => Some(command),
+                            Err(std_mpsc::TryRecvError::Empty) => None,
+                            Err(std_mpsc::TryRecvError::Disconnected) => return,
+                        };
                     }
                     for event in node.tick(TICK_FRAMES) {
-                        if events.send(EtEvent::Node(event)).is_err() {
+                        if events.try_send(EtEvent::Node(event)).is_err() {
                             return;
                         }
                     }
-                    std::thread::sleep(TICK_INTERVAL);
                 }
             })?;
 
         let peer_id = id_rx.recv().map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::Other, "ET node thread exited at startup")
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "ET node thread exited at startup",
+            )
         })?;
         Ok((
             Self {
@@ -245,14 +293,24 @@ impl EtNode {
         self.peer_id
     }
 
-    /// 接入一条传输并做 ET 握手；结果经事件通道给出（Connected / ConnectFailed）
-    pub fn attach(&self, transport: TunnelFrameTransport) {
-        let _ = self.commands.send(Command::Attach(transport));
+    /// 接入一条传输并做 ET 握手；队列满时返回错误，不阻塞调用线程。
+    pub fn attach(&self, transport: TunnelFrameTransport) -> anyhow::Result<()> {
+        self.commands
+            .try_send(Command::Attach(transport))
+            .map_err(|err| anyhow!("ET command queue unavailable: {err}"))
     }
 
-    /// 向指定 ET 节点发一段用户数据（对端收到 `P2pEvent::InboundUserData`）
-    pub fn send_data(&self, to: u32, data: Vec<u8>) {
-        let _ = self.commands.send(Command::Send { to, data });
+    /// 向指定 ET 节点发一段用户数据（对端收到 `P2pEvent::InboundUserData`）。
+    /// 队列满时返回错误，不阻塞调用线程。
+    pub fn send_data(&self, to: u32, data: Vec<u8>) -> anyhow::Result<()> {
+        if data.len() > MAX_COMMAND_DATA {
+            return Err(anyhow!(
+                "ET user payload exceeds {MAX_COMMAND_DATA} byte limit"
+            ));
+        }
+        self.commands
+            .try_send(Command::Send { to, data })
+            .map_err(|err| anyhow!("ET command queue unavailable: {err}"))
     }
 
     /// 停止节点并等线程退出
@@ -266,7 +324,7 @@ impl EtNode {
 
 impl Drop for EtNode {
     fn drop(&mut self) {
-        let _ = self.commands.send(Command::Stop);
+        let _ = self.commands.try_send(Command::Stop);
     }
 }
 

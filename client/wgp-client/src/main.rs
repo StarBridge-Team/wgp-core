@@ -105,6 +105,8 @@ struct Opts {
     observer: Option<String>,
     identity: Option<PathBuf>,
     once: bool,
+    /// 兼容旧节点：身份证明失败时回退到旧 PING/PONG 学习（默认关闭）
+    allow_legacy_identity: bool,
     /// 端口转发规则（原始字符串，可重复给出；解析见 build_port_config）
     expose: Vec<String>,
     forward: Vec<String>,
@@ -158,6 +160,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
             "--expose-udp" => push_list(&mut o.expose_udp, &take(&mut i)?),
             "--forward-udp" => push_list(&mut o.forward_udp, &take(&mut i)?),
             "--once" => o.once = true,
+            "--allow-legacy-identity" => o.allow_legacy_identity = true,
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -317,7 +320,12 @@ fn cmd_host(args: &[String]) -> Result<(), String> {
     println!("—— 把下面这一行发给同伴，对方原样执行即可加入 ——");
     println!(
         "{}",
-        join_command(&code, &seed_string(&opts), opts.observer.as_deref(), &port_cfg)
+        join_command(
+            &code,
+            &seed_string(&opts),
+            opts.observer.as_deref(),
+            &port_cfg
+        )
     );
     run_room(&code, opts, false)
 }
@@ -377,11 +385,9 @@ fn resolve_join_code(opts: &Opts) -> Result<String, String> {
             println!("派生房间码: {code}");
             Ok(code)
         }
-        _ => Err(
-            "缺少加入目标：给 `join <U/房间码>`，或改用 \
+        _ => Err("缺少加入目标：给 `join <U/房间码>`，或改用 \
              `join --network-name <网络名> --network-secret <网络密钥>` 在本地派生"
-                .to_string(),
-        ),
+            .to_string()),
     }
 }
 
@@ -390,6 +396,20 @@ fn resolve_join_code(opts: &Opts) -> Result<String, String> {
 // ---------------------------------------------------------------------------
 
 /// `joining`：本次是「加入」而不是「开房」——加入时没找到房间要提醒用户（见 async_move）
+fn runtime_worker_threads() -> usize {
+    runtime_worker_threads_for(
+        std::env::var("WGP_RUNTIME_WORKERS").ok().as_deref(),
+        std::thread::available_parallelism().map_or(2, |n| n.get()),
+    )
+}
+
+fn runtime_worker_threads_for(configured: Option<&str>, available: usize) -> usize {
+    configured
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|workers| (1..=64).contains(workers))
+        .unwrap_or_else(|| available.max(1).min(4))
+}
+
 fn run_room(code: &str, opts: Opts, joining: bool) -> Result<(), String> {
     let seed_str = seed_string(&opts);
     let (endpoints, bad) = SeedEndpoint::parse_list(&seed_str);
@@ -413,6 +433,7 @@ fn run_room(code: &str, opts: Opts, joining: bool) -> Result<(), String> {
     let identity = load_or_create_identity(&identity_path)?;
 
     let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(runtime_worker_threads())
         .enable_all()
         .build()
         .map_err(|e| format!("运行时启动失败：{e}"))?;
@@ -438,28 +459,88 @@ async fn async_move(
     let node = DhtNode::bind(identity, "0.0.0.0:0".parse().unwrap())
         .await
         .map_err(|e| format!("DHT 绑定失败：{e}"))?;
+    // 身份证明策略（17 §11.6）：默认严格；--allow-legacy-identity 才回退旧 PING/PONG
+    node.set_identity_policy(if opts.allow_legacy_identity {
+        wgp_dht::IdentityPolicy::LegacyAllowed
+    } else {
+        wgp_dht::IdentityPolicy::Strict
+    });
 
     // ② 选路：测速全部种子（顺带打印观测 RTT）
+    //
+    // 承载选择：用户给的全是 tcp:// → 走 TCP 信令（UDP 被封时的兜底）。TCP 只能承担信令，
+    // 打洞与数据面仍然需要 UDP，所以这里先把话说清楚，而不是等到入表阶段才超时。
+    let tcp_signaling = !endpoints.is_empty()
+        && endpoints
+            .iter()
+            .all(|ep| ep.scheme == SeedScheme::Tcp);
+    let transport = if tcp_signaling {
+        wgp_dht::Transport::Tcp
+    } else {
+        wgp_dht::Transport::Udp
+    };
+    node.set_signaling_transport(transport);
+    if tcp_signaling {
+        println!(
+            "[信令] 使用 TCP 种子（UDP 被封时的兜底）：入表、选点、房间读写与报道中转走 TCP"
+        );
+        eprintln!(
+            "[warn] 打洞与数据面仍然需要 UDP：两端之间 UDP 完全不通时隧道不会建立，\
+             本端只能停在「已入表」"
+        );
+    }
+
     let picks: Vec<SeedPick> = if endpoints.is_empty() {
         Vec::new()
     } else {
         measure_seeds(&node, &endpoints).await
     };
     for p in &picks {
-        println!("[种子] {} → {}  往返 {:?}", p.endpoint.display(), p.addr, p.rtt);
+        println!(
+            "[种子] {} → {}  往返 {:?}",
+            p.endpoint.display(),
+            p.addr,
+            p.rtt
+        );
     }
     if !endpoints.is_empty() && picks.is_empty() {
-        eprintln!("[warn] 全部种子端点不可达（继续尝试显式 --storage）");
+        eprintln!(
+            "[warn] 全部种子端点不可达（对端未启动、UDP 被封，或对端是旧版本不支持身份证明）。\
+             继续尝试显式 --storage"
+        );
+        if tcp_signaling {
+            eprintln!(
+                "[hint] TCP 种子也不可达：确认种子的 TCP 信令端口（wgp-node --tcp）已开放且端口填对"
+            );
+        } else {
+            eprintln!(
+                "[hint] UDP 被封时可以改用 TCP 种子：-p tcp://<主机>:<TCP 信令端口>（如 3481）"
+            );
+        }
+        if !opts.allow_legacy_identity {
+            eprintln!(
+                "[hint] 若确认种子在线且是旧版本，加 --allow-legacy-identity 显式兼容旧协议"
+            );
+        }
     }
 
-    // ②b 种子发现（07 §5 第③层）：以配置的 UDP 种子为入口，学到它们认识的其他种子，并启动
+    // ②b 种子发现（07 §5 第③层）：以配置的种子为入口，学到它们认识的其他种子，并启动
     // 后台维护（探活 + 保住到各种子的 NAT 映射）。入口种子没有宣告自己时目录为空，一切照旧——
     // 只认手工配置的那几个。
     let entries: Vec<SocketAddr> = picks
         .iter()
-        .filter(|p| p.endpoint.scheme == SeedScheme::Udp)
+        .filter(|p| {
+            (transport == wgp_dht::Transport::Tcp) == (p.endpoint.scheme == SeedScheme::Tcp)
+        })
         .map(|p| p.addr)
         .collect();
+    if entries.is_empty() && !endpoints.is_empty() {
+        return Err(format!(
+            "没有可用的 {} 种子端点：房间读写至少要一个能连上的种子。\
+             请检查 -p 的协议与端口，或改用 --storage 显式指定存储节点",
+            transport.scheme()
+        ));
+    }
     if !entries.is_empty() {
         node.discover(&entries).await;
         // 再问一遍「离这个房间最近的种子」：种子很多时，让各端对选点的看法一致
@@ -470,13 +551,22 @@ async fn async_move(
     for seed in &seeds {
         println!("[发现] {}", describe_seed(seed));
     }
+    if !opts.allow_legacy_identity && seeds.iter().any(|s| !s.supports_auth()) {
+        eprintln!(
+            "[warn] 有种子没有宣告身份证明能力（旧版本）。严格模式下它们不会被采信：\
+             升级种子，或加 --allow-legacy-identity 显式兼容旧协议"
+        );
+    }
 
-    // ③ 房间键存储节点：显式优先；否则在已知种子里按房间键确定性选点（v1 房间 RPC 走 UDP）
-    let (storage, room_exists) =
-        resolve_storage(&node, &code, &entries, &seeds, opts.storage.as_deref()).await?;
+    // ③ 房间键存储节点：显式优先；否则在已知种子里按房间键确定性选点
+    let (storage, room_exists, storage_transport) =
+        resolve_storage(&node, &code, &entries, &seeds, opts.storage.as_deref(), transport)
+            .await?;
 
-    // 预热：让存储节点学习本端身份（失败不致命）
-    let _ = node.ping(storage).await;
+    // 预热：让存储节点学习本端身份（失败不致命，但要给出可读原因）
+    if let Err(e) = node.ping(storage).await {
+        eprintln!("[warn] 与存储节点 {storage} 互认失败：{}", e.explain());
+    }
 
     // ④ 数据面：端口转发中枢。先于入表启动——转发口被占用等问题立刻暴露
     let my_id = node.node_id();
@@ -499,7 +589,9 @@ async fn async_move(
 
     // ⑤ 装配内核
     let (engine, _rx) = Engine::new();
-    engine.attach_dht(node.clone(), storage).await;
+    engine
+        .attach_dht_with_transport(node.clone(), storage, storage_transport)
+        .await;
 
     let handle = engine
         .join_room(RoomCode(code.clone()), None)
@@ -655,41 +747,62 @@ fn unforwarded_hint(
 /// 按房间键选点——已有本房间的跟随之；没有则在可达种子里先看中转能力（明确可中转 > 不知道 >
 /// 明确不中转），同一档内取离房间键最近者。
 /// 两端只要认识的种子一样，选中的就是同一个（不再取决于各自测速谁最快）。
-/// 返回 (存储节点, 房间此刻是否已经在它上面；显式指定时没有查，为 None)。
+///
+/// `preferred` 是本次信令的承载：UDP 模式下候选是广告里的 DHT 地址，TCP 模式下是 TCP 信令端口
+/// （没有宣告 TCP 端口的种子在 TCP 模式下不可用，会被跳过并给出说明）。
+/// 返回 (存储节点, 房间此刻是否已经在它上面 / None=没查, 访问它的承载)。
 async fn resolve_storage(
     node: &Arc<DhtNode>,
     code: &str,
     entries: &[SocketAddr],
     seeds: &[SeedInfo],
     explicit: Option<&str>,
-) -> Result<(SocketAddr, Option<bool>), String> {
+    preferred: wgp_dht::Transport,
+) -> Result<(SocketAddr, Option<bool>, wgp_dht::Transport), String> {
     if let Some(s) = explicit {
         let ep = SeedEndpoint::parse(s).map_err(|e| format!("--storage 解析失败：{e:?}"))?;
         let addr = resolve_endpoint(&ep)
             .await
             .ok_or_else(|| format!("--storage 无法解析为地址：{s}"))?;
-        println!("[存储] 房间键存储节点 = {addr}（--storage 指定）");
-        // 没有查过房间在不在
-        return Ok((addr, None));
-    }
-    let candidates = storage_candidates(&node.known_nodes().await, entries, seeds);
-    if candidates.is_empty() {
-        return Err(
-            "无可用 UDP 种子端点：v1 房间键存储走 UDP RPC，请提供 `--seed udp://host:port`"
-                .to_string(),
+        let transport = match ep.scheme {
+            SeedScheme::Tcp => wgp_dht::Transport::Tcp,
+            SeedScheme::Udp => wgp_dht::Transport::Udp,
+        };
+        println!(
+            "[存储] 房间键存储节点 = {addr}（--storage 指定，{}）",
+            transport.scheme()
         );
+        // 没有查过房间在不在
+        return Ok((addr, None, transport));
+    }
+    let candidates = storage_candidates(&node.known_nodes().await, entries, seeds, preferred);
+    if candidates.is_empty() {
+        return Err(match preferred {
+            wgp_dht::Transport::Udp => {
+                "无可用 UDP 种子端点：房间键存储走 UDP RPC，\
+                 请提供 `--seed udp://host:port`（UDP 被封时改用 `--seed tcp://host:<TCP 信令端口>`）"
+                    .to_string()
+            }
+            wgp_dht::Transport::Tcp => {
+                "无可用 TCP 种子端点：UDP 被封时房间读写需要种子的 TCP 信令端口。\
+                 请按 `--seed tcp://host:3481` 给出（端口见 wgp-node 的 --tcp），\
+                 或确认该种子有宣告 tcp_port"
+                    .to_string()
+            }
+        });
     }
     let pick = RoomRuntime::locate(node, code, &candidates)
         .await
         .ok_or("已知种子全部不可达，无法读写房间记录")?;
     println!(
-        "[存储] 房间键存储节点 = {}（{}）",
+        "[存储] 房间键存储节点 = {}（{}，{}）",
         pick.candidate.addr,
         if pick.existing {
             "房间已在该节点上，跟随"
         } else {
             "房间尚不存在，按房间键选定"
-        }
+        },
+        pick.candidate.transport.scheme()
     );
     if pick.candidate.relays == Some(false) {
         eprintln!(
@@ -697,33 +810,50 @@ async fn resolve_storage(
              房间里只会有你自己。请至少配置一个完整版种子（wgp-node）"
         );
     }
-    Ok((pick.candidate.addr, Some(pick.existing)))
+    Ok((
+        pick.candidate.addr,
+        Some(pick.existing),
+        pick.candidate.transport,
+    ))
 }
 
 /// 汇集存储候选：发现的种子（广告里带中转能力）+ 手工配置但没有宣告自己的入口种子
 /// （身份取自测速时的应答，中转能力未知）。同一地址以广告为准。
+///
+/// `preferred` 决定每个候选的访问地址与承载：TCP 模式下用广告里的 TCP 信令端口，
+/// 没有宣告 TCP 端口的种子直接跳过（它在这条路径上不可达）。
 fn storage_candidates(
     known: &[(NodeId, SocketAddr)],
     entries: &[SocketAddr],
     seeds: &[SeedInfo],
+    preferred: wgp_dht::Transport,
 ) -> Vec<StorageCandidate> {
+    let addr_of = |s: &SeedInfo| match preferred {
+        wgp_dht::Transport::Udp => Some(s.addr),
+        wgp_dht::Transport::Tcp => s.tcp_addr(),
+    };
     let mut out: Vec<StorageCandidate> = seeds
         .iter()
-        .map(|s| StorageCandidate {
-            node_id: s.node_id,
-            addr: s.addr,
-            relays: Some(s.relays()),
+        .filter_map(|s| {
+            addr_of(s).map(|addr| StorageCandidate {
+                node_id: s.node_id,
+                addr,
+                relays: Some(s.relays()),
+                transport: preferred,
+            })
         })
         .collect();
     for addr in entries {
         if out.iter().any(|c| c.addr == *addr) {
             continue;
         }
+        // 手工入口端点的身份来自测速时的应答；TCP 模式下 entries 本身就是 TCP 端点
         if let Some((id, _)) = known.iter().find(|(_, at)| at == addr) {
             out.push(StorageCandidate {
                 node_id: *id,
                 addr: *addr,
                 relays: None,
+                transport: preferred,
             });
         }
     }
@@ -761,14 +891,16 @@ fn describe_seed(seed: &SeedInfo) -> String {
     format!(
         "种子 {}（{observer}，{}{rtt}）",
         seed.addr,
-        if seed.relays() { "可中转" } else { "不中转" }
+        if seed.relays() {
+            "可中转"
+        } else {
+            "不中转"
+        }
     )
 }
 
 fn parse_observers(list: Option<&str>) -> Vec<SocketAddr> {
-    let Some(s) = list else {
-        return Vec::new()
-    };
+    let Some(s) = list else { return Vec::new() };
     s.split(|c: char| c == ',' || c == ';' || c.is_whitespace())
         .filter(|s| !s.trim().is_empty())
         .filter_map(|s| s.trim().parse::<SocketAddr>().ok())
@@ -1009,7 +1141,11 @@ fn render(ev: &EngineEvent) {
             diagnosis.udp_blocked,
             diagnosis.cgnat
         ),
-        EngineEvent::RoomAnchorChanged { epoch, anchor, reason } => println!(
+        EngineEvent::RoomAnchorChanged {
+            epoch,
+            anchor,
+            reason,
+        } => println!(
             "[房间] 锚点变更 epoch={epoch} 新锚点={} 原因={reason:?}",
             hex(anchor)
         ),
@@ -1032,9 +1168,7 @@ fn describe_close(reason: &CloseReason) -> String {
     match reason {
         CloseReason::Local => "本端关闭".to_string(),
         CloseReason::Peer(code) if *code == close_code::NORMAL => "对端已退出".to_string(),
-        CloseReason::Peer(code) if *code == close_code::REPLACED => {
-            "对端已换用新链路".to_string()
-        }
+        CloseReason::Peer(code) if *code == close_code::REPLACED => "对端已换用新链路".to_string(),
         CloseReason::Peer(code) => format!("对端关闭（原因码 {code}）"),
         CloseReason::Timeout => "对端无应答，链路已断".to_string(),
         CloseReason::PeerSilent => "对端长时间静默".to_string(),
@@ -1075,26 +1209,29 @@ fn render_port(ev: &PortEvent) {
             hex(peer),
             describe_close(reason)
         ),
-        PortEvent::TunnelFailed { peer, error } => println!(
-            "[隧道] 无法建立 peer={} 原因={error:?}",
-            hex(peer)
-        ),
+        PortEvent::TunnelFailed { peer, error } => {
+            println!("[隧道] 无法建立 peer={} 原因={error:?}", hex(peer))
+        }
         PortEvent::StreamOpened {
             peer,
             port,
             inbound,
         } => println!(
             "[转发] {} peer={} 端口={port}",
-            if *inbound { "对端连入" } else { "本地连出" },
+            if *inbound {
+                "对端连入"
+            } else {
+                "本地连出"
+            },
             hex(peer)
         ),
         PortEvent::NoProvider { proto, remote_port } => println!(
             "[转发] 暂无对端暴露 {} 端口 {remote_port}，本地连接已拒绝",
             proto_name(*proto)
         ),
-        PortEvent::TargetUnreachable { port, target } => println!(
-            "[转发] 本机服务 {target} 连不上（对端请求端口 {port}）——服务启动了吗？"
-        ),
+        PortEvent::TargetUnreachable { port, target } => {
+            println!("[转发] 本机服务 {target} 连不上（对端请求端口 {port}）——服务启动了吗？")
+        }
         // 打洞失败已由引擎事件（LinkLost）打印，此处不重复
         _ => {}
     }
@@ -1181,6 +1318,8 @@ fn print_help() {
                                   （缺省用发现到的种子自带的观察者；一个也没有则跳过 NAT 探测、只试 TCP 兜底）\n\
            -i, --identity <path>  身份文件（默认 {DEFAULT_IDENTITY_FILE}）\n\
            --once                 入表后立即退出（默认驻留并打印事件）\n\
+           --allow-legacy-identity  兼容旧节点：身份证明失败时回退到旧 PING/PONG 学习\n\
+                                   （默认关闭；严格模式只把旧协议用于存活诊断）\n\
            -h, --help             显示本帮助\n\
            -V, --version          显示版本\n\
          \n\
@@ -1204,6 +1343,16 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_worker_threads_are_capped_and_configurable() {
+        assert_eq!(runtime_worker_threads_for(None, 1), 1);
+        assert_eq!(runtime_worker_threads_for(None, 32), 4);
+        assert_eq!(runtime_worker_threads_for(Some("2"), 32), 2);
+        assert_eq!(runtime_worker_threads_for(Some("64"), 1), 64);
+        assert_eq!(runtime_worker_threads_for(Some("0"), 8), 4);
+        assert_eq!(runtime_worker_threads_for(Some("bad"), 8), 4);
+    }
 
     fn v(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
@@ -1306,7 +1455,15 @@ mod tests {
                 target: addr("192.168.1.20:25570"),
             }
         );
-        for bad in ["", "0", "70000", "abc", "25565=", "25565=localhost", "=1.2.3.4:5"] {
+        for bad in [
+            "",
+            "0",
+            "70000",
+            "abc",
+            "25565=",
+            "25565=localhost",
+            "=1.2.3.4:5",
+        ] {
             assert!(parse_expose(bad).is_err(), "`{bad}` 应被拒绝");
         }
     }
@@ -1334,7 +1491,15 @@ mod tests {
                 remote_port: 25565,
             }
         );
-        for bad in ["", "0", "1:2:3:4", "x:25565", "25565:0", "nope:1:2", "1.2.3:1:2"] {
+        for bad in [
+            "",
+            "0",
+            "1:2:3:4",
+            "x:25565",
+            "25565:0",
+            "nope:1:2",
+            "1.2.3:1:2",
+        ] {
             assert!(parse_forward(bad).is_err(), "`{bad}` 应被拒绝");
         }
     }
@@ -1398,15 +1563,25 @@ mod tests {
 
     #[test]
     fn storage_candidates_merge_discovered_and_configured_seeds() {
-        let discovered = [seed_info(1, 11010, 3478, true), seed_info(2, 11010, 0, false)];
+        let discovered = [
+            seed_info(1, 11010, 3478, true),
+            seed_info(2, 11010, 0, false),
+        ];
         // 配置了三个入口：一个就是已发现的 1 号；一个没有宣告但测速时应答过；一个没应答过
         let silent_seed = addr("198.51.100.9:11010");
         let dead_seed = addr("198.51.100.10:11010");
         let entries = [discovered[0].addr, silent_seed, dead_seed];
-        let known = [(NodeId([9; 32]), silent_seed), (NodeId([1; 32]), discovered[0].addr)];
+        let known = [
+            (NodeId([9; 32]), silent_seed),
+            (NodeId([1; 32]), discovered[0].addr),
+        ];
 
-        let got = storage_candidates(&known, &entries, &discovered);
-        assert_eq!(got.len(), 3, "已发现的不重复计入；没应答过的（身份未知）不计入");
+        let got = storage_candidates(&known, &entries, &discovered, wgp_dht::Transport::Udp);
+        assert_eq!(
+            got.len(),
+            3,
+            "已发现的不重复计入；没应答过的（身份未知）不计入"
+        );
         // 广告里的中转能力如实带上；手工配置而未宣告的种子能力未知
         assert_eq!(got[0].relays, Some(true));
         assert_eq!(got[1].relays, Some(false));
@@ -1416,10 +1591,28 @@ mod tests {
                 node_id: NodeId([9; 32]),
                 addr: silent_seed,
                 relays: None,
+                transport: wgp_dht::Transport::Udp,
             }
         );
         // 没有任何已知种子：候选为空（调用方报错，而不是猜一个）
-        assert!(storage_candidates(&[], &[dead_seed], &[]).is_empty());
+        assert!(
+            storage_candidates(&[], &[dead_seed], &[], wgp_dht::Transport::Udp).is_empty()
+        );
+    }
+
+    #[test]
+    fn storage_candidates_in_tcp_mode_use_tcp_endpoints() {
+        // 广告宣告了 TCP 信令端口的种子：TCP 模式用 tcp_addr()
+        let mut with_tcp = seed_info(1, 11010, 3478, true);
+        with_tcp.tcp_port = 3481;
+        // 没有宣告 TCP 端口的种子在 TCP 模式下不可用，必须被跳过
+        let no_tcp = seed_info(2, 11010, 3478, true);
+        let seeds = [with_tcp, no_tcp];
+        let got = storage_candidates(&[], &[], &seeds, wgp_dht::Transport::Tcp);
+        assert_eq!(got.len(), 1, "没有 TCP 信令端口的种子应被跳过");
+        assert_eq!(got[0].transport, wgp_dht::Transport::Tcp);
+        assert_eq!(got[0].addr.port(), 3481);
+        assert_eq!(got[0].addr.ip(), seeds[0].addr.ip());
     }
 
     #[test]
@@ -1532,7 +1725,10 @@ mod tests {
         let hint = unforwarded_hint(&ready, &forwarded, &mut hinted).expect("有没转发的端口应提示");
         assert!(hint.contains("--forward 8080"), "{hint}");
         assert!(hint.contains("--forward-udp 19132"), "{hint}");
-        assert!(!hint.contains("--forward 25565"), "已经转发的端口不该出现：{hint}");
+        assert!(
+            !hint.contains("--forward 25565"),
+            "已经转发的端口不该出现：{hint}"
+        );
         // 重连后同样的端口不再重复提示
         assert!(unforwarded_hint(&ready, &forwarded, &mut hinted).is_none());
         // 全都转发了：不提示
@@ -1547,7 +1743,10 @@ mod tests {
     fn join_errors_are_explained() {
         let storage: SocketAddr = "192.0.2.1:11010".parse().unwrap();
         let timeout = describe_join_error(&RoomError::NotFound, storage);
-        assert!(timeout.contains("入表超时") && timeout.contains("192.0.2.1:11010"), "{timeout}");
+        assert!(
+            timeout.contains("入表超时") && timeout.contains("192.0.2.1:11010"),
+            "{timeout}"
+        );
         let unreachable = describe_join_error(&RoomError::StoreFailed, storage);
         assert!(unreachable.contains("没有应答"), "{unreachable}");
     }

@@ -72,6 +72,12 @@ impl SeedInfo {
     pub fn relays(&self) -> bool {
         self.flags & seed_advertise_v2::FLAG_RELAY != 0
     }
+
+    /// 是否支持挑战响应身份证明（17 §11）。老版本不置位：严格模式下它们无法被采信，
+    /// 调用方可据此提前给出「对端需要升级」的提示，而不是等探活超时。
+    pub fn supports_auth(&self) -> bool {
+        self.flags & seed_advertise_v2::FLAG_AUTH_V1 != 0
+    }
 }
 
 /// 一条已验签的广告相对目录现状的处置

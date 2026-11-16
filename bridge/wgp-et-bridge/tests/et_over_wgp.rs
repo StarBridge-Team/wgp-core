@@ -133,12 +133,18 @@ async fn punch() -> Rig {
 }
 
 /// 在一对隧道上开一条 ET 流：`opener` 发起，`acceptor` 接受
-async fn et_stream_pair(opener: &mut Tunnel, acceptor: &mut Tunnel) -> (TunnelStream, TunnelStream) {
+async fn et_stream_pair(
+    opener: &mut Tunnel,
+    acceptor: &mut Tunnel,
+) -> (TunnelStream, TunnelStream) {
     let hello = timeout(STEP_TIMEOUT, opener.handle.peer_hello())
         .await
         .expect("应收到对端的隧道 HELLO")
         .expect("隧道在 HELLO 之前关闭");
-    assert!(hello.tcp.contains(&ET_TUNNEL_PORT), "对端应声明接受 ET 端口");
+    assert!(
+        hello.tcp.contains(&ET_TUNNEL_PORT),
+        "对端应声明接受 ET 端口"
+    );
     let opened = opener.handle.open_stream(ET_TUNNEL_PORT).expect("开流");
     let incoming = timeout(STEP_TIMEOUT, acceptor.incoming.recv())
         .await
@@ -150,7 +156,7 @@ async fn et_stream_pair(opener: &mut Tunnel, acceptor: &mut Tunnel) -> (TunnelSt
 
 /// 等一个满足条件的 ET 事件（其余事件跳过）
 async fn expect_event<T>(
-    events: &mut mpsc::UnboundedReceiver<EtEvent>,
+    events: &mut mpsc::Receiver<EtEvent>,
     what: &str,
     mut pick: impl FnMut(EtEvent) -> Option<T>,
 ) -> T {
@@ -206,18 +212,37 @@ async fn two_wgp_nodes_punch_then_talk_et_over_the_tunnel() {
             et_stream_pair(&mut rig.host_tunnel, &mut rig.joiner_tunnel).await;
         let (et_host, mut host_events) = EtNode::start("wgp-et-poc", "poc-secret").unwrap();
         let (et_joiner, mut joiner_events) = EtNode::start("wgp-et-poc", "poc-secret").unwrap();
-        et_host.attach(TunnelFrameTransport::spawn(host_stream, "wgp-tunnel/host"));
-        et_joiner.attach(TunnelFrameTransport::spawn(joiner_stream, "wgp-tunnel/joiner"));
+        et_host
+            .attach(TunnelFrameTransport::spawn(host_stream, "wgp-tunnel/host"))
+            .expect("队列应有空位接入房主流");
+        et_joiner
+            .attach(TunnelFrameTransport::spawn(
+                joiner_stream,
+                "wgp-tunnel/joiner",
+            ))
+            .expect("队列应有空位接入加入流");
 
         let seen_by_host = expect_event(&mut host_events, "房主侧 ET 握手完成", connected).await;
         let seen_by_joiner =
             expect_event(&mut joiner_events, "加入方 ET 握手完成", connected).await;
-        assert_eq!(seen_by_host, et_joiner.peer_id(), "房主认出的对端 = 加入方的 ET 节点号");
-        assert_eq!(seen_by_joiner, et_host.peer_id(), "加入方认出的对端 = 房主的 ET 节点号");
+        assert_eq!(
+            seen_by_host,
+            et_joiner.peer_id(),
+            "房主认出的对端 = 加入方的 ET 节点号"
+        );
+        assert_eq!(
+            seen_by_joiner,
+            et_host.peer_id(),
+            "加入方认出的对端 = 房主的 ET 节点号"
+        );
 
         // —— 互发一条消息 ——
-        et_host.send_data(et_joiner.peer_id(), b"hello from host".to_vec());
-        et_joiner.send_data(et_host.peer_id(), "加入方向房主问好".as_bytes().to_vec());
+        et_host
+            .send_data(et_joiner.peer_id(), b"hello from host".to_vec())
+            .expect("发送命令应入队");
+        et_joiner
+            .send_data(et_host.peer_id(), "加入方向房主问好".as_bytes().to_vec())
+            .expect("发送命令应入队");
 
         let (from, data) = expect_event(&mut joiner_events, "加入方收到消息", user_data).await;
         assert_eq!(from, et_host.peer_id());
@@ -232,18 +257,39 @@ async fn two_wgp_nodes_punch_then_talk_et_over_the_tunnel() {
             et_stream_pair(&mut rig.joiner_tunnel, &mut rig.host_tunnel).await;
         let (stranger, mut stranger_events) =
             EtNode::start("wgp-et-poc", "another-secret").unwrap();
-        stranger.attach(TunnelFrameTransport::spawn(stranger_stream, "wgp-tunnel/stranger"));
-        et_host.attach(TunnelFrameTransport::spawn(host_stream_2, "wgp-tunnel/host-2"));
+        stranger
+            .attach(TunnelFrameTransport::spawn(
+                stranger_stream,
+                "wgp-tunnel/stranger",
+            ))
+            .expect("队列应有空位接入陌生节点流");
+        et_host
+            .attach(TunnelFrameTransport::spawn(
+                host_stream_2,
+                "wgp-tunnel/host-2",
+            ))
+            .expect("队列应有空位接入第二条流");
 
         let reason = expect_event(&mut stranger_events, "陌生节点被拒", rejected).await;
-        assert!(reason.contains("mismatch"), "拒绝原因应为身份不符，得到：{reason}");
+        assert!(
+            reason.contains("mismatch"),
+            "拒绝原因应为身份不符，得到：{reason}"
+        );
         let reason = expect_event(&mut host_events, "房主拒绝陌生节点", rejected).await;
-        assert!(reason.contains("mismatch"), "拒绝原因应为身份不符，得到：{reason}");
+        assert!(
+            reason.contains("mismatch"),
+            "拒绝原因应为身份不符，得到：{reason}"
+        );
 
         // 已建立的那条 ET 连接不受影响
-        et_joiner.send_data(et_host.peer_id(), b"still here".to_vec());
+        et_joiner
+            .send_data(et_host.peer_id(), b"still here".to_vec())
+            .expect("发送命令应入队");
         let (from, data) = expect_event(&mut host_events, "旧连接仍可用", user_data).await;
-        assert_eq!((from, data.as_slice()), (et_joiner.peer_id(), &b"still here"[..]));
+        assert_eq!(
+            (from, data.as_slice()),
+            (et_joiner.peer_id(), &b"still here"[..])
+        );
 
         et_host.stop();
         et_joiner.stop();

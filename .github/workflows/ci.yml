@@ -82,6 +82,18 @@ jobs:
         if: runner.os == 'Linux'
         run: bash scripts/e2e-local.sh target/release --discovery --hobby
 
+      # —— 多进程阶段 1：真实进程 + 真实本机 IPC 端点（ACL、有界队列、优雅退出）——
+      - name: Agent IPC smoke (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          & .\scripts\agent-smoke.ps1
+          exit $LASTEXITCODE
+
+      - name: Agent IPC smoke (Linux)
+        if: runner.os == 'Linux'
+        run: bash scripts/agent-smoke.sh
+
   cross-check:
     name: check (${{ matrix.os }} cross targets)
     runs-on: ${{ matrix.os }}

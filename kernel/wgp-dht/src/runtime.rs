@@ -7,7 +7,7 @@
 //!    写入者身份），锚点验签后 add_member 重签重存。
 
 use crate::id::{node_id_from_verifying, NodeId, NodeIdentity};
-use crate::node::DhtNode;
+use crate::node::{DhtNode, Transport};
 use crate::room::{
     room_key, sign_room, succession_line, verify_room, Lease, LeaseWatch, RoomRecord,
 };
@@ -19,6 +19,7 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 use wgp_proto::consts::LEASE_INTERVAL_S;
+use wgp_proto::dht::ValueBody;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoomError {
@@ -42,6 +43,8 @@ pub struct StorageCandidate {
     pub addr: SocketAddr,
     /// 是否允许 Forward 中转；None = 不知道（没有广告的手工配置种子）
     pub relays: Option<bool>,
+    /// 用哪种承载访问这个候选（UDP 被封时选 TCP 种子）
+    pub transport: Transport,
 }
 
 /// 选点结果
@@ -63,17 +66,63 @@ enum StorageProbe {
 pub struct RoomRuntime {
     node: Arc<DhtNode>,
     identity: Arc<NodeIdentity>,
-    /// 房间键存储节点（v1：双方共同认识的种子）
+    /// 房间键存储节点
     storage: SocketAddr,
+    /// 访问存储节点的承载（UDP 直连 / TCP 兜底）
+    transport: Transport,
 }
 
 impl RoomRuntime {
+    /// 默认走 UDP（与 v1 行为一致）
     pub fn new(node: Arc<DhtNode>, storage: SocketAddr) -> Self {
+        Self::with_transport(node, storage, Transport::Udp)
+    }
+
+    /// 指定承载：UDP 被封时用 [`Transport::Tcp`]，`storage` 必须是该种子的 **TCP 信令端口**
+    pub fn with_transport(node: Arc<DhtNode>, storage: SocketAddr, transport: Transport) -> Self {
         let identity = node.identity();
         Self {
             node,
             identity,
             storage,
+            transport,
+        }
+    }
+
+    pub fn transport(&self) -> Transport {
+        self.transport
+    }
+
+    pub fn storage(&self) -> SocketAddr {
+        self.storage
+    }
+
+    // —— 存储节点 RPC：同一套语义，按承载分派 ———————————————
+    async fn rpc_find_value(&self, key: [u8; 32]) -> Result<ValueBody, crate::node::RpcError> {
+        match self.transport {
+            Transport::Udp => self.node.find_value(self.storage, key).await,
+            Transport::Tcp => self.node.find_value_tcp(self.storage, key).await,
+        }
+    }
+
+    async fn rpc_store(&self, key: [u8; 32], value: Vec<u8>) -> Result<(), crate::node::RpcError> {
+        match self.transport {
+            Transport::Udp => self.node.store(self.storage, key, value).await,
+            Transport::Tcp => self.node.store_tcp(self.storage, key, value).await,
+        }
+    }
+
+    async fn rpc_forward(&self, target: NodeId, payload: Vec<u8>) -> Result<(), crate::node::RpcError> {
+        match self.transport {
+            Transport::Udp => self.node.forward_to(self.storage, target, payload).await,
+            Transport::Tcp => self.node.forward_tcp(self.storage, target, payload).await,
+        }
+    }
+
+    async fn rpc_ping(&self) -> Result<crate::node::PongInfo, crate::node::RpcError> {
+        match self.transport {
+            Transport::Udp => self.node.ping(self.storage).await,
+            Transport::Tcp => self.node.ping_tcp(self.storage).await,
         }
     }
 
@@ -106,8 +155,13 @@ impl RoomRuntime {
         for (rank, candidate) in ordered.iter().enumerate() {
             let node = node.clone();
             let addr = candidate.addr;
+            let transport = candidate.transport;
             queries.spawn(async move {
-                let state = match node.find_value(addr, key).await {
+                let probe = match transport {
+                    Transport::Udp => node.find_value(addr, key).await,
+                    Transport::Tcp => node.find_value_tcp(addr, key).await,
+                };
+                let state = match probe {
                     Ok(v) if !v.value.is_empty() && verify_room(&v.value).is_some() => {
                         StorageProbe::HasRoom
                     }
@@ -174,8 +228,7 @@ impl RoomRuntime {
     pub async fn fetch(&self, code: &str) -> Result<RoomRecord, RoomError> {
         let key = room_key(code);
         let value = self
-            .node
-            .find_value(self.storage, key)
+            .rpc_find_value(key)
             .await
             .map_err(|_| RoomError::StoreFailed)?;
         if value.value.is_empty() {
@@ -188,8 +241,7 @@ impl RoomRuntime {
     /// 签名并存储记录
     pub async fn publish(&self, code: &str, record: &RoomRecord) -> Result<(), RoomError> {
         let signed = sign_room(&self.identity, record);
-        self.node
-            .store(self.storage, room_key(code), signed)
+        self.rpc_store(room_key(code), signed)
             .await
             .map_err(|_| RoomError::StoreFailed)
     }
@@ -269,8 +321,7 @@ impl RoomRuntime {
     /// v1 无 ACK：请求方轮询 fetch 直至自己入表（upkeep 内实现）。
     pub async fn request_join(&self, code: &str, record: &RoomRecord) -> Result<(), RoomError> {
         let payload = JoinRequest::sign(&self.identity, code);
-        self.node
-            .forward_to(self.storage, record.lease.anchor, payload)
+        self.rpc_forward(record.lease.anchor, payload)
             .await
             .map_err(|_| RoomError::StoreFailed)
     }
@@ -327,9 +378,9 @@ impl RoomRuntime {
             round = round.wrapping_add(1);
 
             // ⓪ 向存储节点重新登记地址：它按「身份 → 地址」把报道与协商消息中转给我们，而地址只从
-            // PING / STORE 里学；它一重启，地址簿就空了。顺带保住本端到它的 NAT 映射。
+            // 互认握手（挑战响应）里学；它一重启，地址簿就空了。顺带保住本端到它的 NAT 映射。
             if round % REGISTER_EVERY_ROUNDS == 0 {
-                let _ = self.node.ping(self.storage).await;
+                let _ = self.rpc_ping().await;
             }
 
             // ① 锚点职责：处理报道队列
@@ -468,6 +519,79 @@ mod tests {
 
     fn pk_of(node: &Arc<DhtNode>) -> Vec<u8> {
         node.identity().verifying_key().to_bytes().to_vec()
+    }
+
+    #[tokio::test]
+    async fn room_readwrite_works_over_tcp_when_udp_endpoint_is_dead() {
+        // 存储节点：TCP 信令面可用；它的 UDP 端口这里**不参与**——客户端拿到的存储地址就是
+        // 这个 TCP 端口，若实现偷偷走 UDP，find_value/store 会因为「该端口没有 UDP 服务」而超时。
+        let storage = spawn_node().await;
+        let storage_tcp = storage
+            .listen_tcp("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let owner = spawn_node().await;
+        let member = spawn_node().await;
+        owner.set_signaling_transport(Transport::Tcp);
+        member.set_signaling_transport(Transport::Tcp);
+
+        let code = "U/TCP-ROOM-0001-CD34";
+        let candidate = |node: &Arc<DhtNode>| StorageCandidate {
+            node_id: node.node_id(),
+            addr: storage_tcp,
+            relays: Some(true),
+            transport: Transport::Tcp,
+        };
+        // 选点也走 TCP：能看到「房间还不存在」，并把这个判断作为选点依据
+        let empty = RoomRuntime::locate(&owner, code, &[candidate(&storage)])
+            .await
+            .unwrap();
+        assert_eq!(empty.candidate.transport, Transport::Tcp);
+        assert!(!empty.existing);
+
+        let rt_owner = RoomRuntime::with_transport(owner.clone(), storage_tcp, Transport::Tcp);
+        assert_eq!(rt_owner.transport(), Transport::Tcp);
+        let created = rt_owner.create(code, 0).await.expect("TCP 上也应能建房");
+        assert_eq!(created.lease.anchor, owner.node_id());
+
+        // 第二个客户端：同样只走 TCP 读到同一份记录，并跟随之
+        let rt_member = RoomRuntime::with_transport(member.clone(), storage_tcp, Transport::Tcp);
+        let fetched = rt_member.fetch(code).await.expect("TCP 上也应能读房间");
+        assert_eq!(fetched.lease, created.lease);
+        let pick = RoomRuntime::locate(&member, code, &[candidate(&storage)])
+            .await
+            .unwrap();
+        assert!(pick.existing, "已有记录时应跟随既有房间");
+
+        // 续期（store）+ 入表（add_member + store）都只经 TCP
+        let renewed = rt_owner.renew(code, &created, 30_000).await.expect("续期");
+        assert!(renewed.lease.expires_at_ms > created.lease.expires_at_ms);
+        let joined = rt_owner
+            .add_member(code, &renewed, member.node_id(), pk_of(&member), 30_000)
+            .await
+            .expect("入表");
+        assert_eq!(joined.members.len(), 2);
+        assert_eq!(
+            rt_member.fetch(code).await.unwrap().members.len(),
+            2,
+            "成员表在 TCP 读写路径上一致"
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_room_reports_store_failure_when_seed_has_no_tcp_listener() {
+        // 种子的 UDP 在，但 TCP 没开：TCP 模式的房间读写必须**明确失败**，而不是假装成功
+        let storage = spawn_node().await;
+        let dead_tcp: SocketAddr = format!("127.0.0.1:{}", storage.local_addr().unwrap().port())
+            .parse()
+            .unwrap();
+        let client = spawn_node().await;
+        let rt = RoomRuntime::with_transport(client.clone(), dead_tcp, Transport::Tcp);
+        assert_eq!(rt.fetch("U/TCP-ROOM-0002-EF56").await, Err(RoomError::StoreFailed));
+        assert_eq!(
+            rt.create("U/TCP-ROOM-0002-EF56", 0).await,
+            Err(RoomError::StoreFailed)
+        );
     }
 
     #[tokio::test]
@@ -693,6 +817,7 @@ mod tests {
                 node_id: node.node_id(),
                 addr: node.local_addr().unwrap(),
                 relays: None,
+                transport: Transport::Udp,
             };
             out.push((node, candidate));
         }
@@ -789,6 +914,7 @@ mod tests {
                 node_id: ordered[0].node_id,
                 addr: SocketAddr::from(([127, 0, 0, 1], port)),
                 relays: None,
+                transport: Transport::Udp,
             })
             .collect();
         assert!(RoomRuntime::locate(&client, CODE, &dead).await.is_none());

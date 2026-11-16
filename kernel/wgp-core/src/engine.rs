@@ -71,6 +71,8 @@ impl Clone for Engine {
             #[cfg(feature = "client")]
             storage: self.storage.clone(),
             #[cfg(feature = "client")]
+            storage_transport: self.storage_transport.clone(),
+            #[cfg(feature = "client")]
             links: self.links.clone(),
             #[cfg(feature = "client")]
             refill_started: self.refill_started.clone(),
@@ -136,6 +138,9 @@ pub struct NodeConfig {
     pub advertise_epoch: u64,
     /// 入网引导端点：其他种子的 DHT 地址（已解析）。空 = 独立运行，等别人来找
     pub peers: Vec<std::net::SocketAddr>,
+    /// 身份证明兼容策略（17 §11.6）：true = 允许回退到旧 PING/PONG 学习（迁移期）。
+    /// 默认 false（严格：旧协议只用于存活诊断，绝不写路由表/地址簿）。
+    pub allow_legacy_identity: bool,
 }
 
 /// 打洞输入：已协商完成的会话上下文（承诺-揭示产物 + 对端观察报告）。
@@ -171,6 +176,9 @@ pub struct Engine {
     dht: Arc<tokio::sync::Mutex<Option<Arc<DhtNode>>>>,
     #[cfg(feature = "client")]
     storage: Arc<tokio::sync::Mutex<Option<SocketAddr>>>,
+    /// 访问存储节点的承载（UDP / TCP 兜底）
+    #[cfg(feature = "client")]
+    storage_transport: Arc<tokio::sync::Mutex<wgp_dht::Transport>>,
     /// 活跃链路保活停止开关（release 时拉闸；14 §10 条款 4）
     #[cfg(feature = "client")]
     links: Arc<tokio::sync::Mutex<HashMap<PeerId, watch::Sender<bool>>>>,
@@ -223,6 +231,8 @@ impl Engine {
                 #[cfg(feature = "client")]
                 storage: Arc::new(tokio::sync::Mutex::new(None)),
                 #[cfg(feature = "client")]
+                storage_transport: Arc::new(tokio::sync::Mutex::new(wgp_dht::Transport::Udp)),
+                #[cfg(feature = "client")]
                 links: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
                 #[cfg(feature = "client")]
                 refill_started: Arc::new(AtomicBool::new(false)),
@@ -237,11 +247,25 @@ impl Engine {
         self.tx.subscribe()
     }
 
-    /// 注入信令上下文（客户端启动时调用：本进程 DHT 节点 + 已知存储节点）
+    /// 注入信令上下文（客户端启动时调用：本进程 DHT 节点 + 已知存储节点）。
+    /// 默认按 UDP 访问存储节点；UDP 被封时用 [`Self::attach_dht_with_transport`]。
     #[cfg(feature = "client")]
     pub async fn attach_dht(&self, node: Arc<DhtNode>, storage: SocketAddr) {
+        self.attach_dht_with_transport(node, storage, wgp_dht::Transport::Udp)
+            .await;
+    }
+
+    /// 同上，但显式指定存储节点的承载（`storage` 必须是该承载的端点：TCP 模式下是 TCP 信令端口）
+    #[cfg(feature = "client")]
+    pub async fn attach_dht_with_transport(
+        &self,
+        node: Arc<DhtNode>,
+        storage: SocketAddr,
+        transport: wgp_dht::Transport,
+    ) {
         *self.dht.lock().await = Some(node);
         *self.storage.lock().await = Some(storage);
+        *self.storage_transport.lock().await = transport;
     }
 
     /// 客户端路径：接收已协商完成的打洞输入，执行竞速（UDP 三波 ∥ TCP），
@@ -422,7 +446,8 @@ impl Engine {
             }
         };
 
-        let rt = RoomRuntime::new(node.clone(), storage);
+        let transport = *self.storage_transport.lock().await;
+        let rt = RoomRuntime::with_transport(node.clone(), storage, transport);
         let my_id = node.node_id();
 
         // ① 入表判定（建房/已在表/需报道）
@@ -471,7 +496,7 @@ impl Engine {
         // ② spawn upkeep（三合一循环；cancel 经 RoomHandle::cancel 停止）
         let (stop_tx, stop_rx) = watch::channel(false);
         let upkeep_code = code_str.clone();
-        let upkeep_rt = RoomRuntime::new(node.clone(), storage);
+        let upkeep_rt = RoomRuntime::with_transport(node.clone(), storage, transport);
         tokio::spawn(async move {
             upkeep_rt
                 .upkeep(upkeep_code, ROOM_UPKEEP_INTERVAL_MS, stop_rx, engine_now_ms)
@@ -503,6 +528,12 @@ impl Engine {
                     if cfg.hobby {
                         n.set_relay_policy(wgp_dht::RelayPolicy::Deny).await;
                     }
+                    // 身份证明策略：默认严格（17 §11.6）
+                    n.set_identity_policy(if cfg.allow_legacy_identity {
+                        wgp_dht::IdentityPolicy::LegacyAllowed
+                    } else {
+                        wgp_dht::IdentityPolicy::Strict
+                    });
                     Some(n)
                 }
                 Err(e) => {
@@ -552,11 +583,12 @@ impl Engine {
                         .map_or(0, |a| a.port()),
                     tcp_port: tcp.map_or(0, |a| a.port()),
                     priority: 0,
-                    // 贡献模式不中转：如实写进广告，客户端据此避开「报道永远送不到」的存储节点
+                    // 贡献模式不中转：如实写进广告，客户端据此避开「报道永远送不到」的存储节点。
+                    // FLAG_AUTH_V1 恒定置位：本版本支持挑战响应身份证明，对端可据此决定是否值得试。
                     flags: if cfg.hobby {
-                        0
+                        seed_advertise_v2::FLAG_AUTH_V1
                     } else {
-                        seed_advertise_v2::FLAG_RELAY
+                        seed_advertise_v2::FLAG_RELAY | seed_advertise_v2::FLAG_AUTH_V1
                     },
                     name_hash: [0u8; 4],
                 };
@@ -855,6 +887,7 @@ mod tests {
                 advertise: Some(Ipv4Addr::LOCALHOST),
                 advertise_epoch: 1,
                 peers,
+                allow_legacy_identity: false,
             }
         }
 
@@ -926,6 +959,7 @@ mod tests {
                 advertise: Some(Ipv4Addr::LOCALHOST),
                 advertise_epoch: 1,
                 peers,
+                allow_legacy_identity: false,
             }
         }
 

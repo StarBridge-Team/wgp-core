@@ -1,0 +1,20 @@
+[package]
+name = "wgp-ipc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "折跃门本机控制面 IPC（IPC v1）：版本化帧 + 显式二进制编解码 + UDS/命名管道传输与 ACL"
+
+# 只依赖 tokio：本 crate 是「本机控制面」的传输与协议层，不碰 DHT/隧道/密码学。
+# Windows 侧的受限安全描述符必须用 windows-sys 构造（tokio 已依赖同一大版本，不额外引入新树）。
+[dependencies]
+tokio = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }

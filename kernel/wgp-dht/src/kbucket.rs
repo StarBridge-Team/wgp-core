@@ -66,9 +66,24 @@ impl RoutingTable {
         self.buckets[idx].nodes.retain(|n| n != id);
     }
 
+    /// 当前路由表快照（按 NodeId 排序，供有界后台维护使用）。
+    pub fn all_nodes(&self) -> Vec<NodeId> {
+        let mut nodes: Vec<NodeId> = self
+            .buckets
+            .iter()
+            .flat_map(|b| b.nodes.iter().copied())
+            .collect();
+        nodes.sort_unstable();
+        nodes
+    }
+
     /// 与目标最近的 K 个已知节点（实现阶段：全表排序截断）
     pub fn closest_to(&self, target: &NodeId) -> Vec<NodeId> {
-        let mut all: Vec<NodeId> = self.buckets.iter().flat_map(|b| b.nodes.iter().copied()).collect();
+        let mut all: Vec<NodeId> = self
+            .buckets
+            .iter()
+            .flat_map(|b| b.nodes.iter().copied())
+            .collect();
         all.sort_by_key(|n| {
             let d = n.xor_distance(target);
             let mut k = [0u8; 32];

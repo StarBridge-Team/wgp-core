@@ -529,6 +529,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
 
 [[package]]
+name = "wgp-agent"
+version = "0.1.0"
+dependencies = [
+ "rand_core",
+ "tokio",
+ "wgp-core",
+ "wgp-dht",
+ "wgp-ipc",
+ "wgp-port",
+ "wgp-proto",
+]
+
+[[package]]
 name = "wgp-client"
 version = "0.1.0"
 dependencies = [
@@ -578,6 +591,14 @@ dependencies = [
  "tokio",
  "wgp-crypto",
  "wgp-proto",
+]
+
+[[package]]
+name = "wgp-ipc"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

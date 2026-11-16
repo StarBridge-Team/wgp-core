@@ -21,3 +21,7 @@ wgp-client.key
 # ET bridge PoC: its own target dir and downloaded build tools (protoc)
 /bridge/wgp-et-bridge/target/
 /bridge/wgp-et-bridge/.tools/
+
+# 本机工具产物（沙箱 ACL 诊断报告、编辑器规则），与代码无关
+/.acl-report/
+/.cursor/

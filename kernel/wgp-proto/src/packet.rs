@@ -237,6 +237,10 @@ pub mod seed_advertise_v2 {
     /// 「这个种子能不能帮忙投递报道与协商消息」。其余位保留：发送置 0，接收忽略。
     pub const FLAG_RELAY: u8 = 0x01;
 
+    /// flags bit1：支持挑战响应身份证明（17 §11）。老版本不置位；新版本恒置位。
+    /// 客户端据此在探活之前就知道「这个种子能不能被采信」，也能区分「老版本」与「不可达」。
+    pub const FLAG_AUTH_V1: u8 = 0x02;
+
     /// 编码整包（含 `adv.signature`；尚未签名时该字段可为全 0，见 [`signing_message`]）
     pub fn encode(adv: &SeedAdvertiseV2, out: &mut [u8; LEN]) {
         out[0..2].copy_from_slice(&super::SIG_MAGIC);

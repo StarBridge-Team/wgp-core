@@ -16,7 +16,11 @@
 
 use wgp_node::server;
 
-#[tokio::main]
-async fn main() {
-    server::run("wgp-node", false).await;
+fn main() {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(server::runtime_worker_threads())
+        .enable_all()
+        .build()
+        .expect("failed to build Tokio runtime")
+        .block_on(server::run("wgp-node", false));
 }
