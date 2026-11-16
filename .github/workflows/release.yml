@@ -84,17 +84,36 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "name=wgp-$version-${{ matrix.target }}" >> "$GITHUB_OUTPUT"
 
-      # Linux 一律 musl 静态链接（不依赖发行版的 glibc 版本），用工具链自带的 rust-lld 交叉链接，
-      # 不需要各架构的 gcc 交叉工具链。回显工具只用于下面的端到端验证，不进包。
+      # Linux 一律 musl 静态链接（不依赖发行版的 glibc 版本），用 Zig 作为交叉链接器（cargo-zigbuild）：
+      # 它自带 musl/compiler-rt，不需要各架构的 gcc 工具链，也不再依赖 rust-lld 自行拼 CRT。
+      # 回显工具只用于下面的端到端验证，不进包。
+      - name: Zig linker toolchain (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          # cargo-zigbuild 与 ziglang 都在 PyPI；ziglang 的入口脚本叫 python-zig，这里补一个 zig 包装。
+          # 用 venv 是为了避开 PEP 668（24.04 起系统 Python 不允许直接把包装进 site-packages）。
+          python3 -m venv "$HOME/zigvenv"
+          "$HOME/zigvenv/bin/pip" install --quiet --upgrade pip
+          "$HOME/zigvenv/bin/pip" install --quiet ziglang cargo-zigbuild
+          mkdir -p "$HOME/.local/bin"
+          printf '#!/usr/bin/env bash\nexec "%s/zigvenv/bin/python" -m ziglang "$@"\n' "$HOME" > "$HOME/.local/bin/zig"
+          chmod +x "$HOME/.local/bin/zig"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.local/bin" >> "$PATH"
+          zig version
+          cargo zigbuild --help > /dev/null
+
       - name: Build
         shell: bash
         run: |
           if [ "$RUNNER_OS" = Linux ]; then
-            linker_var="CARGO_TARGET_$(echo '${{ matrix.target }}' | tr 'a-z-' 'A-Z_')_LINKER"
-            export "$linker_var=rust-lld"
+            cargo zigbuild --release --locked --bins --target ${{ matrix.target }}
+            cargo zigbuild --release --locked --target ${{ matrix.target }} -p wgp-port --example echo_tool
+          else
+            cargo build --release --locked --bins --target ${{ matrix.target }}
+            cargo build --release --locked --target ${{ matrix.target }} -p wgp-port --example echo_tool
           fi
-          cargo build --release --locked --bins --target ${{ matrix.target }}
-          cargo build --release --locked --target ${{ matrix.target }} -p wgp-port --example echo_tool
 
       - name: QEMU user-mode emulation
         if: matrix.verify == 'qemu'

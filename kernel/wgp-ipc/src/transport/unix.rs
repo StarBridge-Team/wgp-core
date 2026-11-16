@@ -26,6 +26,22 @@ pub struct Listener {
     our_uid: u32,
 }
 
+/// 退出时删掉 socket 文件。
+///
+/// 不删的后果很具体：固定路径的 agent 退出后留下一个「连不上的 socket 文件」，
+/// 下次启动虽然会被 `bind` 里的「连不上就当作残留」逻辑清掉，但任何按「文件是否存在」
+/// 判断 agent 是否在跑的脚本/服务单元都会误判（本轮就是被冒烟脚本抓到的）。
+///
+/// 边界：如果旧监听被丢弃时同一个路径上已经有新监听（只可能发生在「旧进程的 socket 已被
+/// 别人 unlink 并重建」这种极端情况），这里会把新文件也删掉——那种情况下旧进程早就不再服务，
+/// 而新进程的 accept 会失败并自行退出，不会静默变成孤儿。
+impl Drop for Listener {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+
 /// 默认路径：`$XDG_RUNTIME_DIR/wgp/agent.sock`，退化到 `$HOME/.wgp/agent.sock`
 pub fn default_path() -> io::Result<PathBuf> {
     if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {

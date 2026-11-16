@@ -41,7 +41,9 @@ bridge/
   wgp-et-bridge       ET 桥接 PoC（独立 workspace：依赖 mesh-tun-proto 与 protoc，见其 README）
 server/wgp-node       服务端：种子 / 观察者 / TCP 信令兜底（双形态 wgp-node + wgp-node-hobby）
 client/wgp-client     客户端：code / 开房 / join + 端口转发
-scripts/              端到端验证（e2e-local.ps1 / .sh）与本机打包（package.ps1）
+client/wgp-agent      客户端 agent（多进程阶段 1）：持有身份/socket/Engine/PortHub，经本机 IPC 接受控制
+kernel/wgp-ipc        本机控制面 IPC：版本化帧 + 显式编解码 + UDS/命名管道（ACL）+ 有界队列
+scripts/              端到端验证（e2e-local.ps1 / .sh）、agent IPC 冒烟（agent-smoke.*）与本机打包（package.ps1）
 .github/workflows/    持续集成（ci.yml）与多平台预览版发版（release.yml）
 项目完整文档/          设计文档（00–17 编号）+ 按代码现状撰写的全量文档（20 号为 2026-11 的变更追补与多进程方案）
 nat/                  NAT 实测数据
@@ -50,8 +52,8 @@ nat/                  NAT 实测数据
 ## 构建与测试
 
 ```bash
-cargo test --workspace        # Windows 297 个 / Linux 296 个测试，全部跑在回环上
-cargo build --release         # LTO release，产出 wgp-node / wgp-node-hobby / wgp-client
+cargo test --workspace        # Windows 363 个测试，全部跑在回环上（含 wgp-ipc / wgp-agent）
+cargo build --release         # LTO release，产出 wgp-node / wgp-node-hobby / wgp-client / wgp-agent
 ```
 
 用真实二进制在回环上走一遍完整流程（种子 → 开房 → 加入 → 打洞 → 隧道 → TCP/UDP 转发 → 崩溃重连）：
@@ -60,6 +62,7 @@ cargo build --release         # LTO release，产出 wgp-node / wgp-node-hobby /
 # Windows
 powershell -ExecutionPolicy Bypass -File scripts\e2e-local.ps1             # 单种子
 powershell -ExecutionPolicy Bypass -File scripts\e2e-local.ps1 -Discovery  # 双种子发现
+powershell -ExecutionPolicy Bypass -File scripts\agent-smoke.ps1          # agent IPC（真实命名管道）
 ```
 
 ```bash

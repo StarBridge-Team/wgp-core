@@ -5,6 +5,8 @@
 rustflags = ["-C", "target-feature=+crt-static"]
 
 # Linux 的 musl 目标：同样静态链接。多数 musl 目标默认就是静态的，但龙架构（loongarch64）默认动态链接，
-# 不指定的话产物会依赖目标机器上的 musl 运行库（发版流程里用 rust-lld 交叉链接时还会直接找不到库）。
+# 不指定的话产物会依赖目标机器上的 musl 运行库。
+# 交叉链接由 Zig 完成（cargo-zigbuild，见 .github/workflows/release.yml）：它自带 musl 与 compiler-rt，
+# 不需要各架构的 gcc 工具链；本机交叉构建同一条命令：`cargo zigbuild --release --target <target>`。
 [target.'cfg(target_env = "musl")']
 rustflags = ["-C", "target-feature=+crt-static"]
