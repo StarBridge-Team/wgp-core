@@ -10,7 +10,7 @@
 | `kernel/`（wgp-proto、crypto、punch、dht、core） | 从 Downloads 原样拷贝 |
 | `server/`（wgp-node 源码 + deploy 11 件） | 原样拷贝 |
 | `client/`（wgp-client） | 原样拷贝 |
-| `docs/`（12 篇设计文档） | 原样拷贝 |
+| `docs/`（设计文档，现已并入 项目完整文档/） | 原样拷贝 |
 | `项目完整文档/`（15 篇） | 原样拷贝 |
 | `release-prebuilt/`（3 个预编译 exe） | 原样拷贝，作对照 |
 | **根 `Cargo.toml`** | **原本缺失 → 按 `项目完整文档/01-工作区与构建.md` §2/§4 重建** |

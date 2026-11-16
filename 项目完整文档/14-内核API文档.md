@@ -272,6 +272,18 @@ impl Engine {
 | `RoomRuntime::upkeep` | 读不到房间记录就跳过本轮；成员平时只读记录，不向存储节点登记地址 | 记录不存在时，锚点凭上一次读到的记录原样恢复（成员表保留，epoch 不变）；全员每 3 轮（约 6 秒）向存储节点 PING 一次 | 存储节点的房间记录与地址簿都只在内存里：它重启后房间「不存在」，经它中转给老成员的消息被丢弃 |
 | 房间存储节点 | 外围取「测速最快的 UDP 种子」 | `RoomRuntime::locate(node, code, candidates)`：已有该房间记录的优先；否则可达候选按中转能力分档（明确可中转 > 不知道 > 明确不中转），同档取离房间键最近者。仍是单存储点 | 两端必须选中同一个才能相遇 |
 
-**已验证边界（诚实声明）**：截至 2026-11-15，全部测试（Windows 297 个、Linux 296 个）与端到端脚本都跑在回环上（Windows、WSL2 里的 Linux、一台云端虚拟机上的原生 Linux）；跨平台性由"零平台依赖代码 + tokio 抽象"保证，Linux 侧以 [部署清单](../server/deploy/DEPLOY.md) 第 0 步"编译测试先行"为验证门。
+### 12.2 追加登记（2026-11-16：身份证明 / TCP 兜底 / 路由维护 / 多进程）
+
+| 条款 | 此前 | 实现定版 | 原因 |
+|------|------|---------|------|
+| 身份学习闸门 | PING/PONG/STORE 里「`node_id == SHA256(pk)`」即入路由表与地址簿 | `DhtNode` 只在 `accept_proof` 通过（签名 + 一次性 nonce + 来源地址 + 期限）后调 `learn_verified`；PING/PONG/STORE 不再写表。新增 `auth` 模块（`bound_identity` / `sign_proof` / `verify_proof` / `make_challenge` / `fresh_nonce`）与 RPC `AUTH_CHALLENGE(0x3B)` / `AUTH_PROOF(0x3C)` / `AUTH_REJECT(0x3D)`（17 §11） | 绑定校验只证明「公钥与 node_id 自洽」，录下旧报文换地址重放即可把已知节点指向攻击者 |
+| `RpcError` | `Timeout / NoRoute / PayloadTooLarge` | 新增 `Unverified`（对端不支持身份证明）/ `UnsupportedVersion` / `Busy`（本地待应答挑战满）；`explain()` 给用户可读文案 | 严格模式下必须把「旧版本」与「不可达」分开报，否则排障只能猜 |
+| `PingBody` / `PONG` 语义 | 双向学习原语 | `PING` 只为存活与兼容而应答；`PONG` 只在 `IdentityPolicy::LegacyAllowed` 的等待项上学习。`DhtNode::set_identity_policy / identity_policy / legacy_fallback_count / rejected_proof_count` | 安全降级必须是运营者的显式决定 |
+| 信令承载 | 房间 RPC 只有 UDP | `Transport::{Udp,Tcp}`；`DhtNode::set_signaling_transport` 让 `ping/find_node/store/find_value/forward_to/find_seeds` 统一分派到 TCP 版本（复用同一 RPC 与 u16 长度前缀）；`RoomRuntime::with_transport` + `StorageCandidate.transport`；`ping_tcp` 也改成挑战响应，新增 `ping_tcp_legacy` | UDP 被封时 bootstrap / 选点 / `fetch`·`store`·`renew` 仍可用。TCP 不能完成「报道→锚点」这一跳（Forward 要地址簿里的 UDP 目标），已在 12 §6.5 记录 |
+| 广告能力位 | `flags` bit0 = 可中转 | 新增 `FLAG_AUTH_V1 = 0x02`；`SeedInfo::supports_auth()`；`NodeConfig::allow_legacy_identity`；`wgp-node --allow-legacy-identity`（配置键 / `WGP_ALLOW_LEGACY_IDENTITY`），客户端同名校验参数 | 让客户端在探活之前就能判断种子是否会讲身份证明，并给出可操作的提示 |
+| 路由维护 | 无主动淘汰；每拍只探种子 | `probe_window`（纯函数）+ `probe_routing_batch(&skip)`：每拍至多 8 个普通路由节点、连续 3 次失败释放桶位；本拍已被种子探活覆盖的身份跳过；探活成功刷新地址簿最后见时刻 | 死路由占桶位不下线；同一批公网节点既是种子又在路由表里，重复握手纯属浪费 |
+| 多进程（阶段 1） | 单进程 `wgp-client` | 新增 `wgp-ipc`（本机 UDS / Windows 命名管道、长度前缀帧、ACL、有界队列）与 `wgp-agent`（持有 DHT 身份、socket、Engine、PortHub；IPC 命令 `GetVersion/GetCapabilities/GetSnapshot/StartRoom/JoinRoom/LeaveRoom/WatchEvents/ShutdownAgent`）。GUI 仍是后续工作 | UI 崩溃不该带走网络；私钥与 socket 只能有一个所有者 |
+
+**已验证边界（诚实声明）**：截至 2026-11-16，全部自动化测试与端到端脚本仍跑在回环上（Windows、WSL2 里的 Linux）；TCP 兜底、身份证明、路由维护都有回环测试，但**没有任何一次真实 NAT 下的双端联调**。跨平台性由「零平台依赖代码 + tokio 抽象」保证，Linux 侧以 [部署清单](../server/deploy/DEPLOY.md) 第 0 步「编译测试先行」为验证门。
 
 *文档结束*

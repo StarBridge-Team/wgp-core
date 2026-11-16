@@ -11,10 +11,15 @@
 | 文件 | 用途 |
 |---|---|
 | `wgp-client` | 客户端：开房 / 加入 / 端口转发 |
+| `wgp-agent` | 客户端 agent（多进程阶段 1）：持有身份与 socket，经**仅本机** IPC 接受控制 |
 | `wgp-node` | 种子节点（公网固定地址；允许信令中转） |
 | `wgp-node-hobby` | 贡献节点（家庭宽带；拒绝信令中转） |
 
-Windows 包里这三个文件带 `.exe` 后缀；Linux 包是 musl 静态链接，解压即用。
+Windows 包里这四个文件带 `.exe` 后缀；Linux 包是 musl 静态链接，解压即用。
+
+`wgp-agent` 目前还没有 GUI 前端，用 `wgp-agent ping` 自检、`wgp-agent --help` 看用法；
+它的 IPC 端点只在本机（Unix socket 0600 / Windows 命名管道仅属主），详见
+[`client/wgp-agent/README.md`](https://github.com/StarBridge-Team/wgp-core/blob/main/client/wgp-agent/README.md)。
 
 ## 三步联机（以 Minecraft Java 版 25565 为例）
 
@@ -68,9 +73,12 @@ wgp-client join --name 我的房间 --key 一个口令 -p udp://<种子地址>:1
 
 - **种子里至少要有一个 `wgp-node`（完整版）**。只有 `wgp-node-hobby` 时，第二个成员无法入表：
   报道与密钥协商都要经种子中转信令，而贡献节点拒绝一切中转。贡献节点和完整版种子搭配使用没有问题。
-- 本版与更早的构建不能混用（加入房间的报文格式改过）。
-- UDP 被完全封锁的网络暂时连不上（房间信令目前只走 UDP）。
-- 身份文件（客户端 `wgp-client.key`、节点 `node_identity.key`）生成在启动目录，删掉就是换了一个新身份。
+- 本版与更早的构建不能混用：加入房间的报文格式改过，探活也改成了签名的挑战响应。旧节点不会被采信
+  （严格模式），需要临时兼容时给两端都加 `--allow-legacy-identity`。
+- UDP 被封锁时：用 `-p tcp://<种子>:3481` 可以让**入表、选点与房间读写**走 TCP 信令；但打洞与业务数据
+  仍然需要 UDP，两端之间 UDP 完全不通时隧道建不起来（命令会给出明确提示）。
+- 身份文件（客户端 `wgp-client.key`、agent `wgp-agent.key`、节点 `node_identity.key`）生成在启动目录，
+  删掉就是换了一个新身份。
 
 ## 许可证
 

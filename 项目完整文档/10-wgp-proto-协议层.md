@@ -2,7 +2,7 @@
 
 > - 源目录：`H:\mclink core\kernel\wgp-proto\src\`（共 9 个文件，2099 行）
 > - 生成日期：2026-11-05
-> - 对应设计文档：docs/00（总纲与 crate 纪律）、docs/08（包格式）、docs/07（观察者协议 / DHT 网络层 / 房间与锚点）、docs/13（房间码）；代码内注释另引用 docs/03（打洞）、docs/14（协议版本化）、docs/15（全链路流程）
+> - 对应设计文档：00-架构总览（总纲与 crate 纪律）、07-信令面与观察者协议（观察者协议 / DHT 网络层 / 房间与锚点）、13-房间码派生协议；代码内注释另引用 03-核心打洞与穿透算法、14-内核API文档（协议版本化）、15-全链路流程
 > - 本文档所有签名、常量、测试向量均逐字照抄源码，未做任何虚构；注释与代码不一致处以代码为准并标注"代码如此，意图待确认"。
 
 ---
@@ -537,6 +537,49 @@ impl StoreBody {
 
 ⚠️ `ForwardBody` 源码注释的字段描述为"len(2B) + 投递目标 NodeId(32B) + 透明载荷"，但 `encode` 实际写入顺序是 `target(32) ‖ len(2) ‖ payload`——**以代码为准，注释顺序描述有误（代码如此）**。
 
+#### 探活身份证明报文（17 §11，2026-11-16 新增）
+
+三个新类型号，落在既有 7B RPC 头之后。老节点不认识这组类型号 → `RpcHeader::decode` 返回 `None` → 静默丢弃，因此不需要改任何既有报文布局。
+
+| 类型 | kind | 体长 | 字节布局 |
+|---|---|---|---|
+| `AuthChallengeBody` | `0x3B` | 81B | `verifier_id(32) ‖ verifier_pubkey(32) ‖ nonce(16) ‖ version(1)` |
+| `AuthProofBody` | `0x3C` | 161B | `prover_id(32) ‖ prover_pubkey(32) ‖ nonce_echo(16) ‖ prover_nonce(16) ‖ version(1) ‖ signature(64)` |
+| `AuthRejectBody` | `0x3D` | 2B | `reason(1) ‖ supported_version(1)` |
+
+```rust
+pub mod auth_reject_reason {
+    pub const UNSUPPORTED_VERSION: u8 = 1;
+    pub const MALFORMED: u8 = 2;
+    pub const RATE_LIMITED: u8 = 3;
+}
+pub const AUTH_SIGNING_MESSAGE_LEN: usize = AUTH_DOMAIN.len() + 1 + 32 + 32 + 16 + 16 + 4; // 117
+
+/// 待签 / 待验消息（两个方向同一套，txid 取自 RPC 头部）
+pub fn auth_signing_message(
+    version: u8, prover_id: &[u8; 32], verifier_id: &[u8; 32],
+    nonce_echo: &[u8; 16], prover_nonce: &[u8; 16], txid: u32,
+) -> [u8; AUTH_SIGNING_MESSAGE_LEN] {
+    // "wgp/dht-auth/v1" ‖ version ‖ prover_id ‖ verifier_id ‖ nonce_echo ‖ prover_nonce ‖ txid(BE)
+}
+impl AuthProofBody {
+    pub fn signing_message(&self, verifier_id: &[u8;32], txid: u32) -> [u8; AUTH_SIGNING_MESSAGE_LEN];
+}
+impl RpcPacket {
+    pub fn auth_challenge(txid: u32, body: AuthChallengeBody) -> Self;
+    pub fn auth_proof(txid: u32, body: AuthProofBody) -> Self;
+    pub fn auth_reject(txid: u32, body: AuthRejectBody) -> Self;
+}
+```
+
+关键约定：
+- `version` 在**签名覆盖范围**内（防降级复用），`nonce`/`nonce_echo`/`prover_nonce` 一律 16B 定长；
+- `prover_pubkey` 不进待签消息，但被 `prover_id == SHA256(pubkey)` 间接绑定——换公钥必须先换 node_id，而 node_id 被签；
+- 三个体的 `decode` 都要求长度精确匹配（多一字节也拒绝），与既有 `StoreBody` 的代际隔离策略一致；
+- 测试：`auth_challenge_roundtrip_and_layout` / `auth_proof_roundtrip_and_layout` / `auth_reject_roundtrip_and_layout` /
+  `auth_types_do_not_collide_with_existing_rpc` / `auth_signing_message_covers_every_field` /
+  `auth_proof_old_header_length_is_not_accepted`（偏移锁定、逐字段签名覆盖、旧帧拒绝）。
+
 #### 统一信封
 
 ```rust
@@ -552,6 +595,8 @@ pub enum RpcBody {
     Forward(ForwardBody), Store(StoreBody),
     StoredAck,
     FindValue(FindValueBody), Value(ValueBody),
+    FindSeeds(FindSeedsBody), Seeds(SeedsBody),
+    AuthChallenge(AuthChallengeBody), AuthProof(AuthProofBody), AuthReject(AuthRejectBody),
 }
 
 pub struct RpcPacket { pub header: RpcHeader, pub body: RpcBody }
@@ -580,7 +625,7 @@ RPC 头字节布局（7B）：
       └─────────┴─────────┴──────────────────┘
 ```
 
-- `RpcHeader::decode` 的 kind 白名单 = `rpc_type` 全部 9 个值（0x30-0x38），其余拒绝。
+- `RpcHeader::decode` 的 kind 白名单 = `rpc_type` 全部值（0x30-0x3A 既有 + 0x3B-0x3D 身份证明），其余拒绝。
 - `RpcPacket::decode` 先解头，剩余字节按 kind 分发到对应 body 的 decode；任一失败整体 `None`。
 - FORWARD 的设计语义（源码注释）："致某 NodeId 的投递（承诺-揭示/打洞参数/协调消息；**不可信转发语义**）"——中间节点只按 target 转发，不解析载荷。
 
@@ -1010,13 +1055,13 @@ pub use room_code::derive_room_code;
 
 | 设计文档 | 代码内引用的章节 | 在本 crate 的落地 |
 |---|---|---|
-| docs/00 总纲 | §1 H 约束、§3 纪律、§5、§11 版本化纪律 | `consts.rs` 全部常量（H6 打洞预算 47/500）；lib.rs 模块划分与"无 IO/async/零依赖/禁 serde"纪律（sig.rs、packet.rs 注释明示）；`PROTO_VERSION` |
-| docs/08 包格式 | —（包格式权威） | `sig.rs`（信令包 8B 头 + 4 体）、`packet.rs`（探针 31B/心跳 19/23B/种子广告 91B）、`dht.rs`（RPC 7B 头 + 9 体）、`stun.rs`（STUN 20B 头 + TLV 属性） |
-| docs/07 观察者协议/网络层/房间 | §3（STUN 扩展，客户端/服务端同源两级能力）、§4（房间/锚点、K=1 简化 KV、报道路由）、§5（种子发现） | `stun.rs` 的 `wgp_attr`（WGP_PEER/LINK/PUNCH，0x80F0-0x80F2）、`BindingProbe`；`consts.rs` 的 `LEASE_INTERVAL_S`/`LEASE_TIMEOUT_S`/`ROOM_KEY_DOMAIN`；`dht.rs` 的 STORE/FORWARD/ValueBody（空值=未命中）；`endpoint.rs` 种子端点第 1 层 |
-| docs/13 房间码 | §2 算法规范、§6 安全边界 | `room_code.rs` 全部（`derive_room_code` + 自实现 `md5` + 消歧补丁；"MD5 仅标识符派生、房间密钥不参与密钥材料派生"注释） |
-| docs/03 打洞 | §3.2.3（魔数思路）、§3.5（三波探测）、§3.5.5（探针包）、§3.7.4（心跳） | `packet.rs` 的 `probe`/`heartbeat`；`consts.rs` 的 `WAVE1/2/3_PACKETS`、`WAVE_TIMEOUT_MS`、`PROBE_BUDGET_*`；`sig::SIG_MAGIC` 注释"与 03 §3.2.3 思路一致" |
-| docs/14 协议版本化 | §11 | `consts.rs` 的 `PROTO_VERSION`；`sig.rs` 头部 version 字段（lib/sig 注释明示 14 §11） |
-| docs/15 全链路流程 | Phase 0、4；各超时数字化 | `consts.rs` 超时组（COMMIT/QUIC/DEGRADED/OLD_LINK_GRACE）；`stun.rs` 的 `BindingProbe` 注释（步长学习/NAT 判定/出站预判/观察者报告） |
+| 00-架构总览 | §1 H 约束、§3 纪律、§5、§11 版本化纪律 | `consts.rs` 全部常量（H6 打洞预算 47/500）；lib.rs 模块划分与"无 IO/async/零依赖/禁 serde"纪律（sig.rs、packet.rs 注释明示）；`PROTO_VERSION` |
+| 包格式 | —（包格式权威） | `sig.rs`（信令包 8B 头 + 4 体）、`packet.rs`（探针 31B/心跳 19/23B/种子广告 91B）、`dht.rs`（RPC 7B 头 + 9 体）、`stun.rs`（STUN 20B 头 + TLV 属性） |
+| 07-信令面与观察者协议 | §3（STUN 扩展，客户端/服务端同源两级能力）、§4（房间/锚点、K=1 简化 KV、报道路由）、§5（种子发现） | `stun.rs` 的 `wgp_attr`（WGP_PEER/LINK/PUNCH，0x80F0-0x80F2）、`BindingProbe`；`consts.rs` 的 `LEASE_INTERVAL_S`/`LEASE_TIMEOUT_S`/`ROOM_KEY_DOMAIN`；`dht.rs` 的 STORE/FORWARD/ValueBody（空值=未命中）；`endpoint.rs` 种子端点第 1 层 |
+| 13-房间码派生协议 | §2 算法规范、§6 安全边界 | `room_code.rs` 全部（`derive_room_code` + 自实现 `md5` + 消歧补丁；"MD5 仅标识符派生、房间密钥不参与密钥材料派生"注释） |
+| 03-核心打洞与穿透算法 | §3.2.3（魔数思路）、§3.5（三波探测）、§3.5.5（探针包）、§3.7.4（心跳） | `packet.rs` 的 `probe`/`heartbeat`；`consts.rs` 的 `WAVE1/2/3_PACKETS`、`WAVE_TIMEOUT_MS`、`PROBE_BUDGET_*`；`sig::SIG_MAGIC` 注释"与 03 §3.2.3 思路一致" |
+| 14-内核API文档 | §11 | `consts.rs` 的 `PROTO_VERSION`；`sig.rs` 头部 version 字段（lib/sig 注释明示 14 §11） |
+| 15-全链路流程 | Phase 0、4；各超时数字化 | `consts.rs` 超时组（COMMIT/QUIC/DEGRADED/OLD_LINK_GRACE）；`stun.rs` 的 `BindingProbe` 注释（步长学习/NAT 判定/出站预判/观察者报告） |
 
 ---
 

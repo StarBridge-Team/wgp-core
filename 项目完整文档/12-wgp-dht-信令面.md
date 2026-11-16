@@ -2,7 +2,7 @@
 
 > **源目录**：`kernel/wgp-dht/`（9 个源文件：lib.rs / id.rs / kbucket.rs / node.rs / observe.rs / room.rs / runtime.rs / advertise.rs / net_test.rs）
 > **生成日期**：2026-11-05
-> **对应设计文档**：`docs/07-信令面与观察者协议.md`
+> **对应设计文档**：`07-信令面与观察者协议.md`
 > **crate 描述**（Cargo.toml）：折跃门去中心化信令面：Kademlia 变种、房间键、租约/继位链、观察者协议
 
 ---
@@ -932,16 +932,22 @@ dev-dependencies 使用：`wgp_crypto::commit::commit`、`wgp_crypto::ka::{X2551
 
 ## 4. 对外 API 汇总（lib.rs `pub use` 全量清单）
 
+> 2026-11-16 变更见 §7：新增 `auth` 模块与 `IdentityPolicy` / `Transport` / `StorageCandidate.transport`。
+
 ```rust
-pub use advertise::{sign_advertise, verify_advertise};
+pub use advertise::{
+    sign_advertise, sign_advertise_v2, verify_advertise, verify_advertise_v2, AdvertiseSpec,
+};
+pub use auth::{bound_identity, verify_proof};
+pub use directory::{SeedDirectory, SeedInfo, SEED_DIR_MAX};
 pub use id::{NodeId, NodeIdentity};
 pub use kbucket::RoutingTable;
-pub use node::{DhtNode, PongInfo, RelayPolicy, RpcError};
+pub use node::{DhtNode, IdentityPolicy, PongInfo, RelayPolicy, RpcError, Transport};
 pub use observe::{
     try_answer_stun, ObserverPolicy, ObserverServer, OBSERVER_RATE_LIMIT, OBSERVER_RATE_WINDOW,
 };
-pub use room::{room_key, sign_room, succession_line, verify_room, Lease, RoomRecord};
-pub use runtime::{RoomError, RoomRuntime};
+pub use room::{room_key, sign_room, succession_line, verify_room, Lease, LeaseWatch, RoomRecord};
+pub use runtime::{RoomError, RoomRuntime, StorageCandidate, StoragePick};
 ```
 
 共 **20 个** crate 根再导出项。
@@ -984,7 +990,57 @@ pub use runtime::{RoomError, RoomRuntime};
 
 ---
 
-## 6. 已知限制或未实现项
+## 6. 2026-11-16 变更追补（身份证明 / TCP 兜底 / 路由维护）
+
+> 本节记录 §3.4 / §3.7 之后的实际改动；与上文冲突时以本节和代码为准。
+
+### 6.1 学习语义（取代 §3.4 文件头那段注释）
+
+```rust
+//! 学习语义：**只有验过身份证明的路径能写路由表与地址簿**（17 §11）……
+```
+
+- 唯一写入入口是 `learn_verified(id, addr)`，只有 `accept_proof` 在「签名 + 一次性 nonce + 来源地址」全部通过后调用。
+- 入站 `PING` 仍应答（存活与兼容），`PONG` / `STORE` **不再产生任何学习**——录下旧报文换地址重放即可毒化地址簿，这是原实现的漏洞。
+- 旧的「PING/PONG 双向学习」只在 `IdentityPolicy::LegacyAllowed`（`--allow-legacy-identity`）下保留，且计入 `legacy_fallback_count()`。
+
+### 6.2 新增类型与状态（`node.rs`）
+
+| 项 | 说明 |
+|---|---|
+| `RpcError::{Unverified, UnsupportedVersion, Busy}` | 严格模式下「对端不支持身份证明」与「不可达」分开报；`explain()` 给可读文案 |
+| `IdentityPolicy::{Strict, LegacyAllowed}` + `set_identity_policy` / `identity_policy` | 默认严格 |
+| `Transport::{Udp, Tcp}` + `set_signaling_transport` / `signaling_transport` | 出站 RPC 统一按它分派（见 §7.3） |
+| `Pending::Auth { addr, nonce, tx }` | 发起方等待应答；`MAX_PENDING_AUTH = 64`，满则 `Busy` |
+| `issued: HashMap<nonce, (addr, Instant)>` | 应答方记住自己发出的回证挑战；`MAX_ISSUED=512`、`ISSUED_TTL=30s`，只被 `claim_issued`（地址+期限都对得上）消费 |
+| `AuthGate` | 入站挑战应答限速：全局 128/s、单源 IP 16/s、IP 表上限 1024；超限静默丢弃 |
+| `rejected_proof_count()` / `legacy_fallback_count()` | 可观测计数 |
+
+新增常量：`RPC_TIMEOUT_MS=1500`（原先内联）、`LEGACY_DIAGNOSTIC_TIMEOUT_MS=800`、`MAX_PENDING_AUTH`、`MAX_ISSUED`、`ISSUED_TTL`、`AUTH_REPLIES_PER_SEC`、`AUTH_REPLIES_PER_IP_SEC`、`AUTH_GATE_IPS_MAX`。
+
+### 6.3 TCP 兜底（UDP 被封）
+
+- 出站：`ping` → `ping_tcp`、`find_node` → `find_node_tcp`、`store` → `store_tcp`、`find_value` → `find_value_tcp`、`forward_to` → `forward_tcp`、`request_seeds` → `tcp_roundtrip(FIND_SEEDS)`。全部复用「u16 BE 长度前缀 + 同一条 `RpcPacket`」。
+- 地址换算：`seed_endpoint(&SeedInfo)` 按承载给出探测地址（UDP → 广告里的 DHT 端口，TCP → 广告里的 `tcp_port`）；`known_seed_addrs`、`probe_known_seeds`、`probe_candidate` 都走它。没有宣告 `tcp_port` 的种子在 TCP 模式下直接跳过。
+- `push_advert` 在 TCP 模式下不发（广告是非 RPC 的定长数据报，TCP 面只承载 RPC 帧）。
+- TCP 入站**不写任何表**：TCP 源端口不是可达的 UDP 端点，只入路由表的条目既不能被 `probe_routing_batch` 探到，也就永远不淘汰。
+- `ping_tcp` 也是挑战响应（不带回证）；`ping_tcp_legacy` 仅供兼容模式。
+- `runtime.rs`：`Transport` 进入 `RoomRuntime::with_transport` / `StorageCandidate.transport`；`fetch` / `publish` / `renew` / `add_member` / `request_join` / upkeep 里的登记 ping 全部经 `rpc_*` 分派。
+
+### 6.4 路由维护（17 §3.2 第 14 项）
+
+- `probe_window(cursor, len, batch)` 是纯函数：环形连续窗口 + 步长等于窗口长度；`probe_window_covers_every_route_for_any_size_and_batch` 用 `len=1..=40 × batch=1..=12` 证明 `ceil(len/batch)` 轮覆盖全部下标。
+- `probe_known_seeds()` 现在返回本拍探过的身份集合，`probe_routing_batch(&skip)` 跳过它们——同一批公网节点往往既是种子又在路由表里，避免一拍内重复握手。
+- 探活成功时刷新地址簿最后见时刻（避免长期在线但少被学到的条目在容量清扫时被误清）。
+- `forget(id)`（路由表 + 地址簿）在种子连续失败与路由失败达 `ROUTE_FAILURE_LIMIT=3` 时调用。
+
+### 6.5 已知限制（补充 §7）
+
+16. **TCP 模式不能完成「报道 → 锚点」这一跳**：Forward 依赖存储节点地址簿里的目标 UDP 地址，而 TCP 入站不写地址簿。TCP 模式解决的是 bootstrap / 选点 / `fetch`·`store`·`renew`；要让成员真正入表，仍需两端与存储节点之间 UDP 可达。
+17. **TCP 模式下的邻居扩散退化**：`Neighbors` 应答里的地址是 UDP 端口，TCP 模式下按 TCP 语义去连会失败；`lookup_node` 在 TCP 模式下只能覆盖手工入口。
+18. **身份证明防不住在线中继**（17 §11.8 第 1 条）：攻击者若同时在路径上，可把「受害者的身份」证明到自己的地址上——后果是地址被投毒（可用性），探活连续失败 3 次即淘汰。
+
+## 7. 已知限制或未实现项（2026-11-07 快照）
 
 以下均为代码注释/结构可证的现状，非推测：
 

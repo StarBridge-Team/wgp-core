@@ -2,7 +2,7 @@
 
 > - 源目录：`H:\mclink core\kernel\wgp-punch\src\`
 > - 生成日期：2026-11-05
-> - 对应设计文档：`docs/03-核心打洞与穿透算法`、`docs/04-边缘辅助与容错算法`（另涉及 `docs/00` 约束总则、`docs/14` 载体分层、`docs/15` 全链路流程）
+> - 对应设计文档：`03-核心打洞与穿透算法`、`04-边缘辅助与容错算法`（另涉及 `00-架构总览` 约束总则、`14-内核API文档` 载体分层、`15-全链路流程`）
 > - 分析范围：crate 全部 8 个源文件（含测试模块），另核对 `wgp-proto/src/consts.rs` 中被引用常量的真实数值
 
 ---
@@ -11,7 +11,7 @@
 
 ### 1.1 定位
 
-wgp-punch 是折跃门（wgp）NAT 打洞引擎的**纯算法层**，是 `docs/03`（核心打洞与穿透算法）与 `docs/04`（边缘辅助与容错算法）的代码化实现。其纪律见 `lib.rs` 头注释：
+wgp-punch 是折跃门（wgp）NAT 打洞引擎的**纯算法层**，是 `03-核心打洞与穿透算法` 与 `04-边缘辅助与容错算法` 的代码化实现。其纪律见 `lib.rs` 头注释：
 
 - **调度器是唯一发包点（H6，00 §3）**：crate 内所有模块只做决策与计划（"何时发、发哪些端口、发多少"），不持有 socket、不执行任何真实 IO；发包动作与预算扣减由外层调度器 / `UdpProbeCarrier` / 引擎完成。
 - **内核只产链路、不跑数据**：本 crate 的产出是"探测计划 + 心跳节奏 + 预算闸门 + 状态机语义"，链路打通后的数据面归 wgp-core。
@@ -734,7 +734,7 @@ impl From<Option<&PortStepModel>> for Confidence { /* conf ≥0.85 High；≥0.5
 | 代码元素 | 设计文档对应 | 对应内容 |
 |---|---|---|
 | 整个 crate 定位（lib.rs:1-2） | 03、04 文档总纲 | "折跃门打洞引擎（03/04 文档的代码化）" |
-| H6 / 00 §3（lib.rs:2、budget.rs:1-2、heartbeat.rs:128） | docs/00 §3 | 调度器是内核唯一发包点；心跳与探测共用调度器配额 |
+| H6 / 00 §3（lib.rs:2、budget.rs:1-2、heartbeat.rs:128） | 00-架构总览 §3 | 调度器是内核唯一发包点；心跳与探测共用调度器配额 |
 | 双闸门预算（budget.rs） | 03/00 §1 H6 | 轮预算 ≤47、滑动 10 分钟预算 ≤500；耗尽即触发 BudgetExhausted 事件 |
 | `ProbeCarrier`（carrier.rs:1） | 00 D9、14 §8 | 底层多协议抽象；新增载体 = 新写实现，引擎零改动 |
 | `TransportCapability`（carrier.rs:6） | 14 §8（能力位交换） | 能力位交换 + `LinkControl::advertise_transports` 的单元 |
@@ -754,8 +754,8 @@ impl From<Option<&PortStepModel>> for Confidence { /* conf ≥0.85 High；≥0.5
 | Precision 2ms 抖动收紧（timer.rs:55-56） | 03 §3.3.5（"内核强制小数 ms 抖动收紧"） | Precision 允许提前 ≤2ms |
 | Windows 15.6ms 定时器精度（timer.rs:6-9） | 部署清单（生产阶段） | timeBeginPeriod/Priority 提升，真机验证前置项 |
 | `PunchState` 状态机（state.rs:1） | 00 §4 | Idle → … → Connected；失败 → ICMP 逃生 → 死局 |
-| 15 全链路 Phase 3-8 状态化（state.rs:3、各状态注释） | docs/15 全链路流程 | Preprobe/RoomLookup/Negotiating/Punching/Connected 各阶段 |
-| `DeadEnd` + 04 D5 评分 ≥70（state.rs:19、52） | docs/04 D5 | 全灭 + ICMP 逃生失败死局判定，附诊断报告 |
+| 15 全链路 Phase 3-8 状态化（state.rs:3、各状态注释） | 15-全链路流程 | Preprobe/RoomLookup/Negotiating/Punching/Connected 各阶段 |
+| `DeadEnd` + 04 D5 评分 ≥70（state.rs:19、52） | 04-边缘辅助与容错算法 D5 | 全灭 + ICMP 逃生失败死局判定，附诊断报告 |
 | `TcpFallbackTrigger` T1–T4（state.rs:23-24） | 00 §4 | 任一满足即启动 TCP simultaneous open（UDP 预检失败 / 三波全灭 / QUIC 握手超时 / 运营商画像差+对端同意） |
 | `WAVE_TIMEOUT_MS=800`（wgp-proto consts.rs:17） | 03 §3.5 | 波间超时约定；**本 crate 未引用**（应在引擎/调度器层消费），见 §6 |
 
