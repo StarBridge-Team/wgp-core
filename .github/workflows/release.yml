@@ -203,9 +203,14 @@ jobs:
           cd dist
           if [ "$RUNNER_OS" = Windows ]; then
             7z a -tzip "$name.zip" "$name" > /dev/null
+            sha256sum "$name.zip" > "$name.zip.sha256"
           else
             tar -czf "$name.tar.gz" "$name"
+            sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
           fi
+          # 每个目标产出的校验值单独存一份：不发布标签的演练（workflow_dispatch / PR）
+          # 也能核对「打包 + checksum」这一步，而不是等到 publish 才第一次算
+          cat ./*.sha256
           ls -l
 
       - uses: actions/upload-artifact@v4
@@ -214,6 +219,7 @@ jobs:
           path: |
             dist/*.zip
             dist/*.tar.gz
+            dist/*.sha256
           if-no-files-found: error
 
   publish:
