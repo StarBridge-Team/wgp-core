@@ -15,7 +15,7 @@ pub mod race;
 #[cfg(feature = "client")]
 pub use circuit::{decide_race, CircuitInput, RaceConfig, TcpTrigger};
 #[cfg(feature = "client")]
-pub use keepalive::keepalive_loop;
+pub use keepalive::{fair_share_interval_ms, keepalive_loop, BUDGET_WINDOW_MS};
 #[cfg(feature = "client")]
 pub use nat_probe::{classify_reports, NatClass, NatProbe, ObserverReport};
 #[cfg(feature = "client")]
@@ -42,6 +42,8 @@ use crate::RoomKey;
 use std::collections::HashMap;
 #[cfg(feature = "client")]
 use std::net::{IpAddr, SocketAddr};
+#[cfg(feature = "client")]
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 #[cfg(feature = "client")]
 use std::time::Duration;
@@ -50,7 +52,8 @@ use tokio::sync::broadcast;
 use tokio::sync::watch;
 #[cfg(feature = "client")]
 use wgp_crypto::SecretBox;
-use wgp_dht::{DhtNode, NodeIdentity, ObserverPolicy, ObserverServer};
+use wgp_dht::{AdvertiseSpec, DhtNode, NodeIdentity, ObserverPolicy, ObserverServer};
+use wgp_proto::packet::seed_advertise_v2;
 #[cfg(feature = "client")]
 use wgp_dht::{RoomError, RoomRuntime, room_key as room_key_of};
 #[cfg(feature = "client")]
@@ -68,13 +71,32 @@ impl Clone for Engine {
             #[cfg(feature = "client")]
             storage: self.storage.clone(),
             #[cfg(feature = "client")]
+            storage_transport: self.storage_transport.clone(),
+            #[cfg(feature = "client")]
             links: self.links.clone(),
+            #[cfg(feature = "client")]
+            refill_started: self.refill_started.clone(),
+            #[cfg(feature = "client")]
+            keepalive_links: self.keepalive_links.clone(),
         }
     }
 }
 
 #[cfg(feature = "client")]
 const ROOM_UPKEEP_INTERVAL_MS: u64 = 2_000;
+
+/// 入表轮询：间隔 / 轮数（共 6s）/ 每多少轮补发一次报道（1.5s）。
+/// 锚点每 ROOM_UPKEEP_INTERVAL_MS 才处理一次报道，等待窗口要明显长于它。
+#[cfg(feature = "client")]
+const JOIN_POLL_INTERVAL_MS: u64 = 300;
+#[cfg(feature = "client")]
+const JOIN_POLL_ROUNDS: u32 = 20;
+#[cfg(feature = "client")]
+const JOIN_REREQUEST_EVERY: u32 = 5;
+
+/// 节点入网引导的重试间隔（毫秒）：一个引导端点都没问到时，依次等这么久再试一次；
+/// 用完之后交给 20s 一轮的周期维护。
+const BOOTSTRAP_RETRY_WAITS_MS: [u64; 6] = [0, 300, 700, 1_500, 3_000, 6_000];
 
 /// 进程级单调毫秒（禁止读系统时钟；03 §3.3.2 硬约束）
 #[cfg(feature = "client")]
@@ -107,6 +129,18 @@ pub struct NodeConfig {
     pub hobby: bool,
     /// 观察者限频策略（运维参数；默认 `ObserverPolicy::default`）
     pub observer_policy: ObserverPolicy,
+    /// 对外宣告的公网 IPv4（None = 不宣告，别的节点只能靠手工配置找到本节点）。
+    /// 内核不猜测自己的公网地址；端口沿用 bind / stun / tcp_signal 的实际绑定值，
+    /// 即假定外部端口与本机端口一致（端口映射请按原号映射）。
+    pub advertise: Option<std::net::Ipv4Addr>,
+    /// 广告纪元（17 §5）：接收端只采纳更大的纪元，同一身份每次启动都要比上次大。
+    /// 内核不读系统时钟也不落盘，由外围持久化后注入。仅在 advertise 为 Some 时有意义。
+    pub advertise_epoch: u64,
+    /// 入网引导端点：其他种子的 DHT 地址（已解析）。空 = 独立运行，等别人来找
+    pub peers: Vec<std::net::SocketAddr>,
+    /// 身份证明兼容策略（17 §11.6）：true = 允许回退到旧 PING/PONG 学习（迁移期）。
+    /// 默认 false（严格：旧协议只用于存活诊断，绝不写路由表/地址簿）。
+    pub allow_legacy_identity: bool,
 }
 
 /// 打洞输入：已协商完成的会话上下文（承诺-揭示产物 + 对端观察报告）。
@@ -142,9 +176,18 @@ pub struct Engine {
     dht: Arc<tokio::sync::Mutex<Option<Arc<DhtNode>>>>,
     #[cfg(feature = "client")]
     storage: Arc<tokio::sync::Mutex<Option<SocketAddr>>>,
+    /// 访问存储节点的承载（UDP / TCP 兜底）
+    #[cfg(feature = "client")]
+    storage_transport: Arc<tokio::sync::Mutex<wgp_dht::Transport>>,
     /// 活跃链路保活停止开关（release 时拉闸；14 §10 条款 4）
     #[cfg(feature = "client")]
     links: Arc<tokio::sync::Mutex<HashMap<PeerId, watch::Sender<bool>>>>,
+    /// 窗口预算回填定时器是否已启动（首次 new_link 时惰性启动；H6 的时间驱动面）
+    #[cfg(feature = "client")]
+    refill_started: Arc<AtomicBool>,
+    /// 当前在跑的保活链路数（多链路公平节拍的分母，见 keepalive::fair_share_interval_ms）
+    #[cfg(feature = "client")]
+    keepalive_links: Arc<AtomicUsize>,
 }
 
 /// 打洞会话事件流
@@ -188,7 +231,13 @@ impl Engine {
                 #[cfg(feature = "client")]
                 storage: Arc::new(tokio::sync::Mutex::new(None)),
                 #[cfg(feature = "client")]
+                storage_transport: Arc::new(tokio::sync::Mutex::new(wgp_dht::Transport::Udp)),
+                #[cfg(feature = "client")]
                 links: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+                #[cfg(feature = "client")]
+                refill_started: Arc::new(AtomicBool::new(false)),
+                #[cfg(feature = "client")]
+                keepalive_links: Arc::new(AtomicUsize::new(0)),
             },
             rx,
         )
@@ -198,11 +247,25 @@ impl Engine {
         self.tx.subscribe()
     }
 
-    /// 注入信令上下文（客户端启动时调用：本进程 DHT 节点 + 已知存储节点）
+    /// 注入信令上下文（客户端启动时调用：本进程 DHT 节点 + 已知存储节点）。
+    /// 默认按 UDP 访问存储节点；UDP 被封时用 [`Self::attach_dht_with_transport`]。
     #[cfg(feature = "client")]
     pub async fn attach_dht(&self, node: Arc<DhtNode>, storage: SocketAddr) {
+        self.attach_dht_with_transport(node, storage, wgp_dht::Transport::Udp)
+            .await;
+    }
+
+    /// 同上，但显式指定存储节点的承载（`storage` 必须是该承载的端点：TCP 模式下是 TCP 信令端口）
+    #[cfg(feature = "client")]
+    pub async fn attach_dht_with_transport(
+        &self,
+        node: Arc<DhtNode>,
+        storage: SocketAddr,
+        transport: wgp_dht::Transport,
+    ) {
         *self.dht.lock().await = Some(node);
         *self.storage.lock().await = Some(storage);
+        *self.storage_transport.lock().await = transport;
     }
 
     /// 客户端路径：接收已协商完成的打洞输入，执行竞速（UDP 三波 ∥ TCP），
@@ -213,10 +276,25 @@ impl Engine {
         let tx = self.tx.clone();
         let budget = self.budget.clone();
         let links = self.links.clone();
+        let keepalive_links = self.keepalive_links.clone();
+        self.ensure_window_refill();
         let peer = input.peer;
         let carrier = Arc::new(input.carrier);
         tokio::spawn(async move {
             let _ = tx.send(EngineEvent::PunchingStarted { peer });
+
+            // 会话级轮预算（H6：单侧 ≤47 包/轮）：从共享窗口预扣，竞速结束归还未用部分。
+            // 每个会话独立一轮——重打洞 / mesh 多边不再共用（并耗尽）同一轮配额。
+            let session_budget = Arc::new(tokio::sync::Mutex::new(
+                budget.lock().await.reserve_round(),
+            ));
+            if session_budget.lock().await.remaining().0 == 0 {
+                // 窗口预算耗尽：本窗口内不再发任何探针，明确告知外围停止催促
+                let cause = LinkLossCause::BudgetExhausted;
+                let _ = tx.send(EngineEvent::LinkLost { peer, cause });
+                sink.on_link_lost(peer, cause);
+                return;
+            }
 
             let outcome = race_punch(
                 &carrier,
@@ -224,10 +302,13 @@ impl Engine {
                 input.model.as_ref(),
                 input.peer_ip,
                 input.seed,
-                budget.clone(),
+                session_budget.clone(),
                 input.udp_enabled,
             )
             .await;
+
+            let unused = session_budget.lock().await.clone();
+            budget.lock().await.refund_round(&unused);
 
             match outcome {
                 RaceOutcome::Udp { peer_addr, .. } => {
@@ -240,6 +321,7 @@ impl Engine {
                         transport: LinkTransport::Udp {
                             socket: carrier.socket(),
                         },
+                        peer_addr,
                         session_key: input.session_key,
                         quality: LinkQuality {
                             rtt: Duration::from_millis(0),
@@ -257,17 +339,24 @@ impl Engine {
                     let c2 = carrier.clone();
                     let budget2 = budget.clone();
                     tokio::spawn(async move {
-                        keepalive_loop(c2, peer_addr, budget2, stop_rx).await;
+                        keepalive_links.fetch_add(1, Ordering::Relaxed);
+                        keepalive_loop(c2, peer_addr, budget2, stop_rx, keepalive_links.clone())
+                            .await;
+                        keepalive_links.fetch_sub(1, Ordering::Relaxed);
                     });
                 }
                 RaceOutcome::Tcp { stream, .. } => {
                     // TCP 路径 = 降级档（00 §4 链路优先级：LAN > QUIC > TCP > ICMP）
                     // 保活由 TCP keepalive/流活性承担，内核不另发探针
                     let rank = LinkRank::Degraded;
+                    let peer_addr = stream
+                        .peer_addr()
+                        .unwrap_or_else(|_| SocketAddr::new(input.peer_ip, 0));
                     let _ = tx.send(EngineEvent::LinkYielded { peer, rank });
                     let link = PunchedLink {
                         peer_id: peer,
                         transport: LinkTransport::Tcp { stream },
+                        peer_addr,
                         session_key: input.session_key,
                         quality: LinkQuality {
                             rtt: Duration::from_millis(0),
@@ -289,6 +378,25 @@ impl Engine {
         LinkStream {
             rx: self.tx.subscribe(),
         }
+    }
+
+    /// 惰性启动窗口预算回填定时器（H6：≤500 包/10 分钟的时间驱动面）。
+    /// 弱引用持有预算：引擎及其保活任务全部销毁后，定时器在下个周期自行退出。
+    #[cfg(feature = "client")]
+    fn ensure_window_refill(&self) {
+        if self.refill_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let weak = Arc::downgrade(&self.budget);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(BUDGET_WINDOW_MS)).await;
+                match weak.upgrade() {
+                    Some(budget) => budget.lock().await.refill_window(),
+                    None => break,
+                }
+            }
+        });
     }
 
     /// 释放链路：停保活、清注册（LinkControl::release 的引擎实现）
@@ -338,18 +446,22 @@ impl Engine {
             }
         };
 
-        let rt = RoomRuntime::new(node.clone(), storage);
+        let transport = *self.storage_transport.lock().await;
+        let rt = RoomRuntime::with_transport(node.clone(), storage, transport);
         let my_id = node.node_id();
 
         // ① 入表判定（建房/已在表/需报道）
         let joined = match rt.fetch(&code_str).await {
             Ok(rec) if rec.members.iter().any(|(id, _)| *id == my_id) => rec,
             Ok(rec) => {
-                // 未入表：签名报道 + 轮询等锚点处理
-                let _ = rt.request_join(&code_str, &rec).await;
+                // 未入表：签名报道 + 轮询等锚点处理。报道经 UDP 中转且没有应答，丢一个包就没了——
+                // 所以每隔几轮补发一次（锚点侧幂等），而不是只发一次然后干等
                 let mut last = rec;
-                for _ in 0..10 {
-                    tokio::time::sleep(Duration::from_millis(300)).await;
+                for round in 0..JOIN_POLL_ROUNDS {
+                    if round % JOIN_REREQUEST_EVERY == 0 {
+                        let _ = rt.request_join(&code_str, &last).await;
+                    }
+                    tokio::time::sleep(Duration::from_millis(JOIN_POLL_INTERVAL_MS)).await;
                     match rt.fetch(&code_str).await {
                         Ok(r) if r.members.iter().any(|(id, _)| *id == my_id) => {
                             last = r;
@@ -384,7 +496,7 @@ impl Engine {
         // ② spawn upkeep（三合一循环；cancel 经 RoomHandle::cancel 停止）
         let (stop_tx, stop_rx) = watch::channel(false);
         let upkeep_code = code_str.clone();
-        let upkeep_rt = RoomRuntime::new(node.clone(), storage);
+        let upkeep_rt = RoomRuntime::with_transport(node.clone(), storage, transport);
         tokio::spawn(async move {
             upkeep_rt
                 .upkeep(upkeep_code, ROOM_UPKEEP_INTERVAL_MS, stop_rx, engine_now_ms)
@@ -404,7 +516,9 @@ impl Engine {
 
     /// 节点路径：种子/观察者模式——wgp-node 的完整逻辑入口（07 §6 四职）。
     /// 承载：DHT 节点（RPC/转发/种子）+ 观察者（STUN 响应，独立端口）
-    ///      + TCP 信令面（UDP 被封/受限时的长度前缀帧兜底）。
+    ///      + TCP 信令面（UDP 被封/受限时的长度前缀帧兜底）
+    ///      + 种子发现（17 P0）：配置了 advertise 就周期宣告自己；配置了 peers 就以它们为
+    ///        入口建立种子目录。两者都不配置时行为与以前完全一致。
     pub async fn run_node(&self, cfg: NodeConfig, identity: NodeIdentity) -> NodeHandle {
         let bind_addr: Option<std::net::SocketAddr> = cfg.bind.parse().ok();
         let dht = match bind_addr {
@@ -414,6 +528,12 @@ impl Engine {
                     if cfg.hobby {
                         n.set_relay_policy(wgp_dht::RelayPolicy::Deny).await;
                     }
+                    // 身份证明策略：默认严格（17 §11.6）
+                    n.set_identity_policy(if cfg.allow_legacy_identity {
+                        wgp_dht::IdentityPolicy::LegacyAllowed
+                    } else {
+                        wgp_dht::IdentityPolicy::Strict
+                    });
                     Some(n)
                 }
                 Err(e) => {
@@ -450,6 +570,48 @@ impl Engine {
             },
             None => None,
         };
+
+        if let Some(node) = dht.as_ref() {
+            node.pin_seeds(&cfg.peers).await;
+            if let (Some(ip), Ok(local)) = (cfg.advertise, node.local_addr()) {
+                let spec = AdvertiseSpec {
+                    addr_v4: ip.octets(),
+                    dht_port: local.port(),
+                    stun_port: observer
+                        .as_ref()
+                        .and_then(|o| o.local_addr().ok())
+                        .map_or(0, |a| a.port()),
+                    tcp_port: tcp.map_or(0, |a| a.port()),
+                    priority: 0,
+                    // 贡献模式不中转：如实写进广告，客户端据此避开「报道永远送不到」的存储节点。
+                    // FLAG_AUTH_V1 恒定置位：本版本支持挑战响应身份证明，对端可据此决定是否值得试。
+                    flags: if cfg.hobby {
+                        seed_advertise_v2::FLAG_AUTH_V1
+                    } else {
+                        seed_advertise_v2::FLAG_RELAY | seed_advertise_v2::FLAG_AUTH_V1
+                    },
+                    name_hash: [0u8; 4],
+                };
+                node.start_advertising(spec, cfg.advertise_epoch).await;
+            }
+            node.spawn_maintenance();
+            if !cfg.peers.is_empty() {
+                // 引导放后台：对端种子此刻不在线也不拖慢启动。
+                // 一个都没问到时按短退避再试几次，不干等周期维护——常见于几个种子同时启动、
+                // 对方的端口还没开。这段时间里种子目录是残缺的：两个只认识不同种子的客户端
+                // 各自看不到对方那个种子，会把同一个房间建在两个存储节点上。
+                let (node, peers) = (node.clone(), cfg.peers.clone());
+                tokio::spawn(async move {
+                    for wait_ms in BOOTSTRAP_RETRY_WAITS_MS {
+                        tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+                        if node.discover(&peers).await > 0 {
+                            break;
+                        }
+                    }
+                    node.spread(&peers).await;
+                });
+            }
+        }
         NodeHandle { dht, observer, tcp }
     }
 }
@@ -521,7 +683,8 @@ mod tests {
             .await
             .unwrap();
         let a_addr = a.local_addr().unwrap();
-        let b_ip = b.local_addr().unwrap().ip();
+        let b_addr = b.local_addr().unwrap();
+        let b_ip = b_addr.ip();
 
         // 对端回发（同 key：模拟承诺-揭示后的共享探针密钥）
         tokio::spawn(async move {
@@ -561,6 +724,8 @@ mod tests {
         let link = yielded_rx.recv().await.expect("交付链路");
         assert_eq!(link.peer_id, peer_id);
         assert!(matches!(link.transport, LinkTransport::Udp { .. }));
+        // 14 §2：交付物必须带验证过的对端地址（socket 未 connect，外围据此发包）
+        assert_eq!(link.peer_addr, b_addr);
     }
 
     /// 无对端 → 链路丢失事件 + 外围收到 lost 回调
@@ -568,7 +733,8 @@ mod tests {
     async fn engine_reports_lost_when_no_peer() {
         let (engine, _events) = Engine::new();
         let peer_id: PeerId = [8u8; 16];
-        let a = UdpProbeCarrier::bind("127.0.0.1:0".parse().unwrap(), SHARED_KEY, [1, 1, 1, 1])
+        // 不与别的测试共用探针密钥：并行运行时，别人撒网的探针落到这个 socket 上会被当成命中
+        let a = UdpProbeCarrier::bind("127.0.0.1:0".parse().unwrap(), [0x72; 32], [1, 1, 1, 1])
             .await
             .unwrap();
 
@@ -598,6 +764,17 @@ mod tests {
 
         let lost = lost_rx.recv().await.expect("lost 回调");
         assert_eq!(lost, peer_id);
+
+        // 预算口径（H6）：本会话发包不超一轮配额；未用部分已归还；
+        // 下一会话仍能拿到完整的一轮（修复前：轮预算从不复位，第二次打洞 0 配额）
+        use wgp_proto::consts::{PROBE_BUDGET_PER_10MIN, PROBE_BUDGET_PER_ROUND};
+        let mut shared = engine.budget.lock().await;
+        let used = PROBE_BUDGET_PER_10MIN - shared.remaining().1;
+        assert!(
+            used > 0 && used <= PROBE_BUDGET_PER_ROUND,
+            "单会话发包须在一轮配额内，used={used}"
+        );
+        assert_eq!(shared.reserve_round().remaining().0, PROBE_BUDGET_PER_ROUND);
     }
 
     /// 多客户端联调：两台 Engine（各自 DHT 节点 + 共同存储节点）加入同一房间。
@@ -692,31 +869,162 @@ mod tests {
         let _ = b_handle.leave();
     }
 
+    /// 节点路径的种子发现接线：一个完整版种子、一个贡献模式种子，后者以前者为引导端点——
+    /// 双方最终互相收录；广告里的端口来自实际绑定，中转能力位如实反映模式。
+    #[tokio::test]
+    async fn run_node_advertises_and_seeds_find_each_other() {
+        use rand_core::OsRng;
+        use std::net::Ipv4Addr;
+
+        fn config(hobby: bool, peers: Vec<SocketAddr>) -> NodeConfig {
+            NodeConfig {
+                role: NodeRole::Seed,
+                bind: "127.0.0.1:0".to_string(),
+                stun: Some(0),
+                tcp_signal: Some(0),
+                hobby,
+                observer_policy: ObserverPolicy::default(),
+                advertise: Some(Ipv4Addr::LOCALHOST),
+                advertise_epoch: 1,
+                peers,
+                allow_legacy_identity: false,
+            }
+        }
+
+        let (engine, _ev) = Engine::new();
+        let full = engine
+            .run_node(config(false, Vec::new()), NodeIdentity::generate(&mut OsRng))
+            .await;
+        let full_dht = full.dht.clone().expect("DHT 应绑定成功");
+        let full_addr = full_dht.local_addr().unwrap();
+
+        let hobby = engine
+            .run_node(
+                config(true, vec![full_addr]),
+                NodeIdentity::generate(&mut OsRng),
+            )
+            .await;
+        let hobby_dht = hobby.dht.clone().expect("DHT 应绑定成功");
+
+        // 引导在后台进行：轮询等待双方互相收录
+        let mut found = None;
+        for _ in 0..150 {
+            let on_full = full_dht
+                .seeds()
+                .await
+                .into_iter()
+                .find(|s| s.node_id == hobby_dht.node_id());
+            let on_hobby = hobby_dht
+                .seeds()
+                .await
+                .into_iter()
+                .find(|s| s.node_id == full_dht.node_id());
+            if let (Some(a), Some(b)) = (on_full, on_hobby) {
+                found = Some((a, b));
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let (hobby_seen, full_seen) = found.expect("两个种子应互相收录");
+
+        assert_eq!(hobby_seen.addr, hobby_dht.local_addr().unwrap());
+        assert!(!hobby_seen.relays(), "贡献模式不得宣称可中转");
+        assert_eq!(
+            hobby_seen.observer_addr().map(|a| a.port()),
+            hobby.observer.as_ref().map(|o| o.local_addr().unwrap().port()),
+            "广告里的观察者端口 = 实际绑定端口"
+        );
+        assert_eq!(hobby_seen.tcp_addr(), hobby.tcp);
+        assert!(full_seen.relays());
+        assert_eq!(full_seen.tcp_addr(), full.tcp);
+        assert_eq!(full_seen.addr, full_addr);
+    }
+
+    /// 引导端点比自己晚启动（几个种子同时起来时谁先谁后是随机的）：第一次引导问不到人，
+    /// 应当很快重试，而不是等 20s 一轮的周期维护才认识对方。
+    #[tokio::test]
+    async fn run_node_retries_bootstrap_when_the_peer_starts_late() {
+        use crate::transport::test_ports::unique_loopback_udp_addr;
+        use rand_core::OsRng;
+        use std::net::Ipv4Addr;
+
+        fn config(bind: String, peers: Vec<SocketAddr>) -> NodeConfig {
+            NodeConfig {
+                role: NodeRole::Seed,
+                bind,
+                stun: None,
+                tcp_signal: None,
+                hobby: false,
+                observer_policy: ObserverPolicy::default(),
+                advertise: Some(Ipv4Addr::LOCALHOST),
+                advertise_epoch: 1,
+                peers,
+                allow_legacy_identity: false,
+            }
+        }
+
+        let (engine, _ev) = Engine::new();
+        // 先起的节点把「还没启动的那个」当引导端点
+        let late_addr = unique_loopback_udp_addr();
+        let early = engine
+            .run_node(
+                config("127.0.0.1:0".to_string(), vec![late_addr]),
+                NodeIdentity::generate(&mut OsRng),
+            )
+            .await;
+        let early_dht = early.dht.clone().expect("DHT 应绑定成功");
+
+        // 等到第一次引导已经发出去（必然落空），再让对方上线
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let late = engine
+            .run_node(
+                config(late_addr.to_string(), Vec::new()),
+                NodeIdentity::generate(&mut OsRng),
+            )
+            .await;
+        let late_dht = late.dht.clone().expect("DHT 应绑定成功");
+
+        // 重试生效的话几秒内互相收录；只靠周期维护要等 20s
+        let mut met = false;
+        for _ in 0..400 {
+            let early_knows = early_dht
+                .seeds()
+                .await
+                .iter()
+                .any(|s| s.node_id == late_dht.node_id());
+            let late_knows = late_dht
+                .seeds()
+                .await
+                .iter()
+                .any(|s| s.node_id == early_dht.node_id());
+            if early_knows && late_knows {
+                met = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(met, "引导端点晚启动时，两个种子应在几秒内互相收录");
+    }
+
     /// 竞速交付：UDP 无对端（死路）→ TCP 兜底路径命中 → 交付 Tcp 链路（Degraded 档）。
     /// 确定性构造：B 绑定"波内第一个端口"（同 seed 生成计划），A 侧 TCP 波首个尝试即命中。
     #[tokio::test]
     async fn engine_delivers_tcp_link_when_udp_dead() {
+        use crate::transport::test_ports::{is_free, unique_loopback_addr, PINNED_RANGE};
         use crate::transport::TcpProbeCarrier;
-        use tokio::net::TcpListener;
         use wgp_punch::plan_waves;
 
         let key: [u8; 32] = [0x31; 32];
-        let seed = 7u64;
-        let plan = plan_waves(None, seed, 47);
-        // 无数据模式：撒网在 wave3（wave1/2 为空），取第一个端口作确定性命中
-        let b_port = plan.wave3[0];
+        // 无数据模式：撒网在 wave3（wave1/2 为空），B 绑定计划里的第一个端口作确定性命中。
+        // 端口号由种子决定，所以反过来挑种子：要求该端口落在测试专用的指定端口区里且此刻空闲，
+        // 不去碰系统动态端口范围（那里的端口随时可能被并行的测试或别的程序拿到）。
+        let (seed, b_port) = (1u64..)
+            .map(|seed| (seed, plan_waves(None, seed, 47).wave3[0]))
+            .find(|(_, port)| PINNED_RANGE.contains(port) && is_free(*port))
+            .expect("总能找到一个种子，使撒网计划的首个端口落在指定端口区");
 
-        async fn reserve_port() -> u16 {
-            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let p = l.local_addr().unwrap().port();
-            drop(l);
-            p
-        }
-
-        let a_tcp_bind: std::net::SocketAddr =
-            format!("127.0.0.1:{}", reserve_port().await).parse().unwrap();
-        let b_tcp_bind: std::net::SocketAddr =
-            format!("127.0.0.1:{b_port}").parse().unwrap();
+        let a_tcp_bind = unique_loopback_addr();
+        let b_tcp_bind = std::net::SocketAddr::from(([127, 0, 0, 1], b_port));
 
         let tcp_a = TcpProbeCarrier::new(a_tcp_bind, key, [1, 1, 1, 1]);
         let tcp_b = TcpProbeCarrier::new(b_tcp_bind, key, [2, 2, 2, 2]);
@@ -776,6 +1084,62 @@ mod tests {
         let link = yielded_rx.recv().await.expect("TCP 链路交付");
         assert_eq!(link.rank, LinkRank::Degraded);
         assert!(matches!(link.transport, LinkTransport::Tcp { .. }));
+        assert_eq!(link.peer_addr, b_tcp_bind, "TCP 交付物的对端地址 = 流的对端");
         assert!(lost_rx.try_recv().is_err(), "不应有 lost 回调");
+    }
+
+    /// 报道请求经 UDP 中转且没有应答：第一份丢了，入表不应就此失败——等待期间会定期补发。
+    /// 用「存储节点起初拒绝中转、1 秒后恢复」模拟首份报道丢失。
+    #[tokio::test]
+    async fn join_survives_a_lost_join_request() {
+        use rand_core::OsRng;
+        use wgp_dht::RelayPolicy;
+        const CODE: &str = "U/ENG-ROOM-0002-DD55";
+
+        async fn spawn_node() -> Arc<DhtNode> {
+            DhtNode::bind(
+                NodeIdentity::generate(&mut OsRng),
+                "127.0.0.1:0".parse().unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+
+        let storage = spawn_node().await;
+        let storage_addr = storage.local_addr().unwrap();
+
+        let (engine_a, _ev_a) = Engine::new();
+        let node_a = spawn_node().await;
+        node_a.ping(storage_addr).await.unwrap();
+        engine_a.attach_dht(node_a.clone(), storage_addr).await;
+        let a_handle = engine_a
+            .join_room(crate::RoomCode(CODE.to_string()), None)
+            .await
+            .expect("A 建房成功");
+
+        let (engine_b, _ev_b) = Engine::new();
+        let node_b = spawn_node().await;
+        node_b.ping(storage_addr).await.unwrap();
+        engine_b.attach_dht(node_b.clone(), storage_addr).await;
+
+        // 首份报道会被丢弃；1 秒后中转恢复，只有补发的报道才能送达锚点
+        storage.set_relay_policy(RelayPolicy::Deny).await;
+        let healer = {
+            let storage = storage.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(1000)).await;
+                storage.set_relay_policy(RelayPolicy::Allow).await;
+            })
+        };
+
+        let b_handle = engine_b
+            .join_room(crate::RoomCode(CODE.to_string()), None)
+            .await
+            .expect("补发的报道应让 B 入表");
+        assert!(b_handle.members >= 2);
+        healer.await.unwrap();
+
+        let _ = a_handle.leave();
+        let _ = b_handle.leave();
     }
 }

@@ -5,9 +5,13 @@ members = [
     "kernel/wgp-punch",
     "kernel/wgp-dht",
     "kernel/wgp-core",
+    "kernel/wgp-ipc",
+    "bridge/wgp-port",
     "server/wgp-node",
     "client/wgp-client",
+    "client/wgp-agent",
 ]
+exclude = ["bridge/wgp-et-bridge"]
 resolver = "2"
 
 [workspace.package]

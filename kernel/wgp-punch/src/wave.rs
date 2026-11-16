@@ -82,6 +82,17 @@ fn sample_window(rng: &mut XorShift64, center: i64, half: i64, n: u16) -> Vec<u1
         .collect()
 }
 
+/// 窗口采样，但首包固定打预测中心：那是最大似然端口——锥形 NAT（实测占多数）下
+/// 它就是观察者实测到的映射端口，一包即中；其余在窗口内随机采样覆盖映射抖动。
+fn centered_window(rng: &mut XorShift64, center: i64, half: i64, n: u16) -> Vec<u16> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut ports = vec![clamp_port(center)];
+    ports.extend(sample_window(rng, center, half, n - 1));
+    ports
+}
+
 /// 生成三波探测计划。
 /// `packet_cap`：调度器给出的本轮可发包上限（预算裁剪在此发生，
 /// 顺序裁剪：wave1 → wave2 → wave3，先保精准波）。
@@ -98,11 +109,8 @@ pub fn plan_waves(model: Option<&PortStepModel>, seed: u64, packet_cap: u16) -> 
 
     match conf {
         Confidence::High => {
-            // 21 包精准窗口（±50）；首包必打预测中心（最大似然端口），
-            // 其余在窗口内随机采样（覆盖映射抖动）
-            let n = WAVE1_PACKETS.min(max_total);
-            let mut wave1 = vec![clamp_port(center)];
-            wave1.extend(sample_window(&mut rng, center, 50, n.saturating_sub(1)));
+            // 21 包精准窗口（±50），首包直打预测中心
+            let wave1 = centered_window(&mut rng, center, 50, WAVE1_PACKETS.min(max_total));
             let remaining = max_total.saturating_sub(wave1.len() as u16);
             let wave2 = sample_window_trunc(
                 &mut rng,
@@ -117,7 +125,7 @@ pub fn plan_waves(model: Option<&PortStepModel>, seed: u64, packet_cap: u16) -> 
             }
         }
         Confidence::Medium => {
-            let wave1 = sample_window(&mut rng, center, 400, WAVE1_PACKETS.min(max_total));
+            let wave1 = centered_window(&mut rng, center, 400, WAVE1_PACKETS.min(max_total));
             let remaining = max_total.saturating_sub(wave1.len() as u16);
             let wave2 = sample_window_trunc(&mut rng, center, -500, WAVE2_PACKETS.min(remaining));
             let remaining = remaining.saturating_sub(wave2.len() as u16);
@@ -136,7 +144,8 @@ pub fn plan_waves(model: Option<&PortStepModel>, seed: u64, packet_cap: u16) -> 
             match model {
                 Some(m) => {
                     let center = m.predict_window(1.0).center as i64;
-                    let wave1 = sample_window(&mut rng, center, 3000, WAVE1_PACKETS.min(max_total));
+                    let wave1 =
+                        centered_window(&mut rng, center, 3000, WAVE1_PACKETS.min(max_total));
                     let remaining = max_total.saturating_sub(wave1.len() as u16);
                     let wave2 = sample_window_trunc(&mut rng, center, -500, WAVE2_PACKETS.min(remaining));
                     let remaining = remaining.saturating_sub(wave2.len() as u16);
@@ -225,6 +234,23 @@ mod tests {
         assert_eq!(plan.wave1.len(), 10);
         assert!(plan.wave2.is_empty());
         assert!(plan.wave3.is_empty());
+    }
+
+    /// 只要有模型（不论置信度高低），首包必须直打预测中心：
+    /// 锥形 NAT 下那就是实测映射端口，窗口内盲采样有可能整波都错过它。
+    #[test]
+    fn any_model_probes_predicted_center_first() {
+        for conf in [0.92, 0.7, 0.5, 0.2, 0.0] {
+            let m = model(conf, 40_000);
+            let center = m.predict_window(1.0).center;
+            for seed in 0..50u64 {
+                let plan = plan_waves(Some(&m), seed, 47);
+                assert_eq!(plan.wave1.first(), Some(&center), "conf={conf} seed={seed}");
+            }
+        }
+        // 预算为 0 时不得凭空多出一包
+        let plan = plan_waves(Some(&model(0.92, 40_000)), 1, 0);
+        assert_eq!(plan.total(), 0);
     }
 
     #[test]

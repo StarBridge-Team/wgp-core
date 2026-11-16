@@ -1,0 +1,12 @@
+[Unit]
+Description=Periodically check WGP public IPv4 advertisement
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=10min
+RandomizedDelaySec=90s
+Persistent=true
+Unit=wgp-refresh-advertise.service
+
+[Install]
+WantedBy=timers.target

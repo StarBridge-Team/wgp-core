@@ -1,0 +1,138 @@
+# 持续集成：每次推送到 main、每个 PR 都跑。
+#   test         Windows / Linux 上跑全量测试，再用 release 二进制跑回环端到端（含双种子发现）
+#   cross-check  对发版矩阵里的其余目标做编译检查（32 位、ARM、龙架构），尽早发现平台相关的编译错误
+# 发版见 release.yml。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustc --version
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ci-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ci-${{ runner.os }}-
+
+      - name: Tests
+        run: cargo test --workspace --locked
+
+      - name: Build release binaries and examples
+        run: cargo build --release --locked --bins --examples
+
+      # —— 回环端到端：真实二进制，种子 + 房主 + 加入方，打洞、建隧道、转发、崩溃重连 ——
+      - name: End-to-end, single seed (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          & .\scripts\e2e-local.ps1 -Configuration release -SkipBuild
+          exit $LASTEXITCODE
+
+      - name: End-to-end, seed discovery (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          & .\scripts\e2e-local.ps1 -Configuration release -SkipBuild -Discovery
+          exit $LASTEXITCODE
+
+      - name: End-to-end, single seed (Linux)
+        if: runner.os == 'Linux'
+        run: bash scripts/e2e-local.sh target/release
+
+      - name: End-to-end, seed discovery (Linux)
+        if: runner.os == 'Linux'
+        run: bash scripts/e2e-local.sh target/release --discovery
+
+      - name: End-to-end, seed discovery with a hobby seed (Linux)
+        if: runner.os == 'Linux'
+        run: bash scripts/e2e-local.sh target/release --discovery --hobby
+
+      # —— 多进程阶段 1：真实进程 + 真实本机 IPC 端点（ACL、有界队列、优雅退出）——
+      - name: Agent IPC smoke (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          & .\scripts\agent-smoke.ps1
+          exit $LASTEXITCODE
+
+      - name: Agent IPC smoke (Linux)
+        if: runner.os == 'Linux'
+        run: bash scripts/agent-smoke.sh
+
+  cross-check:
+    name: check (${{ matrix.os }} cross targets)
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            targets: i686-pc-windows-msvc aarch64-pc-windows-msvc
+          - os: ubuntu-latest
+            targets: >-
+              x86_64-unknown-linux-musl i686-unknown-linux-musl aarch64-unknown-linux-musl
+              armv7-unknown-linux-musleabihf loongarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain and targets
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustup target add ${{ matrix.targets }}
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cross-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cross-${{ runner.os }}-
+
+      # 只检查不链接：快，且不需要各目标的链接器。完整构建与运行验证在 release.yml
+      - name: cargo check for every target
+        shell: bash
+        run: |
+          for target in ${{ matrix.targets }}; do
+            echo "::group::cargo check --target $target"
+            cargo check --workspace --all-targets --locked --target "$target"
+            echo "::endgroup::"
+          done

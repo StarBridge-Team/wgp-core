@@ -1,6 +1,6 @@
 # wgp-node-hobby 家庭宽带部署包（Windows）
 
-家庭宽带贡献节点 = 折跃门的种子/观察者/STUN/TCP 信令兜底四职，但**强制拒绝 Forward 中转**（避免持续流量触发运营商 PCDN 风控，见 `docs/07-信令面与观察者协议.md` §7）。
+家庭宽带贡献节点 = 折跃门的种子/观察者/STUN/TCP 信令兜底四职，但**强制拒绝 Forward 中转**（避免持续流量触发运营商 PCDN 风控，见 `项目完整文档/07-信令面与观察者协议.md` §7）。
 
 ## 包内容
 
@@ -35,7 +35,10 @@
 
 ## 注意事项
 
-- **`node_identity.key` 勿删**：删除即更换节点身份（node_id 变化）；
+- **只有贡献节点时，房间里进不了第二个人**：报道与密钥协商要经种子中转，而贡献节点不中转。
+  请在 `wgp-node.conf` 的 `peers` 里填一个完整版种子（`wgp-node`）：只认识本节点的客户端会经本节点找到它，
+  并改用它存放房间；
+- **`node_identity.key` 勿删**：删除即更换节点身份（node_id 变化），旁边的 `node_identity.epoch`（宣告用的启动计数）也别删；
 - 修改端口后需同步更新防火墙规则与路由器映射；
 - 家宽多无固定公网 IPv4：IP 变化后需更新客户端 `--seed`（DDNS 域名可缓解）；有公网 IPv6 时客户端也可直连（防火墙规则已放行 any profile）；
 - 贡献版不会中转业务流量，仅承担信令与观察，带宽占用可忽略；
@@ -49,6 +52,8 @@
 | `stun` | `3478` | 观察者/STUN 端口，`none` 关闭 |
 | `tcp` | `3481` | TCP 信令端口，`none` 关闭 |
 | `hobby` | `true` | 贡献模式（本二进制恒为 true） |
+| `advertise` | 不宣告 | 本节点的公网 IPv4；宣告后能被其他种子与客户端自动发现（地址会变的家宽先别开） |
+| `peers` | 无 | 启动时去认识的其他种子，逗号分隔（`udp://主机:端口`） |
 | `observer_rate_limit` / `observer_rate_window` | `12` / `10` | 观察者每 IP 限频 |
 | `identity` | `node_identity.key` | 身份文件路径 |
 | `log_level` | `info` | `error`/`warn`/`info`/`debug` |

@@ -1,0 +1,11 @@
+# Copy to /etc/systemd/system/wgp-node-hobby.service.d/resources.conf
+# Keep one worker for a quiet home seed. Change to 2 for a small VPS if measured load needs it.
+[Service]
+CPUQuota=50%
+CPUWeight=50
+MemoryHigh=160M
+MemoryMax=256M
+TasksMax=32
+Nice=5
+IOWeight=50
+Environment=WGP_RUNTIME_WORKERS=1

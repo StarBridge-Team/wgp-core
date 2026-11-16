@@ -2,6 +2,7 @@
 
 use crate::PeerId;
 use crate::rank::LinkRank;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpStream, UdpSocket};
@@ -36,6 +37,9 @@ pub struct IcmpChan {
 pub struct PunchedLink {
     pub peer_id: PeerId,
     pub transport: LinkTransport,
+    /// 验证过的对端地址（14 §2）：UDP/LAN = 收到并验签通过的对端探针源地址
+    /// （socket 未 connect，外围发包必须以此为目的地址）；TCP = 流的对端地址。
+    pub peer_addr: SocketAddr,
     pub session_key: wgp_crypto::SecretBox,
     pub quality: LinkQuality,
     pub rank: LinkRank,

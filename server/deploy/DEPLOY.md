@@ -109,7 +109,7 @@ wgp-node-hobby --bind 0.0.0.0:11010 --stun 3478 --tcp 3481
 ```
 
 > CLI 以 `--flag value` 为准（`--bind/--stun/--tcp/--identity/--observer-rate-limit/
-> --observer-rate-window/--log-level/--config`）；配置优先级：命令行 > WGP_* 环境变量 >
+> --observer-rate-window/--log-level/--config/--advertise/--peers`）；配置优先级：命令行 > WGP_* 环境变量 >
 > `wgp-node.conf` > 默认值。旧的纯位置参数（`wgp-node 0.0.0.0:11010 3478 3481`）仅首位
 > bind 向后兼容，stun/tcp 位置值已不生效（取默认 3478/3481）。
 
@@ -139,7 +139,9 @@ wgp-node-hobby --bind 0.0.0.0:11010 --stun 3478 --tcp 3481
 
 步骤：`firewall-hobby.bat`（管理员）→ 光猫/路由器端口映射（以 `wgp-node.conf` 中的端口为准，映射到本机内网 IP）→ 双击 `start-hobby.bat` → 日志出现 `已就绪（种子+观察者+承诺兜底）` 即成功。细节（自启、公网 IP 变动、卸载）见包内 `README.md`。
 
-> 每次重新 `cargo build --release` 后，记得把新的 `target/release/wgp-node-hobby.exe` 拷入本目录，保持包内二进制与源码一致。
+> 服务端代码有改动后，记得重新构建并把新的 `wgp-node-hobby.exe` 拷入本目录，保持包内二进制与源码一致。
+> 请用 `scripts\package.ps1` 构建、取 `target\package\release\wgp-node-hobby.exe`：这样编出来的程序不依赖 VC++ 运行库，
+> 也不会把构建者本机的用户目录路径带进仓库（直接 `cargo build --release` 的产物里有）。
 
 ## 7.2 Linux 一键部署（参数化，不写死端口）
 
@@ -156,11 +158,131 @@ sudo bash server/deploy/install-hobby.sh # 创建用户+装二进制+装单元+e
 | 环境文件 | `/etc/wgp-node/env` | 安装脚本首装从 `wgp-node.env.example` 模板创建（全注释=全默认）；**已存在则绝不覆盖**。改键后 `systemctl restart wgp-node-hobby` |
 | `wgp-node.conf` | 工作目录 | 二进制自动加载；键同 env（去 `WGP_` 前缀） |
 
-键名与 `server.rs::collect_env()` 一一对应：`WGP_BIND` / `WGP_STUN` / `WGP_TCP` / `WGP_HOBBY`（贡献版恒 true 无需设） / `WGP_OBSERVER_RATE_LIMIT` / `WGP_OBSERVER_RATE_WINDOW` / `WGP_IDENTITY` / `WGP_LOG_LEVEL` / `WGP_CONFIG`。
+键名与 `server.rs::collect_env()` 一一对应：`WGP_BIND` / `WGP_STUN` / `WGP_TCP` / `WGP_HOBBY`（贡献版恒 true 无需设） / `WGP_OBSERVER_RATE_LIMIT` / `WGP_OBSERVER_RATE_WINDOW` / `WGP_IDENTITY` / `WGP_LOG_LEVEL` / `WGP_CONFIG` / `WGP_ADVERTISE` / `WGP_PEERS`。
+
+`WGP_ADVERTISE=<本机公网IPv4>`（或 `--advertise`）让节点对外宣告自己：其他节点与客户端可以自动发现它，客户端也不必再手填观察者。
+只接受 IPv4 地址，且假定外部端口与本机端口一致（端口映射请按原号映射）；家宽换了公网 IP 要改配置并重启。宣告后身份文件旁会多一个
+`node_identity.epoch`（启动计数，请和身份文件一起保留）。`WGP_PEERS=udp://另一个种子:11010,...`（或 `--peers`）指定入网引导的其他种子。
+两者都不设时节点不参与发现，行为与以前一致。
 
 脚本可调安装位置（均有默认，不需要就不设）：`WGP_INSTALL_DIR` / `WGP_RUN_USER` / `WGP_ENV_FILE` / `WGP_BIN`。防火墙仍按 §2 手工执行 `wgp-node.nft`（该文件首行 `flush ruleset` 会清空宿主机全部规则，故脚本不代劳）。
 
-## 8. 运维要点
+## 8. 低资源调度配置
+
+WGP 的节点与客户端以网络 I/O 为主；节点宣告/探活由 DHT 每 20 秒维护一次，房间维护及成员发现当前约每 2 秒轮询。默认 Tokio 多线程运行时会创建与 CPU 可见核数接近的 worker；新版本将默认封顶为 4 个，可通过 `WGP_RUNTIME_WORKERS` 设为 1–64。低流量种子可先设 1，普通 VPS 建议 2，只有测得 Tokio 任务积压后再增加。
+
+### systemd 资源预算（可直接配置）
+
+创建 `/etc/systemd/system/wgp-node-hobby.service.d/resources.conf`：
+
+```ini
+[Service]
+# 家宽/1C VPS：CPU 配额按实际贡献能力调整，超限会延后工作但不丢状态
+CPUQuota=50%
+CPUWeight=50
+# 当前目录簿 / KV / 转发队列均有界；给日志、运行时和峰值留余量
+MemoryHigh=160M
+MemoryMax=256M
+TasksMax=32
+# 低优先级后台运行，正常网络服务不受影响
+Nice=5
+IOWeight=50
+Environment=WGP_RUNTIME_WORKERS=1
+# 只在确实有公网 IPv4 且路由映射已通时配置静态地址
+# Environment=WGP_ADVERTISE=203.0.113.7
+# Environment=WGP_PEERS=udp://seed1.example:11010,udp://seed2.example:11010
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart wgp-node-hobby
+sudo systemctl show wgp-node-hobby -p CPUQuotaPerSecUSec -p MemoryHigh -p MemoryMax -p TasksMax
+sudo systemctl status wgp-node-hobby --no-pager
+```
+
+静态 IP 完整版同样可用该 drop-in，文件名改为 `wgp-node.service.d/resources.conf`，但公网转发种子不建议设置过低 CPUQuota；资源限制是宿主机预算，不替代 DHT 自身限流。避免对生产机直接应用 `server/deploy/wgp-node.nft`：该规则文件会 `flush ruleset`，先合并到现有防火墙策略。
+
+资源监控：
+
+```bash
+systemctl show wgp-node-hobby -p CPUUsageNSec -p MemoryCurrent -p TasksCurrent
+journalctl -u wgp-node-hobby --since today --no-pager
+ss -lunpt | grep -E ':(11010|3478|3481)\\b'
+```
+
+### 种子维护节奏与节点角色
+
+- VPS 主种子：固定公网 IPv4，开放 UDP 11010、UDP 3478、TCP 3481；设置 `WGP_ADVERTISE`，并用 `WGP_PEERS` 配置至少一个独立备用 VPS。完整 `wgp-node` 提供信令 Forward 兜底。
+- 家宽贡献节点：使用 `wgp-node-hobby`，保持 `WGP_HOBBY` 不可关闭；需映射 UDP 11010/3478、TCP 3481。配置一个 VPS 完整节点为 `WGP_PEERS`，家宽节点只承担发现、观察者与 KV，不中转 Forward。
+- 房间快速入网：客户端优先配置稳定 VPS 的 UDP seed，第一次运行执行发现；入口 seed 必须互相认识并持续对外宣告。仅 TCP seed 目前只能作为后续协商兜底，房间 DHT RPC 仍要求至少一个 UDP seed。
+- 客户端开房/加入命令须长期驻留；节点服务用 `systemctl enable --now` 开机自启。首次开机后检查日志中 `已就绪`、`node_id`、广告地址和入网引导端点。
+
+### VPS 部署检查表
+
+1. 优先选择有固定公网 IPv4 的 1 vCPU / 512 MiB 或以上 Linux VPS；完整节点建议 2 Tokio workers，极小实例用 1。
+2. 安装完整版：按 §3 放置 `wgp-node` 与 `wgp-node.service`。将 `--advertise` 设置为固定公网 IPv4，并用 `--peers udp://<备用VPS>:11010`（或配置 `WGP_PEERS`）形成至少双入口。
+3. 云厂商安全组和主机防火墙都开放 UDP 11010、UDP 3478、TCP 3481；TCP 3481 不能替代 UDP DHT 房间读写。
+4. 执行 `systemctl enable --now wgp-node`，用另一条网络运行 `wgp-client --seed udp://<VPS_IP>:11010` 做连通实测，再查看目录是否互相发现。
+5. 备用 VPS 使用不同可用区/供应商；不要复制同一份 `node_identity.key`，身份必须独立且持久化。
+
+### 家庭宽带节点细分
+
+- **公网 IPv4 / 光猫桥接**：在路由器 DHCP 保留节点主机 LAN IP；映射 UDP 11010、UDP 3478、TCP 3481 到本机相同端口；配置 `WGP_ADVERTISE=<当前公网 IPv4>`、`WGP_PEERS=udp://<VPS_IP>:11010`；选用 hobby 版并设 `WGP_RUNTIME_WORKERS=1`。WAN 地址变化时按下一节更新宣告。
+- **双层 NAT**：光猫路由模式时，光猫与下游路由器都要映射；任一层没有管理权限或不支持映射，外部节点无法主动探测此节点。仍可运行 hobby 版作为出站发现客户端，但不要发布不可达地址。
+- **CGNAT / 无公网 IPv4**：端口映射无效，`--advertise` 不能填写私网或 CGNAT 地址并期待公网入站；不要做 UPnP/DMZ 暴露。节点可以作为出站客户端连 VPS seed，但目前不是可被其他节点直连的公共 seed。若运营商提供公网 IPv6，可在另行实现并验证 IPv6 广告前作为实验性目标，不要宣称当前 IPv4 DHT 路径已支持 IPv6。
+- **纯 Windows 家庭电脑**：运行 `server/deploy/hobby-windows/` 包，防火墙脚本需管理员运行；用任务计划程序创建“登录时启动”任务，程序指向 `wgp-node-hobby.exe`，起始目录设为包目录以固定身份文件位置。关机启动且无人登录的服务场景优先使用 Linux/systemd 或受控 Windows Service 包装器，不要依赖用户 Startup 文件夹。
+
+### 动态 IPv4 更新（systemd timer）
+
+程序只接受字面 IPv4，不能把 DDNS 域名直接写进 `WGP_ADVERTISE`。有公网地址的家宽可使用下面脚本定时查公网地址；地址变化时仅替换已存在的 `WGP_ADVERTISE` 行并重启节点。先确认公网 IP 查询服务可信且允许自动请求，再安装：
+
+仓库提供脚本与 systemd 单元模板；脚本会校验全球可路由 IPv4、使用文件锁防并发、仅地址变化时重启，并在重启失败时回滚环境文件。安装步骤：
+
+```bash
+sudo install -m 0755 server/deploy/wgp-refresh-advertise.sh /usr/local/libexec/wgp-refresh-advertise
+sudo install -m 0644 server/deploy/wgp-refresh-advertise.service /etc/systemd/system/
+sudo install -m 0644 server/deploy/wgp-refresh-advertise.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now wgp-refresh-advertise.timer
+sudo systemctl start wgp-refresh-advertise.service
+sudo systemctl list-timers wgp-refresh-advertise.timer
+sudo journalctl -u wgp-refresh-advertise.service -n 30 --no-pager
+```
+
+service 默认维护 `/etc/wgp-node/env` 并重启 `wgp-node-hobby`；完整版 VPS 不需要动态刷新。脚本依赖 `curl`、`python3`、`flock`。可在 service drop-in 覆盖 `WGP_IP_CHECK_URL` 使用自有可信地址回显服务。
+脚本不负责 DDNS 提供商 API、路由器端口映射、CGNAT 穿透或端口变化。端口外映射与本机端口必须一致；若更新配置失败，先恢复 `/etc/wgp-node/env` 备份并重启服务。不要把 seed 私钥复制给更新任务。
+
+### 客户端开机运行
+
+Linux 图形桌面可用用户 systemd unit；身份文件用绝对路径固定保存位置，命令中的房间码、口令请限制本地文件权限：
+
+```ini
+# ~/.config/systemd/user/wgp-client.service
+[Unit]
+Description=WGP room client
+After=network-online.target
+Wants=network-online.target
+[Service]
+Environment=WGP_RUNTIME_WORKERS=2
+Environment=WGP_SEED=udp://seed.example:11010
+ExecStart=/opt/wgp/wgp-client join U/替换为房间码 --identity %h/.local/share/wgp/client.key --forward 25565
+Restart=on-failure
+RestartSec=5
+[Install]
+WantedBy=default.target
+```
+
+```bash
+mkdir -p ~/.config/systemd/user ~/.local/share/wgp
+chmod 700 ~/.local/share/wgp
+systemctl --user daemon-reload
+systemctl --user enable --now wgp-client
+loginctl enable-linger "$USER"  # 仅需在无交互登录也要运行时开启
+```
+
+客户端是会话进程，不要作为 seed 节点运行；在 Windows 用任务计划程序配置开机触发、失败重启，并把 `wgp-client.key`/工作目录固定到用户数据目录。
+
+## 9. 运维要点
 
 - 升级 = `cargo build --release && cp` 覆盖二进制 + `systemctl restart`（无数据迁移，无状态）
 - 身份文件即服务器全部状态：备份 `node_identity.key`，丢失 = 节点身份重生成（被已入网路由表视为新节点，无害但不优雅）

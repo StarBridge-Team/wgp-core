@@ -1,0 +1,19 @@
+[package]
+name = "wgp-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "折跃门客户端 agent：持有 DHT 身份、socket、Engine 与 PortHub，经本机 IPC 接受 UI/CLI 控制"
+
+[[bin]]
+name = "wgp-agent"
+path = "src/main.rs"
+
+[dependencies]
+wgp-core = { path = "../../kernel/wgp-core" }
+wgp-dht = { path = "../../kernel/wgp-dht" }
+wgp-proto = { path = "../../kernel/wgp-proto" }
+wgp-port = { path = "../../bridge/wgp-port" }
+wgp-ipc = { path = "../../kernel/wgp-ipc" }
+rand_core = { workspace = true }
+tokio = { workspace = true }

@@ -13,11 +13,28 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io::Write;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 use wgp_core::{Engine, NodeConfig, NodeRole};
 use wgp_dht::{NodeIdentity, ObserverPolicy};
+use wgp_proto::{SeedEndpoint, SeedScheme};
+
+/// Tokio worker cap for mostly-I/O node runtimes. Set WGP_RUNTIME_WORKERS to override.
+pub fn runtime_worker_threads() -> usize {
+    runtime_worker_threads_for(
+        env::var("WGP_RUNTIME_WORKERS").ok().as_deref(),
+        std::thread::available_parallelism().map_or(2, |n| n.get()),
+    )
+}
+
+fn runtime_worker_threads_for(configured: Option<&str>, available: usize) -> usize {
+    configured
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|workers| (1..=64).contains(workers))
+        .unwrap_or_else(|| available.max(1).min(4))
+}
 
 /// 默认 DHT 信令 UDP 绑定地址
 pub const DEFAULT_BIND: &str = "0.0.0.0:11010";
@@ -31,6 +48,8 @@ pub const IDENTITY_FILE: &str = "node_identity.key";
 pub const DEFAULT_CONFIG_FILE: &str = "wgp-node.conf";
 /// 环境变量前缀
 pub const ENV_PREFIX: &str = "WGP_";
+/// 入网引导端点数上限（与内核的入口端点上限一致）
+pub const MAX_PEERS: usize = 16;
 
 // ————————————————————————————————————————————————————————————
 // 日志（零依赖；systemd/journald 负责采集，时间戳由采集端补全）
@@ -114,6 +133,9 @@ pub struct ServerOpts {
     pub tcp: Option<u16>,
     /// 贡献模式（家庭带宽）：拒绝 Forward 中转
     pub hobby: bool,
+    /// 身份证明兼容策略（17 §11.6）：true = 允许回退到旧 PING/PONG 学习。
+    /// 默认 false（严格）——旧协议只用于存活诊断，绝不写路由表/地址簿。
+    pub allow_legacy_identity: bool,
     /// 观察者每 IP 每窗口响应上限
     pub observer_rate_limit: u32,
     /// 观察者限频窗口（秒）
@@ -122,6 +144,10 @@ pub struct ServerOpts {
     pub identity_file: PathBuf,
     /// 日志级别
     pub log_level: LogLevel,
+    /// 对外宣告的公网 IPv4（None = 不宣告）
+    pub advertise: Option<Ipv4Addr>,
+    /// 入网引导端点（其他种子的 UDP 信令地址；域名在启动时解析）
+    pub peers: Vec<SeedEndpoint>,
 }
 
 impl ServerOpts {
@@ -198,7 +224,13 @@ fn parse_u64(key: &str, v: &str) -> Result<u64, String> {
         .map_err(|_| format!("{key} 需要无符号整数，得到：{v}"))
 }
 
-const BOOL_FLAGS: [&str; 4] = ["hobby", "no_hobby", "help", "version"];
+const BOOL_FLAGS: [&str; 5] = [
+    "hobby",
+    "no_hobby",
+    "allow_legacy_identity",
+    "help",
+    "version",
+];
 
 /// 把各来源合并为最终配置。纯函数，不读进程环境（便于测试）。
 pub fn resolve_opts(force_hobby: bool, input: &RawInput) -> Result<ServerOpts, String> {
@@ -211,6 +243,7 @@ pub fn resolve_opts(force_hobby: bool, input: &RawInput) -> Result<ServerOpts, S
         m.insert(k.clone(), v.clone());
     }
 
+    let mut cli_peers: Vec<String> = Vec::new();
     let mut it = input.argv.iter();
     while let Some(arg) = it.next() {
         if let Some(rest) = arg.strip_prefix("--") {
@@ -235,6 +268,11 @@ pub fn resolve_opts(force_hobby: bool, input: &RawInput) -> Result<ServerOpts, S
                 key = "hobby".to_string();
                 val = "false".to_string();
             }
+            if key == "peer" || key == "peers" {
+                // 可重复给出：命令行上的多次 --peers 累加（整体仍覆盖环境变量 / 配置文件）
+                cli_peers.push(val);
+                continue;
+            }
             m.insert(key, val);
         } else if let Some(short) = arg.strip_prefix('-') {
             match short {
@@ -251,6 +289,9 @@ pub fn resolve_opts(force_hobby: bool, input: &RawInput) -> Result<ServerOpts, S
             m.entry("bind".to_string()).or_insert_with(|| arg.clone());
         }
     }
+    if !cli_peers.is_empty() {
+        m.insert("peers".to_string(), cli_peers.join(","));
+    }
 
     let bind = m
         .get("bind")
@@ -258,7 +299,9 @@ pub fn resolve_opts(force_hobby: bool, input: &RawInput) -> Result<ServerOpts, S
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| DEFAULT_BIND.to_string());
     if bind.parse::<std::net::SocketAddr>().is_err() {
-        return Err(format!("bind 非法（应为 IP:端口，如 {DEFAULT_BIND}）：{bind}"));
+        return Err(format!(
+            "bind 非法（应为 IP:端口，如 {DEFAULT_BIND}）：{bind}"
+        ));
     }
 
     let stun = match m.get("stun") {
@@ -277,6 +320,12 @@ pub fn resolve_opts(force_hobby: bool, input: &RawInput) -> Result<ServerOpts, S
             Some(v) => parse_bool("hobby", v)?,
             None => false,
         }
+    };
+
+    // 身份证明兼容策略（17 §11.6）：默认严格，旧 PING/PONG 只用于存活诊断
+    let allow_legacy_identity = match m.get("allow_legacy_identity") {
+        Some(v) => parse_bool("allow_legacy_identity", v)?,
+        None => false,
     };
 
     let observer_rate_limit = match m.get("observer_rate_limit") {
@@ -306,15 +355,57 @@ pub fn resolve_opts(force_hobby: bool, input: &RawInput) -> Result<ServerOpts, S
         None => LogLevel::Info,
     };
 
+    let advertise = match m.get("advertise").map(|v| v.trim()) {
+        None | Some("") => None,
+        Some(v) if matches!(v.to_ascii_lowercase().as_str(), "none" | "off") => None,
+        Some(v) => {
+            let ip = v.parse::<Ipv4Addr>().map_err(|_| {
+                format!(
+                    "advertise 非法（应为本节点的公网 IPv4 地址，如 203.0.113.7；不支持域名）：{v}"
+                )
+            })?;
+            if ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() {
+                return Err(format!("advertise 不能是 {ip}：别的节点无法用它连到本节点"));
+            }
+            Some(ip)
+        }
+    };
+
+    let peers = match m.get("peers") {
+        Some(v) => {
+            let (peers, bad) = SeedEndpoint::parse_list(v);
+            if let Some(b) = bad.first() {
+                return Err(format!("peers 含非法端点（应为 udp://主机:端口）：{b}"));
+            }
+            if let Some(tcp) = peers.iter().find(|ep| ep.scheme != SeedScheme::Udp) {
+                return Err(format!(
+                    "peers 只支持 UDP 端点（种子之间走 UDP 信令）：{}",
+                    tcp.display()
+                ));
+            }
+            if peers.len() > MAX_PEERS {
+                return Err(format!(
+                    "peers 最多 {MAX_PEERS} 个，得到 {} 个",
+                    peers.len()
+                ));
+            }
+            peers
+        }
+        None => Vec::new(),
+    };
+
     Ok(ServerOpts {
         bind,
         stun,
         tcp,
         hobby,
+        allow_legacy_identity,
         observer_rate_limit,
         observer_rate_window_secs,
         identity_file,
         log_level,
+        advertise,
+        peers,
     })
 }
 
@@ -338,16 +429,19 @@ fn find_config_path(argv: &[String]) -> Option<PathBuf> {
 }
 
 fn collect_env() -> Vec<(String, String)> {
-    const KEYS: [&str; 9] = [
+    const KEYS: [&str; 12] = [
         "BIND",
         "STUN",
         "TCP",
         "HOBBY",
+        "ALLOW_LEGACY_IDENTITY",
         "OBSERVER_RATE_LIMIT",
         "OBSERVER_RATE_WINDOW",
         "IDENTITY",
         "LOG_LEVEL",
         "CONFIG",
+        "ADVERTISE",
+        "PEERS",
     ];
     KEYS.iter()
         .filter_map(|k| {
@@ -397,6 +491,10 @@ pub fn usage(profile: &str) -> String {
   --stun <port|none>                 观察者/STUN 端口（默认 {DEFAULT_STUN_PORT}；none 关闭）\n\
   --tcp <port|none>                  TCP 信令兜底端口（默认 {DEFAULT_TCP_PORT}；none 关闭）\n\
   --hobby / --no-hobby               贡献模式：拒绝 Forward 中转（PCDN 防护）\n\
+  --allow-legacy-identity            兼容旧节点：身份证明失败时回退到旧 PING/PONG 学习\n\
+                                     （默认关闭；严格模式只把旧协议用于存活诊断）\n\
+  --advertise <ipv4|none>            对外宣告的公网 IPv4（默认不宣告）：宣告后其他节点与客户端可自动发现本节点\n\
+  --peers <list>                     入网引导：其他种子的 udp://主机:端口，逗号分隔，可重复给出\n\
   --observer-rate-limit <n>          观察者每 IP 每窗口响应上限（默认 {limit}）\n\
   --observer-rate-window <secs>      观察者限频窗口秒数（默认 {window}）\n\
   --identity <path>                  节点身份文件（默认 {IDENTITY_FILE}）\n\
@@ -405,8 +503,10 @@ pub fn usage(profile: &str) -> String {
   -h, --help                         显示本帮助\n\
   -V, --version                      显示版本\n\n\
 环境变量：WGP_BIND / WGP_STUN / WGP_TCP / WGP_HOBBY /\n\
+          WGP_ALLOW_LEGACY_IDENTITY /\n\
           WGP_OBSERVER_RATE_LIMIT / WGP_OBSERVER_RATE_WINDOW /\n\
-          WGP_IDENTITY / WGP_LOG_LEVEL / WGP_CONFIG\n\
+          WGP_IDENTITY / WGP_LOG_LEVEL / WGP_CONFIG /\n\
+          WGP_ADVERTISE / WGP_PEERS\n\
 优先级：命令行 > 环境变量 > 配置文件 > 默认值",
         limit = wgp_dht::OBSERVER_RATE_LIMIT,
         window = wgp_dht::OBSERVER_RATE_WINDOW.as_secs(),
@@ -462,6 +562,61 @@ fn persist_identity(path: &Path, seed: &[u8; 32]) -> Result<(), String> {
     Ok(())
 }
 
+/// 广告纪元文件：与身份文件同目录、同名，扩展名为 .epoch（如 node_identity.epoch）
+pub fn epoch_file_for(identity_file: &Path) -> PathBuf {
+    identity_file.with_extension("epoch")
+}
+
+/// 取本次启动的广告纪元并落盘（17 §5）。
+///
+/// 别的节点只采纳纪元更大的广告（挡重放），所以同一身份每次启动都要比上次大。项目禁读系统
+/// 时钟（H5），这里用「启动计数」代替时间：文件里存上次的计数（十进制文本），本次 +1；
+/// 纪元 = 启动计数 << 32，低 32 位留给进程内的广告修订。
+///
+/// 返回 (纪元, 可选的告警)。读不出或写不进都不阻止启动——后果只是已经认识本节点的人在一段时间内
+/// 沿用旧广告，而不是节点不可用。
+pub fn next_advertise_epoch(path: &Path) -> (u64, Option<String>) {
+    let mut warning = None;
+    let previous: u32 = match fs::read_to_string(path) {
+        Ok(text) => text.trim().parse::<u32>().unwrap_or_else(|_| {
+            warning = Some(format!(
+                "广告纪元文件 {} 内容无法识别，已从头计数；其他节点可能在一段时间内沿用本节点的旧广告",
+                path.display()
+            ));
+            0
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(e) => {
+            warning = Some(format!(
+                "读取广告纪元文件 {} 失败（{e}），已从头计数",
+                path.display()
+            ));
+            0
+        }
+    };
+    let boot = previous.saturating_add(1);
+
+    let tmp = path.with_extension("epoch.tmp");
+    let persisted = fs::write(&tmp, format!("{boot}\n")).and_then(|_| fs::rename(&tmp, path));
+    if let Err(e) = persisted {
+        let _ = fs::remove_file(&tmp);
+        warning = Some(format!(
+            "广告纪元无法写入 {}（{e}）：下次重启后，其他节点可能在一段时间内沿用本节点的旧广告",
+            path.display()
+        ));
+    }
+    (u64::from(boot) << 32, warning)
+}
+
+/// 解析一个引导端点（域名先经 IDN 归一化；只取 IPv4）
+async fn resolve_peer(ep: &SeedEndpoint) -> Option<SocketAddr> {
+    let host = ep.host_ascii();
+    let mut addrs = tokio::net::lookup_host((host.as_str(), ep.port))
+        .await
+        .ok()?;
+    addrs.find(|a| a.is_ipv4())
+}
+
 // ————————————————————————————————————————————————————————————
 // 运行
 // ————————————————————————————————————————————————————————————
@@ -497,7 +652,10 @@ async fn wait_for_shutdown() {
 pub async fn run(profile: &str, force_hobby: bool) {
     let argv: Vec<String> = env::args().skip(1).collect();
 
-    if argv.iter().any(|a| a == "-h" || a == "--help" || a == "help") {
+    if argv
+        .iter()
+        .any(|a| a == "-h" || a == "--help" || a == "help")
+    {
         println!("{}", usage(profile));
         return;
     }
@@ -529,13 +687,40 @@ pub async fn run(profile: &str, force_hobby: bool) {
     log_info(format!(
         "{profile} 启动中 | bind={} | stun={} | tcp={} | 模式={} | 观察者限频={}/{}s | 身份={}",
         opts.bind,
-        opts.stun.map(|p| p.to_string()).unwrap_or_else(|| "off".into()),
-        opts.tcp.map(|p| p.to_string()).unwrap_or_else(|| "off".into()),
-        if opts.hobby { "贡献(PCDN防护)" } else { "完整" },
+        opts.stun
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "off".into()),
+        opts.tcp
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "off".into()),
+        if opts.hobby {
+            "贡献(PCDN防护)"
+        } else {
+            "完整"
+        },
         opts.observer_rate_limit,
         opts.observer_rate_window_secs,
         opts.identity_file.display(),
     ));
+
+    // 入网引导端点：解析不了的跳过并告警（对端的域名暂时解析不出，不该拦住本节点启动）
+    let mut peers: Vec<SocketAddr> = Vec::new();
+    for ep in &opts.peers {
+        match resolve_peer(ep).await {
+            Some(addr) => peers.push(addr),
+            None => log_warn(format!("引导端点 {} 无法解析，已跳过", ep.display())),
+        }
+    }
+    let advertise_epoch = match opts.advertise {
+        Some(_) => {
+            let (epoch, warning) = next_advertise_epoch(&epoch_file_for(&opts.identity_file));
+            if let Some(w) = warning {
+                log_warn(w);
+            }
+            epoch
+        }
+        None => 0,
+    };
 
     let (engine, _events) = Engine::new();
     let cfg = NodeConfig {
@@ -545,6 +730,10 @@ pub async fn run(profile: &str, force_hobby: bool) {
         tcp_signal: opts.tcp,
         hobby: opts.hobby,
         observer_policy: opts.observer_policy(),
+        advertise: opts.advertise,
+        advertise_epoch,
+        peers: peers.clone(),
+        allow_legacy_identity: opts.allow_legacy_identity,
     };
 
     // 四职中的网络面：DHT（含承诺转发兜底）+ 观察者（STUN）+ TCP 信令兜底
@@ -591,6 +780,54 @@ pub async fn run(profile: &str, force_hobby: bool) {
         "{profile} 已就绪（种子+观察者+承诺兜底）| node_id={:02x?} | {dht_text} | {stun_text} | {tcp_text} | {relay_text}",
         &node_id.0[..4]
     ));
+    match opts.advertise {
+        Some(ip) => {
+            log_info(format!(
+                "对外宣告 {ip}（第 {} 次启动；{}）：其他节点与客户端可自动发现本节点",
+                advertise_epoch >> 32,
+                if opts.hobby {
+                    "声明不中转"
+                } else {
+                    "声明可中转"
+                },
+            ));
+            if ip.is_loopback() || ip.is_private() || ip.is_link_local() {
+                log_warn(format!(
+                    "宣告地址 {ip} 不是公网地址：只有本机 / 同一局域网内的节点能据此连到本节点"
+                ));
+            }
+        }
+        None => log_info("未配置 --advertise：本节点不对外宣告，只能靠手工填写地址找到"),
+    }
+    if !peers.is_empty() {
+        let list: Vec<String> = peers.iter().map(|a| a.to_string()).collect();
+        log_info(format!("入网引导端点：{}", list.join(", ")));
+    }
+
+    // 种子目录有变化就记一笔（运维可见性：谁被发现了、谁失联了）
+    if let Some(dht) = node.dht.clone() {
+        tokio::spawn(async move {
+            let mut changes = dht.watch_seeds();
+            let mut logged: Vec<String> = Vec::new();
+            loop {
+                // 先读后等：订阅之前已经发生的变化也不会漏；只在成员确实变了时才记
+                let mut list: Vec<String> = dht
+                    .seeds()
+                    .await
+                    .iter()
+                    .map(|s| format!("{}{}", s.addr, if s.relays() { "" } else { "(不中转)" }))
+                    .collect();
+                list.sort();
+                if list != logged {
+                    log_info(format!("种子目录：{} 个 [{}]", list.len(), list.join(", ")));
+                    logged = list;
+                }
+                if changes.changed().await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
 
     wait_for_shutdown().await;
     log_info(format!("{profile} 收到退出信号，关闭中。"));
@@ -600,10 +837,26 @@ pub async fn run(profile: &str, force_hobby: bool) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn runtime_worker_count_is_capped_and_configurable() {
+        assert_eq!(runtime_worker_threads_for(None, 1), 1);
+        assert_eq!(runtime_worker_threads_for(None, 32), 4);
+        assert_eq!(runtime_worker_threads_for(Some("2"), 32), 2);
+        assert_eq!(runtime_worker_threads_for(Some("64"), 4), 64);
+        assert_eq!(runtime_worker_threads_for(Some("0"), 8), 4);
+        assert_eq!(runtime_worker_threads_for(Some("oops"), 8), 4);
+    }
+
     fn raw(file: &[(&str, &str)], env: &[(&str, &str)], argv: &[&str]) -> RawInput {
         RawInput {
-            file: file.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
-            env: env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            file: file
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            env: env
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
             argv: argv.iter().map(|s| s.to_string()).collect(),
         }
     }
@@ -641,7 +894,11 @@ mod tests {
     fn flag_equals_form_and_none_ports() {
         let o = resolve_opts(
             false,
-            &raw(&[], &[], &["--bind=0.0.0.0:12000", "--stun=none", "--tcp", "off"]),
+            &raw(
+                &[],
+                &[],
+                &["--bind=0.0.0.0:12000", "--stun=none", "--tcp", "off"],
+            ),
         )
         .unwrap();
         assert_eq!(o.bind, "0.0.0.0:12000");
@@ -651,10 +908,22 @@ mod tests {
 
     #[test]
     fn hobby_flag_and_force_hobby() {
-        assert!(resolve_opts(false, &raw(&[], &[], &["--hobby"])).unwrap().hobby);
-        assert!(!resolve_opts(false, &raw(&[], &[], &["--no-hobby"])).unwrap().hobby);
+        assert!(
+            resolve_opts(false, &raw(&[], &[], &["--hobby"]))
+                .unwrap()
+                .hobby
+        );
+        assert!(
+            !resolve_opts(false, &raw(&[], &[], &["--no-hobby"]))
+                .unwrap()
+                .hobby
+        );
         // force_hobby（家庭宽带版）恒为真，且不被 --no-hobby 覆盖
-        assert!(resolve_opts(true, &raw(&[], &[], &["--no-hobby"])).unwrap().hobby);
+        assert!(
+            resolve_opts(true, &raw(&[], &[], &["--no-hobby"]))
+                .unwrap()
+                .hobby
+        );
         assert!(resolve_opts(true, &raw(&[], &[], &[])).unwrap().hobby);
     }
 
@@ -682,7 +951,11 @@ mod tests {
     fn observer_policy_is_injected() {
         let o = resolve_opts(
             false,
-            &raw(&[], &[], &["--observer-rate-limit", "30", "--observer-rate-window", "5"]),
+            &raw(
+                &[],
+                &[],
+                &["--observer-rate-limit", "30", "--observer-rate-window", "5"],
+            ),
         )
         .unwrap();
         let p = o.observer_policy();
@@ -742,6 +1015,115 @@ mod tests {
             load_or_create_identity(&path).is_err(),
             "长度非法必须拒绝启动"
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn advertise_and_peers_default_to_off() {
+        let o = resolve_opts(false, &raw(&[], &[], &[])).unwrap();
+        assert_eq!(o.advertise, None);
+        assert!(o.peers.is_empty());
+    }
+
+    #[test]
+    fn advertise_is_parsed_and_validated() {
+        let o = resolve_opts(false, &raw(&[], &[], &["--advertise", "203.0.113.7"])).unwrap();
+        assert_eq!(o.advertise, Some(Ipv4Addr::new(203, 0, 113, 7)));
+        // 关闭写法：命令行的 none 覆盖配置文件里的地址
+        let o = resolve_opts(
+            false,
+            &raw(&[("advertise", "203.0.113.7")], &[], &["--advertise=none"]),
+        )
+        .unwrap();
+        assert_eq!(o.advertise, None);
+        // 域名、越界、不可用地址：启动即报错，而不是带着一个谁也连不上的地址去宣告
+        for bad in [
+            "seed.example.com",
+            "999.1.1.1",
+            "0.0.0.0",
+            "255.255.255.255",
+            "224.0.0.1",
+        ] {
+            let e = resolve_opts(false, &raw(&[], &[], &["--advertise", bad])).unwrap_err();
+            assert!(e.contains("advertise"), "{bad}: {e}");
+        }
+    }
+
+    #[test]
+    fn peers_accumulate_on_cli_and_override_lower_layers() {
+        // 配置文件 / 环境变量：单个值内用逗号分隔
+        let o = resolve_opts(
+            false,
+            &raw(
+                &[("peers", "udp://a.example:11010, b.example:11011")],
+                &[],
+                &[],
+            ),
+        )
+        .unwrap();
+        let shown: Vec<String> = o.peers.iter().map(|p| p.display()).collect();
+        assert_eq!(
+            shown,
+            vec!["udp://a.example:11010", "udp://b.example:11011"]
+        );
+
+        // 命令行：--peers / --peer 可重复给出并累加；整体覆盖环境变量与配置文件
+        let o = resolve_opts(
+            false,
+            &raw(
+                &[("peers", "udp://file.example:1")],
+                &[("peers", "udp://env.example:2")],
+                &["--peers", "udp://x.example:3", "--peer=198.51.100.4:4"],
+            ),
+        )
+        .unwrap();
+        let shown: Vec<String> = o.peers.iter().map(|p| p.display()).collect();
+        assert_eq!(shown, vec!["udp://x.example:3", "udp://198.51.100.4:4"]);
+    }
+
+    #[test]
+    fn bad_peers_are_rejected() {
+        let err = |v: &str| resolve_opts(false, &raw(&[], &[], &["--peers", v])).unwrap_err();
+        assert!(err("http://x.example:1").contains("非法端点"));
+        assert!(err("udp://x.example").contains("非法端点"), "缺端口");
+        assert!(
+            err("tcp://x.example:3481").contains("UDP"),
+            "种子间信令只走 UDP"
+        );
+        let many: Vec<String> = (0..=MAX_PEERS)
+            .map(|i| format!("udp://198.51.100.1:{}", 1000 + i))
+            .collect();
+        assert!(err(&many.join(",")).contains("最多"));
+    }
+
+    #[test]
+    fn advertise_epoch_strictly_increases_across_restarts() {
+        let dir = std::env::temp_dir().join(format!("wgp-node-epoch-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = epoch_file_for(&dir.join("node_identity.key"));
+        assert_eq!(path.file_name().unwrap(), "node_identity.epoch");
+
+        // 连续三次「启动」：纪元严格递增，且低 32 位留空
+        let (first, w1) = next_advertise_epoch(&path);
+        let (second, w2) = next_advertise_epoch(&path);
+        let (third, w3) = next_advertise_epoch(&path);
+        assert!(w1.is_none() && w2.is_none() && w3.is_none());
+        assert_eq!((first >> 32, second >> 32, third >> 32), (1, 2, 3));
+        assert_eq!(first & 0xFFFF_FFFF, 0);
+        assert_eq!(fs::read_to_string(&path).unwrap().trim(), "3");
+
+        // 文件损坏：给出告警并从头计数，不阻止启动
+        fs::write(&path, "not-a-number").unwrap();
+        let (reset, warning) = next_advertise_epoch(&path);
+        assert_eq!(reset >> 32, 1);
+        assert!(warning.unwrap().contains("无法识别"));
+
+        // 写不进去（目录不存在）：仍返回可用的纪元，并告警
+        let (epoch, warning) = next_advertise_epoch(&dir.join("missing").join("x.epoch"));
+        assert_eq!(epoch >> 32, 1);
+        assert!(warning.unwrap().contains("无法写入"));
 
         let _ = fs::remove_dir_all(&dir);
     }

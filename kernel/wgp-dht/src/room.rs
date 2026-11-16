@@ -20,7 +20,9 @@ pub fn room_key(room_code: &str) -> [u8; 32] {
 pub struct Lease {
     pub epoch: u64,
     pub anchor: NodeId,
-    /// 租约到期时刻（Instant 单调时基的毫秒数，由网络时间锚点换算）
+    /// 租约到期时刻：**锚点进程**单调时钟的毫秒读数。
+    /// 不同进程的单调时基互不可比，成员不能拿它和自己的时钟比大小——对成员而言它只是
+    /// 一个「每次续期都会变」的值，掉线判定见 [`LeaseWatch`]。
     pub expires_at_ms: u64,
 }
 
@@ -38,13 +40,49 @@ impl Lease {
         self.expires_at_ms = now_ms + LEASE_TIMEOUT_S * 1000;
     }
 
-    /// 成员视角：租约是否已过期（连续判过期即触发继位链抢占）
+    /// 租约是否已过期。`now_ms` 必须与写入 `expires_at_ms` 的是同一个时基（即锚点自己，
+    /// 或共用注入时钟的测试）；跨进程的成员侧判定不要用它，用 [`LeaseWatch`]。
     pub fn expired(&self, now_ms: u64) -> bool {
         now_ms >= self.expires_at_ms
     }
 
     pub fn interval_s(&self) -> u64 {
         LEASE_INTERVAL_S
+    }
+}
+
+/// 成员侧的租约观测器。
+///
+/// 租约里的到期时刻是锚点进程单调时钟的读数（内核禁读系统时钟，H5），而不同进程的单调时基
+/// 互不可比：成员进程比锚点老，会把健康的租约判成早已过期；比锚点新，则锚点死了很久都判不出来。
+/// 成员能可靠观测的只有一件事——**租约在本地时钟下已经多久没变过**。锚点每 LEASE_INTERVAL_S
+/// 续期一次（到期时刻随之改变），超过 LEASE_TIMEOUT_S 没变即视为掉线。
+#[derive(Debug, Default)]
+pub struct LeaseWatch {
+    /// (最近一次看到的租约, 本地首次看到它的时刻)
+    last: Option<(Lease, u64)>,
+}
+
+impl LeaseWatch {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 喂入刚读到的租约，返回它在本地已保持不变的毫秒数（首次看到或刚发生变化时为 0）。
+    /// `now_ms` 取本地单调时钟。
+    pub fn observe(&mut self, lease: &Lease, now_ms: u64) -> u64 {
+        match &self.last {
+            Some((seen, since)) if seen == lease => now_ms.saturating_sub(*since),
+            _ => {
+                self.last = Some((lease.clone(), now_ms));
+                0
+            }
+        }
+    }
+
+    /// 不变时长是否已达掉线判定阈值
+    pub fn is_stale(unchanged_ms: u64) -> bool {
+        unchanged_ms >= LEASE_TIMEOUT_S * 1000
     }
 }
 
@@ -213,6 +251,42 @@ mod tests {
         assert!(lease.expired(1000 + LEASE_TIMEOUT_S * 1000));
         lease.renew(2000);
         assert!(!lease.expired(2000 + LEASE_TIMEOUT_S * 1000 - 1));
+    }
+
+    #[test]
+    fn lease_watch_measures_local_silence_not_remote_clock() {
+        let timeout = LEASE_TIMEOUT_S * 1000;
+        let mut watch = LeaseWatch::new();
+
+        // 锚点进程刚启动：它写下的到期时刻很小；成员进程已运行一小时（本地时钟 3_600_000）。
+        // 拿两者直接比大小会得出「早已过期」，观测器只看本地流逝：刚看到 = 0
+        let young_anchor = Lease::new(0, anchor(1), 5_000);
+        assert!(young_anchor.expired(3_600_000), "跨时基直接比较的确会误判——所以不能用");
+        assert_eq!(watch.observe(&young_anchor, 3_600_000), 0);
+        assert_eq!(watch.observe(&young_anchor, 3_600_000 + 40_000), 40_000);
+        assert!(!LeaseWatch::is_stale(40_000));
+
+        // 锚点续期（到期时刻变了）：计时归零
+        let mut renewed = young_anchor.clone();
+        renewed.renew(35_000);
+        assert_eq!(watch.observe(&renewed, 3_600_000 + 41_000), 0);
+
+        // 此后锚点沉默：本地满 LEASE_TIMEOUT_S 才判掉线
+        let silent_for = watch.observe(&renewed, 3_600_000 + 41_000 + timeout - 1);
+        assert!(!LeaseWatch::is_stale(silent_for));
+        let silent_for = watch.observe(&renewed, 3_600_000 + 41_000 + timeout);
+        assert!(LeaseWatch::is_stale(silent_for));
+
+        // 反方向：锚点进程很老（到期时刻极大），成员很新——同样只看本地沉默时长
+        let mut watch = LeaseWatch::new();
+        let old_anchor = Lease::new(3, anchor(2), 86_400_000);
+        assert!(!old_anchor.expired(timeout * 10), "直接比较则永远判不出掉线");
+        assert_eq!(watch.observe(&old_anchor, 1_000), 0);
+        assert!(LeaseWatch::is_stale(watch.observe(&old_anchor, 1_000 + timeout)));
+
+        // 换锚点（epoch+1）也是变化
+        let taken_over = Lease::new(4, anchor(3), 0);
+        assert_eq!(watch.observe(&taken_over, 1_000 + timeout + 5), 0);
     }
 
     #[test]

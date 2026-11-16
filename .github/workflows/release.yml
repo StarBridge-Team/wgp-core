@@ -1,0 +1,285 @@
+# 发版：推送 v* 标签时，为 8 个目标构建 → 验证 → 打包，并发布为 GitHub Release。
+# 不发布的演练（只构建和验证，产物挂在该次运行上）：
+#   - 在 Actions 页面手动触发（workflow_dispatch）；
+#   - 改到发版流程本身（本文件、构建配置、端到端脚本）的 PR 会自动跑一遍，免得打标签时才发现坏了。
+#
+# 发一个版本：
+#   git tag v0.1.0-preview.1 && git push origin v0.1.0-preview.1
+#
+# 目标矩阵：Windows（x86_64 / i686 / ARM64）与 Linux（x86_64 / i686 / ARM64 / ARMv7 / 龙架构 64）。
+# 龙架构 32 位与 Windows 32 位 ARM 没有带标准库的 Rust 目标，编不了。
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+    paths:
+      - '.github/workflows/release.yml'
+      - '.cargo/config.toml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'scripts/e2e-local.ps1'
+      - 'scripts/e2e-local.sh'
+      - 'scripts/package-readme.md'
+  workflow_dispatch:
+
+# 同一个 PR 的新推送顶掉旧的演练；标签发版不取消
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  # 发布产物去掉符号表
+  CARGO_PROFILE_RELEASE_STRIP: symbols
+  # 项目仍处于预览阶段：所有发布一律标记为 pre-release。转正时改成 'false'（并同步修改发布说明）
+  PRERELEASE: 'true'
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # verify：e2e  = 构建机上原生运行，打包前跑回环端到端
+          #         qemu = 经 QEMU 用户态仿真运行，跑同一套回环端到端
+          #         none = 构建机上无法运行，只编译
+          # 改动这一列时，请同步修改下面 publish 里的发布说明
+          - { target: x86_64-pc-windows-msvc, os: windows-latest, verify: e2e }
+          - { target: i686-pc-windows-msvc, os: windows-latest, verify: e2e }
+          - { target: aarch64-pc-windows-msvc, os: windows-latest, verify: none }
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest, verify: e2e }
+          - { target: i686-unknown-linux-musl, os: ubuntu-latest, verify: e2e }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-latest, verify: qemu }
+          - { target: armv7-unknown-linux-musleabihf, os: ubuntu-latest, verify: qemu }
+          - { target: loongarch64-unknown-linux-musl, os: ubuntu-latest, verify: qemu }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+          rustc --version
+
+      - name: Package label
+        id: label
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="dev-${GITHUB_SHA::7}"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "name=wgp-$version-${{ matrix.target }}" >> "$GITHUB_OUTPUT"
+
+      # Linux 一律 musl 静态链接（不依赖发行版的 glibc 版本），用 Zig 作为交叉链接器（cargo-zigbuild）：
+      # 它自带 musl/compiler-rt，不需要各架构的 gcc 工具链，也不再依赖 rust-lld 自行拼 CRT。
+      # 回显工具只用于下面的端到端验证，不进包。
+      - name: Zig linker toolchain (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          # cargo-zigbuild 与 ziglang 都在 PyPI；ziglang 的入口脚本叫 python-zig，这里补一个 zig 包装。
+          # 用 venv 是为了避开 PEP 668（24.04 起系统 Python 不允许直接把包装进 site-packages）。
+          python3 -m venv "$HOME/zigvenv"
+          "$HOME/zigvenv/bin/pip" install --quiet --upgrade pip
+          "$HOME/zigvenv/bin/pip" install --quiet ziglang cargo-zigbuild
+          mkdir -p "$HOME/.local/bin"
+          printf '#!/usr/bin/env bash\nexec "%s/zigvenv/bin/python" -m ziglang "$@"\n' "$HOME" > "$HOME/.local/bin/zig"
+          chmod +x "$HOME/.local/bin/zig"
+          # cargo 只在 PATH 里找 `cargo-zigbuild` 子命令：venv 的 bin 目录也必须进 PATH
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "$HOME/zigvenv/bin" >> "$GITHUB_PATH"
+          # 本步骤内也要能用到（GITHUB_PATH 只影响后续步骤）
+          export PATH="$HOME/.local/bin:$HOME/zigvenv/bin:$PATH"
+          zig version
+          cargo zigbuild --help > /dev/null
+
+      - name: Build
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            cargo zigbuild --release --locked --bins --target ${{ matrix.target }}
+            cargo zigbuild --release --locked --target ${{ matrix.target }} -p wgp-port --example echo_tool
+          else
+            cargo build --release --locked --bins --target ${{ matrix.target }}
+            cargo build --release --locked --target ${{ matrix.target }} -p wgp-port --example echo_tool
+          fi
+
+      - name: QEMU user-mode emulation
+        if: matrix.verify == 'qemu'
+        run: |
+          sudo apt-get update -q
+          # 24.04 及更早：qemu-user-static 直接可装；26.04 起它变成虚包，
+          # 实际提供者是 qemu-user-binfmt（Debian/Ubuntu 把静态二进制与 binfmt 注册拆开了）
+          sudo apt-get install -y -q qemu-user-static || sudo apt-get install -y -q qemu-user-binfmt
+          # 各架构的执行处理器由软件包带来的 binfmt 配置注册；装包时一般已自动完成，这里再确保一次
+          sudo systemctl restart systemd-binfmt || true
+          ls /proc/sys/fs/binfmt_misc/ | grep -E '^qemu-(aarch64|arm|loongarch64)$'
+
+      # Windows 产物静态链接 C 运行时（.cargo/config.toml）：没装 VC++ 运行库的机器上也要能直接跑。
+      # 这是静态检查，构建机上跑不了的 ARM64 产物也一并检查。
+      - name: No VC++ runtime dependency (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $dir = "target\${{ matrix.target }}\release"
+          foreach ($exe in 'wgp-client.exe', 'wgp-node.exe', 'wgp-node-hobby.exe', 'wgp-agent.exe') {
+            $image = [Text.Encoding]::GetEncoding(28591).GetString([IO.File]::ReadAllBytes("$dir\$exe"))
+            if ($image -match '(?i)vcruntime\d+\.dll') { throw "$exe depends on the VC++ runtime (a static CRT is expected)" }
+            Write-Host "$exe has no VC++ runtime dependency"
+          }
+
+      # —— 验证：版本输出 + 13 文档的房间码标准向量，再跑回环端到端（双种子发现模式）——
+      - name: Smoke test (Windows)
+        if: runner.os == 'Windows' && matrix.verify != 'none'
+        shell: powershell
+        run: |
+          $dir = "target\${{ matrix.target }}\release"
+          foreach ($exe in 'wgp-client.exe', 'wgp-node.exe', 'wgp-node-hobby.exe', 'wgp-agent.exe') {
+            & "$dir\$exe" --version
+            if ($LASTEXITCODE -ne 0) { throw "$exe --version failed" }
+          }
+          $room = -join ([char[]](0x793A, 0x4F8B, 0x623F, 0x95F4))
+          $code = & "$dir\wgp-client.exe" code $room 123456
+          if ("$code".Trim() -ne 'U/C2G9-GYET-311W-R636') { throw "room-code vector mismatch: $code" }
+          Write-Host "room-code vector ok: $code"
+
+      - name: End-to-end with the release binaries (Windows)
+        if: runner.os == 'Windows' && matrix.verify != 'none'
+        shell: powershell
+        run: |
+          & .\scripts\e2e-local.ps1 -BinDir "target\${{ matrix.target }}\release" -Discovery
+          exit $LASTEXITCODE
+
+      - name: Smoke test (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          dir="target/${{ matrix.target }}/release"
+          file "$dir/wgp-node"
+          for exe in wgp-client wgp-node wgp-node-hobby wgp-agent; do "$dir/$exe" --version; done
+          code="$("$dir/wgp-client" code 示例房间 123456)"
+          [ "$code" = "U/C2G9-GYET-311W-R636" ] || { echo "room-code vector mismatch: $code"; exit 1; }
+          echo "room-code vector ok: $code"
+
+      - name: End-to-end with the release binaries (Linux)
+        if: runner.os == 'Linux'
+        run: bash scripts/e2e-local.sh "target/${{ matrix.target }}/release" --discovery
+
+      - name: Package
+        shell: bash
+        run: |
+          name="${{ steps.label.outputs.name }}"
+          dir="target/${{ matrix.target }}/release"
+          ext=""
+          [ "$RUNNER_OS" = Windows ] && ext=".exe"
+          mkdir -p "dist/$name"
+          for exe in wgp-client wgp-node wgp-node-hobby wgp-agent; do
+            cp "$dir/$exe$ext" "dist/$name/"
+          done
+          cp LICENSE "dist/$name/"
+          cp scripts/package-readme.md "dist/$name/README.md"
+          {
+            echo "package : $name"
+            echo "version : ${{ steps.label.outputs.version }}"
+            echo "commit  : $GITHUB_SHA"
+            echo "target  : ${{ matrix.target }}"
+            echo "rustc   : $(rustc --version)"
+            echo "profile : release (lto, codegen-units=1, stripped), statically linked C runtime, built with --locked"
+            echo "verified: ${{ matrix.verify }} (e2e = native loopback end-to-end, qemu = same under QEMU user-mode emulation, none = build only)"
+          } > "dist/$name/BUILD-INFO.txt"
+          cd dist
+          if [ "$RUNNER_OS" = Windows ]; then
+            7z a -tzip "$name.zip" "$name" > /dev/null
+            sha256sum "$name.zip" > "$name.zip.sha256"
+          else
+            tar -czf "$name.tar.gz" "$name"
+            sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          fi
+          # 每个目标产出的校验值单独存一份：不发布标签的演练（workflow_dispatch / PR）
+          # 也能核对「打包 + checksum」这一步，而不是等到 publish 才第一次算
+          cat ./*.sha256
+          ls -l
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.label.outputs.name }}
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+  publish:
+    name: publish GitHub release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums and release notes
+        run: |
+          cd dist
+          sha256sum wgp-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          cat > ../notes.md <<'EOF'
+          > **预览版**：全流程只在回环（loopback）上验证过，尚未做过真实 NAT 下的双端联调。请当作试用版使用。
+
+          ## 下载哪个
+
+          | 系统 | 架构 | 文件名结尾 |
+          |---|---|---|
+          | Windows | x86 64 位 | `x86_64-pc-windows-msvc.zip` |
+          | Windows | x86 32 位 | `i686-pc-windows-msvc.zip` |
+          | Windows | ARM64 | `aarch64-pc-windows-msvc.zip` |
+          | Linux | x86 64 位 | `x86_64-unknown-linux-musl.tar.gz` |
+          | Linux | x86 32 位 | `i686-unknown-linux-musl.tar.gz` |
+          | Linux | ARM64 | `aarch64-unknown-linux-musl.tar.gz` |
+          | Linux | ARM 32 位（ARMv7 硬浮点） | `armv7-unknown-linux-musleabihf.tar.gz` |
+          | Linux | 龙架构 64 位 | `loongarch64-unknown-linux-musl.tar.gz` |
+
+          Linux 包是 musl 静态链接，不依赖系统的 glibc 版本。
+          龙架构 32 位与 Windows 32 位 ARM 没有带标准库的 Rust 目标，暂不提供。
+
+          ## 这些包发布前做过什么验证
+
+          - **x86（64 / 32 位，Windows 与 Linux）**：在构建机上原生运行，跑过回环端到端
+            （种子互相发现 → 打洞 → 加密隧道 → TCP / UDP 转发 → 崩溃重连）。
+          - **Linux ARM64 / ARMv7 / 龙架构**：在 QEMU 用户态仿真下跑过同一套回环端到端；没有在真实硬件上运行过。
+          - **Windows ARM64**：只编译，没有运行过。
+
+          用法见包内 `README.md`；校验值见 `SHA256SUMS.txt`。
+          EOF
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          flags=()
+          title="wgp $GITHUB_REF_NAME"
+          if [ "$PRERELEASE" = true ]; then
+            flags+=(--prerelease)
+            title="$title（预览版）"
+          fi
+          gh release create "$GITHUB_REF_NAME" dist/* --verify-tag "${flags[@]}" \
+            --title "$title" --notes-file notes.md --generate-notes

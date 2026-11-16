@@ -2,7 +2,7 @@
 
 > 源目录：`server/wgp-node/`（crate 名 `wgp-node`，workspace 成员）
 > 生成日期：2026-11-05
-> 对应设计文档：`docs/07-信令面与观察者协议.md` §6/§7（部署规格）、`server/deploy/DEPLOY.md`（部署手册）
+> 对应设计文档：`07-信令面与观察者协议.md` §6/§7（部署规格）、`server/deploy/DEPLOY.md`（部署手册）
 
 ## 1. 概览
 
@@ -221,12 +221,12 @@ wgp-node --stun none --tcp none            （仅 DHT 种子）
 
 | 设计文档 | 对应代码 |
 | --- | --- |
-| `docs/07-信令面与观察者协议.md` §6（部署规格） | lib.rs:1、server.rs:1、bin/wgp-node-hobby.rs:1 的模块头注释；四职启动（server.rs:550-551） |
-| `docs/07` §7（贡献版/PCDN 防护） | force_hobby 恒真逻辑（server.rs:273-280）、bin/wgp-node-hobby.rs 全文 |
-| `docs/07` §8（身份漂移） | `load_or_create_identity` 长度校验与拒绝启动（server.rs:420-444）、main.rs:15、bin/wgp-node-hobby.rs:15 |
-| `docs/00-架构总览.md` §3（内核纯粹性） | 部署数据由 server 层注入 `NodeConfig`（server.rs:10、541-548） |
+| `07-信令面与观察者协议.md` §6（部署规格） | lib.rs:1、server.rs:1、bin/wgp-node-hobby.rs:1 的模块头注释；四职启动（server.rs:550-551） |
+| `07-信令面与观察者协议.md` §7（贡献版/PCDN 防护） | force_hobby 恒真逻辑（server.rs:273-280）、bin/wgp-node-hobby.rs 全文 |
+| `07-信令面与观察者协议.md` §8（身份漂移） | `load_or_create_identity` 长度校验与拒绝启动（server.rs:420-444）、main.rs:15、bin/wgp-node-hobby.rs:15 |
+| `00-架构总览.md` §3（内核纯粹性） | 部署数据由 server 层注入 `NodeConfig`（server.rs:10、541-548） |
 | `server/deploy/DEPLOY.md` | 环境变量键名与 `collect_env()` 一一对应（DEPLOY.md:159）；`server/deploy/wgp-node.env.example` 示例值 |
-| `docs/16-怎么做与下一步.md` | 服务端环境变量键清单（docs/16:147） |
+| `16-怎么做与下一步.md` | 服务端环境变量键清单（16-怎么做与下一步.md:147） |
 
 ## 5. 已知限制或未实现项
 

@@ -232,12 +232,12 @@ wgp-client join U/XXXX-XXXX-XXXX-XXXX --seed udp://host:11010 -i my.key
 
 | 设计文档 | 对应代码 |
 | --- | --- |
-| `docs/14-内核API文档.md` | "参考外围"定位（main.rs:1-5、463）；Engine / EngineEvent / SessionOrchestrator / measure_seeds / resolve_endpoint / LinkSink 等 API 装配（main.rs:26-29、242-262） |
-| `docs/13-房间码派生协议.md` | `code` 子命令 = `wgp_proto::room_code::derive_room_code`（main.rs:31、124、137）；测试向量 `U/C2G9-GYET-311W-R636`（main.rs:518-522） |
-| `docs/15-全链路流程.md` | 入表 → 成员感知 → 协商竞速 → 打洞/保活事件流（async_move、member_watch、render 全表） |
-| `docs/16-怎么做与下一步.md` | 客户端启动命令与环境变量 `WGP_SEED`（main.rs:481） |
-| `docs/00-架构总览.md` §3 | 外围只做参数装配 + 事件呈现，无协议实现（main.rs:3-5） |
-| `docs/07` §8 | 身份文件 32B 校验、拒绝静默换身份（main.rs:432-433） |
+| `14-内核API文档.md` | "参考外围"定位（main.rs:1-5、463）；Engine / EngineEvent / SessionOrchestrator / measure_seeds / resolve_endpoint / LinkSink 等 API 装配（main.rs:26-29、242-262） |
+| `13-房间码派生协议.md` | `code` 子命令 = `wgp_proto::room_code::derive_room_code`（main.rs:31、124、137）；测试向量 `U/C2G9-GYET-311W-R636`（main.rs:518-522） |
+| `15-全链路流程.md` | 入表 → 成员感知 → 协商竞速 → 打洞/保活事件流（async_move、member_watch、render 全表） |
+| `16-怎么做与下一步.md` | 客户端启动命令与环境变量 `WGP_SEED`（main.rs:481） |
+| `00-架构总览.md` §3 | 外围只做参数装配 + 事件呈现，无协议实现（main.rs:3-5） |
+| `07-信令面与观察者协议.md` §8 | 身份文件 32B 校验、拒绝静默换身份（main.rs:432-433） |
 
 ## 5. 已知限制或未实现项
 

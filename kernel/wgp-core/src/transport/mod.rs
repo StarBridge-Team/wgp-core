@@ -5,6 +5,8 @@ pub mod escape;
 pub mod lan;
 pub mod probe;
 pub mod tcp;
+#[cfg(test)]
+pub(crate) mod test_ports;
 pub mod udp;
 
 pub use escape::IcEscape;

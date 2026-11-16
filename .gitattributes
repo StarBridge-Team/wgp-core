@@ -2,6 +2,8 @@
 *.bat text eol=crlf
 *.cmd text eol=crlf
 *.ps1 text eol=crlf
+# shell scripts must stay LF (CRLF breaks them on Linux)
+*.sh text eol=lf
 
 # 二进制
 *.exe binary

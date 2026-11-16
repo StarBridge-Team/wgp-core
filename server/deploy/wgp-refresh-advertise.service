@@ -1,0 +1,16 @@
+[Unit]
+Description=Refresh WGP advertised public IPv4
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=WGP_ENV_FILE=/etc/wgp-node/env
+Environment=WGP_RUN_USER=wgp
+Environment=WGP_SERVICE_NAME=wgp-node-hobby
+ExecStart=/usr/local/libexec/wgp-refresh-advertise
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/etc/wgp-node /run/lock
