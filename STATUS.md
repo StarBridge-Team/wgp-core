@@ -93,3 +93,20 @@ Windows 上相邻两次测试进程会撞上前一次连接留下的 TIME_WAIT�
 
 **没有验证的**：真实 NAT、真实丢包与乱序、跨机器运行、Linux 的 systemd / nftables 部署件、除 x86 以外的架构在真实硬件上的运行
 （ARM / 龙架构只在 QEMU 用户态仿真下跑过；Windows 的 i686 / ARM64 构建要等 GitHub Actions 的实际运行）。
+
+## 6. 2026-11-16 追加：身份证明 / TCP 兜底 / 多进程阶段 1 的验证记录
+
+同样只记「实际跑过什么」；做法与残留问题见 [`HANDOFF.md`](HANDOFF.md) §2.5 与
+[`项目完整文档/20-变更追补-2026-11.md`](项目完整文档/20-变更追补-2026-11.md) §11-16。
+
+| 项 | 结果 |
+|---|---|
+| `cargo check --workspace --all-targets` | 通过，0 warning（含两个新 crate） |
+| `cargo test --workspace --locked` | **Windows 363，0 failed**（proto 50、crypto 13、punch 21、dht 101、core 48、port 55、node 19、client 22、ipc 30、agent 3；`bridge/wgp-et-bridge` 4 个不在该 workspace） |
+| Windows 端到端 `scripts\e2e-local.ps1`（release 二进制） | 单种子 PASS：入表 → 打通 → TCP 4MiB 逐字节一致（单向约 1.6 MiB/s）→ UDP 40 报 → 崩溃重连后转发恢复 |
+| agent IPC 冒烟 `scripts\agent-smoke.ps1`（真实进程 + 真实命名管道） | PASS：就绪、同一端点二次绑定被拒（退出码 3）、`ping` 取到版本与快照、`ShutdownAgent` 走优雅退出路径、端点清理 |
+| 新增的身份证明测试 | 伪造（冒用 node_id / 冒用公钥）、重放（旧证明 / 跨挑战 / 回证跨来源）、错误来源后合法恢复、版本拒绝、入站洪流限速、严格模式不学习、兼容模式学习、换端点恢复 |
+| TCP 房间读写 | `room_readwrite_works_over_tcp_when_udp_endpoint_is_dead`（存储节点的 UDP 端口是死的，`locate`/`create`/`fetch`/`renew`/`add_member` 全走 TCP 仍成功） |
+| 路由轮转覆盖率 | `len=1..=40 × batch=1..=12` 全组合：`ceil(len/batch)` 轮后无漏测；去重（种子探过的不再重复探）另有网络级用例 |
+| 真实 NAT 双端联调 | **未执行**：既有两台 VPS 均不可达（一台端口拒绝、一台只接受密码），见 18 §7 与 `scripts/nat-field-test.md` |
+| Linux 原生 / WSL | 本轮未重跑；`wgp-ipc` 的 Unix 分支（UDS + SO_PEERCRED）由 CI 的 ubuntu-latest 覆盖 |

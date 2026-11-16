@@ -100,9 +100,11 @@ jobs:
         if: matrix.verify == 'qemu'
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q qemu-user-static
-          # 各架构的执行处理器由 systemd-binfmt 按软件包带来的配置注册；装包时一般已自动完成，这里再确保一次
-          sudo systemctl restart systemd-binfmt
+          # 24.04 及更早：qemu-user-static 直接可装；26.04 起它变成虚包，
+          # 实际提供者是 qemu-user-binfmt（Debian/Ubuntu 把静态二进制与 binfmt 注册拆开了）
+          sudo apt-get install -y -q qemu-user-static || sudo apt-get install -y -q qemu-user-binfmt
+          # 各架构的执行处理器由软件包带来的 binfmt 配置注册；装包时一般已自动完成，这里再确保一次
+          sudo systemctl restart systemd-binfmt || true
           ls /proc/sys/fs/binfmt_misc/ | grep -E '^qemu-(aarch64|arm|loongarch64)$'
 
       # Windows 产物静态链接 C 运行时（.cargo/config.toml）：没装 VC++ 运行库的机器上也要能直接跑。

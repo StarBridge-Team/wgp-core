@@ -581,9 +581,13 @@ mod tests {
             assert_eq!(seeds[0].tcp_addr(), None);
             assert!(seeds[0].relays());
             assert!(seeds[0].rtt_ms.is_some(), "入表时已测得往返耗时");
-            // 探活用的 PING/PONG 顺带完成了双向认识（地址簿）
+            // 探活用的挑战响应顺带完成了双向认识：hub 在验完证明时同步学习；
+            // newcomer 要靠回证（fire-and-forget）才学到 hub，所以这里等一小会儿
             assert!(knows(&hub, newcomer.node_id()).await);
-            assert!(knows(&newcomer, hub.node_id()).await);
+            assert!(
+                wait_knows(&newcomer, hub.node_id(), 2000).await,
+                "回证后宣告者应认识入口"
+            );
             // 入口自己没有宣告：宣告者的目录里不会有它
             assert!(newcomer.seeds().await.is_empty());
         }
