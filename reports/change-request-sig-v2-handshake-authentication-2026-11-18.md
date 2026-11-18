@@ -5,9 +5,9 @@
 | CR 编号 | CR-2026-11-18-01 |
 | 标题 | 承诺-揭示握手升级为成员身份签名的 SIG v2 |
 | 类型 | 安全修复 + **破坏性协议变更** |
-| 状态 | 待评审（本地编译与测试已通过，未做真实公网验证） |
+| 状态 | 已合入 `main`（合并提交 `36bd0ca`，安全提交 `98efeb8`）；本地编译与测试通过，未做真实公网验证 |
 | 源分支 | `dsh-85b6d55e-9ace`（基准 `ae4e18d`） |
-| 目标分支 | `main`（当前 `b54099e`） |
+| 目标分支 | `main`（合入前 `b54099e`） |
 | 来源 | [`network-security-and-vps-audit-2026-11-17.md`](network-security-and-vps-audit-2026-11-17.md) 的 P0 发现 |
 | 影响 crate | `wgp-proto`、`wgp-dht`、`wgp-core`、`wgp-client`、`wgp-agent`，以及桥接集成测试 |
 
