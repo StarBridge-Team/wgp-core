@@ -23,6 +23,64 @@ pub fn node_id_from_verifying(vk: &VerifyingKey) -> NodeId {
     NodeId(Sha256::digest(vk.as_bytes()).into())
 }
 
+/// 验证成员身份公钥与 NodeId 绑定，并验证协商 transcript 签名。
+pub fn verify_identity_signature(
+    node_id: NodeId,
+    public_key: &[u8; 32],
+    data: &[u8],
+    signature: &[u8; 64],
+) -> bool {
+    let Ok(verifying_key) = VerifyingKey::from_bytes(public_key) else {
+        return false;
+    };
+    if node_id_from_verifying(&verifying_key) != node_id {
+        return false;
+    }
+    let signature = Signature::from_bytes(signature);
+    verifying_key.verify_strict(data, &signature).is_ok()
+}
+
+#[cfg(test)]
+mod identity_signature_tests {
+    use super::*;
+
+    #[test]
+    fn signature_binds_node_id_key_and_message() {
+        let identity = NodeIdentity::from_seed([0x31; 32]);
+        let data = b"wgp-handshake-transcript-v1/test";
+        let signature = identity.sign(data).to_bytes();
+        let public_key = identity.verifying_key().to_bytes();
+        assert!(verify_identity_signature(
+            identity.node_id(),
+            &public_key,
+            data,
+            &signature
+        ));
+
+        let mut changed_message = data.to_vec();
+        changed_message.push(1);
+        assert!(!verify_identity_signature(
+            identity.node_id(),
+            &public_key,
+            &changed_message,
+            &signature,
+        ));
+        assert!(!verify_identity_signature(
+            NodeId([0xFF; 32]),
+            &public_key,
+            data,
+            &signature,
+        ));
+        let other = NodeIdentity::from_seed([0x32; 32]);
+        assert!(!verify_identity_signature(
+            identity.node_id(),
+            &other.verifying_key().to_bytes(),
+            data,
+            &signature,
+        ));
+    }
+}
+
 /// 节点长期身份（生成一次持久化；PeerId 派生自本公钥哈希）
 pub struct NodeIdentity {
     signing: SigningKey,

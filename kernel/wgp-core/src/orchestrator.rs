@@ -10,9 +10,9 @@
 //! 安全说明：sig 包的 Commit 字段仅 16B（协议定长限制），MITM 复验强度不足；
 //! 故 Endpoints 帧追加 32B 完整承诺，揭示后重算比对 → 128bit 抗 MITM（01 §1.2）。
 
-use crate::engine::Engine;
-use crate::engine::circuit::{CircuitInput, decide_race};
+use crate::engine::circuit::{decide_race, CircuitInput};
 use crate::engine::nat_probe::NatProbe;
+use crate::engine::Engine;
 use crate::engine::PunchInput;
 use crate::transport::{TcpProbeCarrier, UdpProbeCarrier};
 use crate::types::LinkSink;
@@ -23,12 +23,13 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
-use wgp_crypto::commit::{Commitment, commit as make_commit, verify as verify_commit};
+use wgp_crypto::commit::{commit as make_commit, verify as verify_commit, Commitment};
 use wgp_crypto::derive::derive_all;
 use wgp_crypto::ka::{KeyAgreement, X25519Agreement};
 use wgp_crypto::SecretBox;
 use wgp_dht::id::peer_id_from_node;
-use wgp_dht::{DhtNode, NodeId};
+use wgp_dht::verify_identity_signature;
+use wgp_dht::{room_key, DhtNode, NodeId, RoomRuntime};
 use wgp_proto::dht::ForwardBody;
 use wgp_proto::sig::{CommitBody, RevealBody, SigBody, SigPacket};
 use wgp_punch::PortStepModel;
@@ -53,8 +54,8 @@ mod frame {
     pub const KIND_SIG: u8 = 0x01; // SigPacket 字节（COMMIT/REVEAL）
     pub const KIND_EP: u8 = 0x02; // 端点报告（含完整承诺复验）
 
-    /// 纯 body 长度（kind 由 exchange 统一封装）
-    pub const EP_BODY_LEN: usize = 47;
+    /// 端点字段 + 完整承诺 + 身份签名。
+    pub const EP_BODY_LEN: usize = 15 + 32 + 64;
 
     /// Endpoints 报告体（47B = 15B 端点 + 32B 完整承诺）
     #[derive(Debug, Clone, Copy)]
@@ -69,8 +70,10 @@ mod frame {
         pub mean_delta_q: i16,
         /// 置信度 0-100
         pub confidence: u8,
-        /// 完整 32B 承诺（MITM 复验，128bit）
+        /// 完整 32B 承诺，用于确认完整 SHA-256 承诺。
         pub full_commit: [u8; 32],
+        /// 身份密钥对房间、双方身份和全部端点字段的签名。
+        pub identity_signature: [u8; 64],
     }
 
     pub fn encode_endpoints(e: &Endpoints) -> [u8; EP_BODY_LEN] {
@@ -83,19 +86,22 @@ mod frame {
         out[9..11].copy_from_slice(&e.last_port.to_be_bytes());
         out[11..13].copy_from_slice(&e.mean_delta_q.to_be_bytes());
         out[13] = e.confidence;
-        out[14..46].fill(0); // 保留
+        out[14] = 0;
         out[15..47].copy_from_slice(&e.full_commit);
+        out[47..].copy_from_slice(&e.identity_signature);
         out
     }
 
     pub fn decode_endpoints(buf: &[u8]) -> Option<Endpoints> {
-        if buf.len() != EP_BODY_LEN {
+        if buf.len() != EP_BODY_LEN || buf[14] != 0 {
             return None;
         }
         let mut ipv4 = [0u8; 4];
         ipv4.copy_from_slice(&buf[0..4]);
         let mut full_commit = [0u8; 32];
         full_commit.copy_from_slice(&buf[15..47]);
+        let mut identity_signature = [0u8; 64];
+        identity_signature.copy_from_slice(&buf[47..111]);
         Some(Endpoints {
             ipv4,
             port: u16::from_be_bytes([buf[4], buf[5]]),
@@ -106,6 +112,7 @@ mod frame {
             mean_delta_q: i16::from_be_bytes([buf[11], buf[12]]),
             confidence: buf[13],
             full_commit,
+            identity_signature,
         })
     }
 
@@ -195,6 +202,100 @@ fn info_ctx(room: &str, a: NodeId, b: NodeId) -> Vec<u8> {
     ctx
 }
 
+fn handshake_transcript(
+    room: &str,
+    tag: u32,
+    sender: NodeId,
+    receiver: NodeId,
+    commitment: &[u8; 16],
+    pubkey: &[u8],
+    nonce: &[u8; 32],
+    sender_session_nonce: &[u8; 16],
+    receiver_session_nonce: &[u8; 16],
+) -> Vec<u8> {
+    let mut transcript = Vec::with_capacity(128 + pubkey.len());
+    transcript.extend_from_slice(b"wgp-handshake-transcript-v1\0");
+    transcript.push(wgp_proto::sig::SIG_VERSION);
+    transcript.extend_from_slice(&room_key(room));
+    transcript.extend_from_slice(&tag.to_be_bytes());
+    transcript.extend_from_slice(&sender.0);
+    transcript.extend_from_slice(&receiver.0);
+    transcript.extend_from_slice(commitment);
+    transcript.extend_from_slice(&(pubkey.len() as u16).to_be_bytes());
+    transcript.extend_from_slice(pubkey);
+    transcript.extend_from_slice(nonce);
+    transcript.extend_from_slice(sender_session_nonce);
+    transcript.extend_from_slice(receiver_session_nonce);
+    transcript
+}
+
+fn endpoint_signing_message(
+    room: &str,
+    tag: u32,
+    sender: NodeId,
+    receiver: NodeId,
+    endpoints: &frame::Endpoints,
+) -> Vec<u8> {
+    let mut message = Vec::with_capacity(128 + frame::EP_BODY_LEN);
+    message.extend_from_slice(b"wgp-endpoints-v1\0");
+    message.push(wgp_proto::sig::SIG_VERSION);
+    message.extend_from_slice(&(room.len() as u32).to_be_bytes());
+    message.extend_from_slice(room.as_bytes());
+    message.extend_from_slice(&tag.to_be_bytes());
+    message.extend_from_slice(&sender.0);
+    message.extend_from_slice(&receiver.0);
+    message.extend_from_slice(&endpoints.ipv4);
+    message.extend_from_slice(&endpoints.port.to_be_bytes());
+    message.push(endpoints.udp_ok as u8);
+    message.push(endpoints.tcp_ok as u8);
+    message.push(endpoints.has_model as u8);
+    message.extend_from_slice(&endpoints.last_port.to_be_bytes());
+    message.extend_from_slice(&endpoints.mean_delta_q.to_be_bytes());
+    message.push(endpoints.confidence);
+    message.extend_from_slice(&endpoints.full_commit);
+    message
+}
+
+fn reveal_is_authentic(
+    room: &str,
+    tag: u32,
+    sender: NodeId,
+    receiver: NodeId,
+    expected_peer_id: &[u8; 16],
+    expected_identity_key: &[u8; 32],
+    reveal: &RevealBody,
+    expected_commit: Option<&CommitBody>,
+    receiver_session_nonce: &[u8; 16],
+) -> bool {
+    let computed_commit = make_commit(&reveal.pubkey, &reveal.nonce);
+    if &reveal.peer_id != expected_peer_id
+        || expected_commit.is_some_and(|commit| {
+            commit.commit != reveal.commitment || commit.session_nonce != reveal.session_nonce
+        })
+        || reveal.peer_session_nonce != *receiver_session_nonce
+        || computed_commit.0[..16] != reveal.commitment
+    {
+        return false;
+    }
+    let transcript = handshake_transcript(
+        room,
+        tag,
+        sender,
+        receiver,
+        &reveal.commitment,
+        &reveal.pubkey,
+        &reveal.nonce,
+        &reveal.session_nonce,
+        &reveal.peer_session_nonce,
+    );
+    verify_identity_signature(
+        sender,
+        expected_identity_key,
+        &transcript,
+        &reveal.identity_signature,
+    )
+}
+
 /// 装配线：房间内成员间的全自动会话工厂
 pub struct SessionOrchestrator {
     node: Arc<DhtNode>,
@@ -233,9 +334,27 @@ impl SessionOrchestrator {
         &self,
         room_code: &str,
         peer_node_id: NodeId,
+        peer_identity_key: [u8; 32],
         sink: Arc<dyn LinkSink>,
     ) -> Result<(), OrchestratorError> {
+        let room_runtime = RoomRuntime::with_transport(
+            self.node.clone(),
+            self.storage,
+            self.node.signaling_transport(),
+        );
+        let record = room_runtime
+            .fetch(room_code)
+            .await
+            .map_err(|_| OrchestratorError::PeerGone)?;
         let my_node_id = self.node.node_id();
+        let local_key = self.node.identity().verifying_key().to_bytes();
+        if !record.members.iter().any(|(id, key)| {
+            *id == peer_node_id && key.as_slice() == peer_identity_key.as_slice()
+        }) || !record.members.iter().any(|(id, key)| {
+            *id == my_node_id && key.as_slice() == local_key
+        }) {
+            return Err(OrchestratorError::Mitm);
+        }
         let my_peer_id = peer_id_from_node(&my_node_id);
         let _peer_peer_id = peer_id_from_node(&peer_node_id);
         let tag = session_tag(room_code, my_node_id, peer_node_id);
@@ -255,39 +374,21 @@ impl SessionOrchestrator {
         let mut nonce = [0u8; 32];
         OsRng.fill_bytes(&mut nonce);
         let my_commit = make_commit(&pubkey, &nonce);
+        let mut my_session_nonce = [0u8; 16];
+        OsRng.fill_bytes(&mut my_session_nonce);
 
-        let commit16 = {
-            let mut c = [0u8; 16];
-            c.copy_from_slice(&my_commit.0[..16]);
-            c
+        let mut commit16 = [0u8; 16];
+        commit16.copy_from_slice(&my_commit.0[..16]);
+        let my_commit_body = CommitBody {
+            peer_id: my_peer_id,
+            commit: commit16,
+            session_nonce: my_session_nonce,
         };
-        let commit_pkt = SigPacket::commit(
-            CommitBody {
-                peer_id: my_peer_id,
-                commit: commit16,
-            },
-            ka.algo_id(),
-            0,
-        );
-        let reveal_pkt = SigPacket::reveal(
-            RevealBody {
-                peer_id: my_peer_id,
-                pubkey: pubkey.clone(),
-                nonce,
-            },
-            ka.algo_id(),
-            0,
-        );
-
-        // ①a 交换承诺。accept 放宽到「Commit 或 Reveal」：对端可能已先行进入揭示阶段
-        // （它收到了我方承诺，而它的承诺丢了、或被我方上一轮的被动监听消费了）。
-        // 此时必须把对端的揭示内容就地记下：对端一收到我方揭示就不再重发，
-        // 若在这里丢弃这份揭示，①b 将永远等不到第二份（旧实现即死锁于此）。
-        // 先见对端揭示再揭示自己不削弱承诺-揭示：对端公钥在它揭示时已定死，
-        // 无法再随我方公钥调整；MITM 防护由 EP 交换的 full_commit 复验兜底（128bit）。
-        let reveal_bytes = reveal_pkt.encode();
-        let mut peer_pk_raw: Option<Vec<u8>> = None;
-        let mut peer_nonce: Option<[u8; 32]> = None;
+        let commit_pkt = SigPacket::commit(my_commit_body, ka.algo_id(), 0);
+        let expected_peer_id = peer_id_from_node(&peer_node_id);
+        let mut peer_commit: Option<CommitBody> = None;
+        let mut early_reveal: Option<RevealBody> = None;
+        let mut invalid_peer_frame = false;
         if !self
             .exchange(
                 &peer_node_id,
@@ -297,11 +398,29 @@ impl SessionOrchestrator {
                 &commit_pkt.encode(),
                 None,
                 |body| match parse_sig(body) {
-                    Some(SigBody::Commit(_)) => true,
-                    Some(SigBody::Reveal(r)) => {
-                        peer_pk_raw = Some(r.pubkey);
-                        peer_nonce = Some(r.nonce);
+                    Some(SigBody::Commit(commit)) if commit.peer_id == expected_peer_id => {
+                        peer_commit = Some(commit);
                         true
+                    }
+                    Some(SigBody::Reveal(reveal))
+                        if reveal_is_authentic(
+                            room_code,
+                            tag,
+                            peer_node_id,
+                            my_node_id,
+                            &expected_peer_id,
+                            &peer_identity_key,
+                            &reveal,
+                            None,
+                            &my_session_nonce,
+                        ) =>
+                    {
+                        early_reveal = Some(reveal);
+                        true
+                    }
+                    Some(SigBody::Commit(_)) | Some(SigBody::Reveal(_)) => {
+                        invalid_peer_frame = true;
+                        false
                     }
                     _ => false,
                 },
@@ -310,36 +429,88 @@ impl SessionOrchestrator {
         {
             return Err(OrchestratorError::PeerGone);
         }
+        if invalid_peer_frame {
+            return Err(OrchestratorError::Mitm);
+        }
+        let peer_commit = peer_commit
+            .or_else(|| {
+                early_reveal.as_ref().map(|reveal| CommitBody {
+                    peer_id: reveal.peer_id,
+                    commit: reveal.commitment,
+                    session_nonce: reveal.session_nonce,
+                })
+            })
+            .ok_or(OrchestratorError::PeerGone)?;
 
-        // ①b 交换揭示 + 取对端公钥/nonce
-        if peer_pk_raw.is_some() {
-            // 对端揭示已在手：我方揭示发出即可前进。万一这一帧丢了，对端会继续重发
-            // 它的 SIG 帧，④ 阶段见到就补发（exchange 的 stale_reply）
+        let transcript = handshake_transcript(
+            room_code,
+            tag,
+            my_node_id,
+            peer_node_id,
+            &commit16,
+            &pubkey,
+            &nonce,
+            &my_session_nonce,
+            &peer_commit.session_nonce,
+        );
+        let reveal_signature = self.node.identity().sign(&transcript).to_bytes();
+        let reveal_pkt = SigPacket::reveal(
+            RevealBody {
+                peer_id: my_peer_id,
+                pubkey: pubkey.clone(),
+                nonce,
+                session_nonce: my_session_nonce,
+                peer_session_nonce: peer_commit.session_nonce,
+                commitment: commit16,
+                identity_signature: reveal_signature,
+            },
+            ka.algo_id(),
+            0,
+        );
+        let reveal_bytes = reveal_pkt.encode();
+        let peer_reveal = if let Some(reveal) = early_reveal {
             self.send_frame(&peer_node_id, tag, frame::KIND_SIG, &reveal_bytes)
                 .await;
-        } else if !self
-            .exchange(
-                &peer_node_id,
-                tag,
-                &mut rx,
-                frame::KIND_SIG,
-                &reveal_bytes,
-                None,
-                |body| match parse_sig(body) {
-                    Some(SigBody::Reveal(r)) => {
-                        peer_pk_raw = Some(r.pubkey);
-                        peer_nonce = Some(r.nonce);
-                        true
-                    }
-                    _ => false,
-                },
-            )
-            .await
-        {
-            return Err(OrchestratorError::PeerGone);
+            reveal
+        } else {
+            let mut accepted = None;
+            if !self
+                .exchange(
+                    &peer_node_id,
+                    tag,
+                    &mut rx,
+                    frame::KIND_SIG,
+                    &reveal_bytes,
+                    None,
+                    |body| match parse_sig(body) {
+                        Some(SigBody::Reveal(reveal)) => {
+                            accepted = Some(reveal);
+                            true
+                        }
+                        _ => false,
+                    },
+                )
+                .await
+            {
+                return Err(OrchestratorError::PeerGone);
+            }
+            accepted.ok_or(OrchestratorError::PeerGone)?
+        };
+        if !reveal_is_authentic(
+            room_code,
+            tag,
+            peer_node_id,
+            my_node_id,
+            &expected_peer_id,
+            &peer_identity_key,
+            &peer_reveal,
+            Some(&peer_commit),
+            &my_session_nonce,
+        ) {
+            return Err(OrchestratorError::Mitm);
         }
-        let peer_pk_raw = peer_pk_raw.ok_or(OrchestratorError::PeerGone)?;
-        let peer_nonce = peer_nonce.ok_or(OrchestratorError::PeerGone)?;
+        let peer_pk_raw = peer_reveal.pubkey;
+        let peer_nonce = peer_reveal.nonce;
 
         // 共享密钥
         let shared_bytes = ka.agree(&sk, &peer_pk_raw).ok_or(OrchestratorError::Mitm)?;
@@ -349,13 +520,9 @@ impl SessionOrchestrator {
         // —— ② 密钥族派生 + 打洞 socket（学习与打洞同源端口，03 §3.4）——
         let secrets = derive_all(&shared, &info_ctx(room_code, my_node_id, peer_node_id));
         let tag4 = tag.to_be_bytes();
-        let carrier = UdpProbeCarrier::bind(
-            "0.0.0.0:0".parse().unwrap(),
-            secrets.probe_key,
-            tag4,
-        )
-        .await
-        .map_err(|_| OrchestratorError::NoRoute)?;
+        let carrier = UdpProbeCarrier::bind("0.0.0.0:0".parse().unwrap(), secrets.probe_key, tag4)
+            .await
+            .map_err(|_| OrchestratorError::NoRoute)?;
 
         // —— ③ 观察者探测 + 步长学习（复用打洞 socket）——
         let probe = NatProbe::from_socket(carrier.socket());
@@ -377,7 +544,7 @@ impl SessionOrchestrator {
         }
 
         // —— ④ 交换端点（含完整承诺复验）——
-        let my_ep = frame::Endpoints {
+        let mut my_ep = frame::Endpoints {
             ipv4: my_mapped.map(|(ip, _)| ip).unwrap_or([0u8; 4]),
             port: my_mapped.map(|(_, p)| p).unwrap_or(0),
             udp_ok,
@@ -393,7 +560,11 @@ impl SessionOrchestrator {
                 .map(|m| (m.confidence * 100.0) as u8)
                 .unwrap_or(0),
             full_commit: my_commit.0,
+            identity_signature: [0; 64],
         };
+        let endpoint_transcript =
+            endpoint_signing_message(room_code, tag, my_node_id, peer_node_id, &my_ep);
+        my_ep.identity_signature = self.node.identity().sign(&endpoint_transcript).to_bytes();
         let ep_bytes = frame::encode_endpoints(&my_ep);
 
         let mut peer_ep: Option<frame::Endpoints> = None;
@@ -408,8 +579,19 @@ impl SessionOrchestrator {
                 Some((frame::KIND_SIG, reveal_bytes.as_slice())),
                 |body| match frame::parse_endpoints_frame(body) {
                     Some(ep) => {
-                        peer_ep = Some(ep);
-                        true
+                        let message =
+                            endpoint_signing_message(room_code, tag, peer_node_id, my_node_id, &ep);
+                        if verify_identity_signature(
+                            peer_node_id,
+                            &peer_identity_key,
+                            &message,
+                            &ep.identity_signature,
+                        ) {
+                            peer_ep = Some(ep);
+                            true
+                        } else {
+                            false
+                        }
                     }
                     None => false,
                 },
@@ -421,11 +603,7 @@ impl SessionOrchestrator {
         let peer_ep = peer_ep.ok_or(OrchestratorError::PeerGone)?;
 
         // 完整承诺复验（128bit 抗 MITM；不匹配 = 有人在中间）
-        if !verify_commit(
-            &Commitment(peer_ep.full_commit),
-            &peer_pk_raw,
-            &peer_nonce,
-        ) {
+        if !verify_commit(&Commitment(peer_ep.full_commit), &peer_pk_raw, &peer_nonce) {
             return Err(OrchestratorError::Mitm);
         }
 
@@ -572,13 +750,15 @@ impl SessionOrchestrator {
     /// 向种子投递一条"致 peer"的载荷：UDP 为主；配置了 TCP 兜底时同发一份。
     /// 两条通道语义一致（种子按地址簿转发 / 长度前缀帧），上层 accept 幂等，重投无副作用。
     async fn send_forward(&self, peer: NodeId, payload: &[u8]) {
-        let _ = self.node.forward_to(self.storage, peer, payload.to_vec()).await;
+        let _ = self
+            .node
+            .forward_to(self.storage, peer, payload.to_vec())
+            .await;
         if let Some(tcp) = self.storage_tcp {
             let _ = self.node.forward_tcp(tcp, peer, payload.to_vec()).await;
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -644,9 +824,10 @@ mod tests {
         };
         let seed_addr = seed.local_addr().unwrap();
         let observer = ObserverServer::bind(0).await.expect("观察者启动");
-        let observer_addr: SocketAddr = format!("127.0.0.1:{}", observer.local_addr().unwrap().port())
-            .parse()
-            .unwrap();
+        let observer_addr: SocketAddr =
+            format!("127.0.0.1:{}", observer.local_addr().unwrap().port())
+                .parse()
+                .unwrap();
 
         // —— 客户端 A（房主）——
         let a = spawn_client(seed_addr, vec![observer_addr]).await;
@@ -664,11 +845,7 @@ mod tests {
         // 让 B 在成员表就绪
         let mut joined = false;
         for _ in 0..20 {
-            if let Ok(h) = b
-                .engine
-                .join_room(RoomCode(ROOM.to_string()), None)
-                .await
-            {
+            if let Ok(h) = b.engine.join_room(RoomCode(ROOM.to_string()), None).await {
                 joined = true;
                 let _ = h;
                 break;
@@ -688,18 +865,24 @@ mod tests {
         });
 
         let (a_node_id, b_node_id) = (a.node.node_id(), b.node.node_id());
+        let (a_identity_key, b_identity_key) = (
+            a.node.identity().verifying_key().to_bytes(),
+            b.node.identity().verifying_key().to_bytes(),
+        );
         let oa = {
             let orch = a.orchestrator;
             let sink = sink_a.clone();
             tokio::spawn(async move {
-                orch.connect_peer(ROOM, b_node_id, sink).await
+                orch.connect_peer(ROOM, b_node_id, b_identity_key, sink)
+                    .await
             })
         };
         let ob = {
             let orch = b.orchestrator;
             let sink = sink_b.clone();
             tokio::spawn(async move {
-                orch.connect_peer(ROOM, a_node_id, sink).await
+                orch.connect_peer(ROOM, a_node_id, a_identity_key, sink)
+                    .await
             })
         };
 
@@ -710,7 +893,8 @@ mod tests {
         // —— 双边交付断言（竞速 ≤ 5s 内）——
         let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
         loop {
-            if sink_a.count.load(Ordering::SeqCst) >= 1 && sink_b.count.load(Ordering::SeqCst) >= 1 {
+            if sink_a.count.load(Ordering::SeqCst) >= 1 && sink_b.count.load(Ordering::SeqCst) >= 1
+            {
                 break;
             }
             if tokio::time::Instant::now() > deadline {
@@ -752,7 +936,30 @@ mod tests {
         let a = spawn_client(seed_addr, vec![observer_addr]).await;
         let b = spawn_client(seed_addr, vec![observer_addr]).await;
         const ROOM: &str = "U/PASSIVE-0001-EE66";
+        let _a_room = a
+            .engine
+            .join_room(RoomCode(ROOM.to_string()), None)
+            .await
+            .expect("A 建房");
+        let mut b_joined = false;
+        for _ in 0..20 {
+            if b
+                .engine
+                .join_room(RoomCode(ROOM.to_string()), None)
+                .await
+                .is_ok()
+            {
+                b_joined = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(b_joined, "B 应入房间成员表");
         let (a_node_id, b_node_id) = (a.node.node_id(), b.node.node_id());
+        let (a_identity_key, b_identity_key) = (
+            a.node.identity().verifying_key().to_bytes(),
+            b.node.identity().verifying_key().to_bytes(),
+        );
 
         let sink_a = Arc::new(CountSink {
             count: AtomicUsize::new(0),
@@ -772,25 +979,180 @@ mod tests {
                     .wait_incoming(ROOM, a_node_id, Duration::from_millis(0))
                     .await;
                 assert!(woken, "B 应被 A 的承诺帧唤醒");
-                orch.connect_peer(ROOM, a_node_id, sink).await
+                orch.connect_peer(ROOM, a_node_id, a_identity_key, sink)
+                    .await
             })
         };
         // 让 B 先挂上监听，再由 A 发起
         tokio::time::sleep(Duration::from_millis(200)).await;
-        let a_result = a.orchestrator.connect_peer(ROOM, b_node_id, sink_a.clone()).await;
+        let a_result = a
+            .orchestrator
+            .connect_peer(ROOM, b_node_id, b_identity_key, sink_a.clone())
+            .await;
         assert!(a_result.is_ok(), "A 侧装配应成功, got={a_result:?}");
         let b_result = b_task.await.unwrap();
         assert!(b_result.is_ok(), "B 侧装配应成功, got={b_result:?}");
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         while tokio::time::Instant::now() < deadline
-            && (sink_a.count.load(Ordering::SeqCst) == 0 || sink_b.count.load(Ordering::SeqCst) == 0)
+            && (sink_a.count.load(Ordering::SeqCst) == 0
+                || sink_b.count.load(Ordering::SeqCst) == 0)
         {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         assert!(sink_a.count.load(Ordering::SeqCst) >= 1, "A 应收到链路交付");
         assert!(sink_b.count.load(Ordering::SeqCst) >= 1, "B 应收到链路交付");
         let _ = observer;
+    }
+
+    #[test]
+    fn transcript_signatures_reject_relay_tampering() {
+        let signer = NodeIdentity::from_seed([0x41; 32]);
+        let expected_peer = signer.node_id();
+        let receiver = NodeIdentity::from_seed([0x42; 32]);
+        let tag = session_tag("room-key", expected_peer, receiver.node_id());
+        let public_key = signer.verifying_key().to_bytes();
+        let sender_nonce = [0x55; 16];
+        let receiver_nonce = [0x66; 16];
+        let ephemeral_key = vec![0x77; 32];
+        let reveal_nonce = [0x88; 32];
+        let full_commit = make_commit(&ephemeral_key, &reveal_nonce);
+        let mut commit_hash = [0u8; 16];
+        commit_hash.copy_from_slice(&full_commit.0[..16]);
+        let transcript = handshake_transcript(
+            "room-key",
+            tag,
+            expected_peer,
+            receiver.node_id(),
+            &commit_hash,
+            &ephemeral_key,
+            &reveal_nonce,
+            &sender_nonce,
+            &receiver_nonce,
+        );
+        let signature = signer.sign(&transcript).to_bytes();
+        let reveal = RevealBody {
+            peer_id: peer_id_from_node(&expected_peer),
+            pubkey: ephemeral_key.clone(),
+            nonce: reveal_nonce,
+            session_nonce: sender_nonce,
+            peer_session_nonce: receiver_nonce,
+            commitment: commit_hash,
+            identity_signature: signature,
+        };
+        let commit = CommitBody {
+            peer_id: reveal.peer_id,
+            commit: commit_hash,
+            session_nonce: sender_nonce,
+        };
+        assert!(reveal_is_authentic(
+            "room-key",
+            tag,
+            expected_peer,
+            receiver.node_id(),
+            &peer_id_from_node(&expected_peer),
+            &public_key,
+            &reveal,
+            Some(&commit),
+            &receiver_nonce,
+        ));
+        assert!(!reveal_is_authentic(
+            "other-room",
+            tag,
+            expected_peer,
+            receiver.node_id(),
+            &peer_id_from_node(&expected_peer),
+            &public_key,
+            &reveal,
+            Some(&commit),
+            &receiver_nonce,
+        ));
+
+        let mut tampered_key = reveal.clone();
+        tampered_key.pubkey[0] ^= 1;
+        assert!(!reveal_is_authentic(
+            "room-key",
+            tag,
+            expected_peer,
+            receiver.node_id(),
+            &peer_id_from_node(&expected_peer),
+            &public_key,
+            &tampered_key,
+            Some(&commit),
+            &receiver_nonce,
+        ));
+        let mut tampered_nonce = reveal.clone();
+        tampered_nonce.peer_session_nonce[0] ^= 1;
+        assert!(!reveal_is_authentic(
+            "room-key",
+            tag,
+            expected_peer,
+            receiver.node_id(),
+            &peer_id_from_node(&expected_peer),
+            &public_key,
+            &tampered_nonce,
+            Some(&commit),
+            &receiver_nonce,
+        ));
+        let mut wrong_key = public_key;
+        wrong_key[0] ^= 1;
+        assert!(!reveal_is_authentic(
+            "room-key",
+            tag,
+            expected_peer,
+            receiver.node_id(),
+            &peer_id_from_node(&expected_peer),
+            &wrong_key,
+            &reveal,
+            Some(&commit),
+            &receiver_nonce,
+        ));
+
+        let mut endpoints = frame::Endpoints {
+            ipv4: [1, 2, 3, 4],
+            port: 12345,
+            udp_ok: true,
+            tcp_ok: false,
+            has_model: false,
+            last_port: 0,
+            mean_delta_q: 0,
+            confidence: 0,
+            full_commit: [0x99; 32],
+            identity_signature: [0; 64],
+        };
+        let endpoint_message = endpoint_signing_message(
+            "room-key",
+            tag,
+            expected_peer,
+            receiver.node_id(),
+            &endpoints,
+        );
+        endpoints.identity_signature = signer.sign(&endpoint_message).to_bytes();
+        assert!(verify_identity_signature(
+            expected_peer,
+            &public_key,
+            &endpoint_signing_message(
+                "room-key",
+                tag,
+                expected_peer,
+                receiver.node_id(),
+                &endpoints,
+            ),
+            &endpoints.identity_signature,
+        ));
+        endpoints.port ^= 1;
+        assert!(!verify_identity_signature(
+            expected_peer,
+            &public_key,
+            &endpoint_signing_message(
+                "room-key",
+                tag,
+                expected_peer,
+                receiver.node_id(),
+                &endpoints,
+            ),
+            &endpoints.identity_signature,
+        ));
     }
 
     #[test]
@@ -805,6 +1167,7 @@ mod tests {
             mean_delta_q: 0,
             confidence: 0,
             full_commit: [0; 32],
+            identity_signature: [0; 64],
         };
         // 无模型但有实测端口 → 以实测端口为中心建模，三波首包直打该端口
         let model = peer_model_from(&base).expect("应兜底建模");
@@ -826,7 +1189,11 @@ mod tests {
         assert!((model.confidence - 0.9).abs() < 1e-9);
 
         // UDP 不通 / 没有端口：无从预测
-        assert!(peer_model_from(&frame::Endpoints { udp_ok: false, ..base }).is_none());
+        assert!(peer_model_from(&frame::Endpoints {
+            udp_ok: false,
+            ..base
+        })
+        .is_none());
         assert!(peer_model_from(&frame::Endpoints { port: 0, ..base }).is_none());
     }
 
@@ -871,6 +1238,7 @@ mod tests {
                 CommitBody {
                     peer_id: peer_id_from_node(&a_node_id),
                     commit: [0x11; 16],
+                    session_nonce: [0x22; 16],
                 },
                 X25519Agreement.algo_id(),
                 0,
@@ -896,14 +1264,20 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // 静默期内的承诺帧 + 任意时刻的端点帧：都不应触发
-        a.orchestrator.send_forward(b_node_id, &commit_payload).await;
+        a.orchestrator
+            .send_forward(b_node_id, &commit_payload)
+            .await;
         tokio::time::sleep(Duration::from_millis(700)).await;
-        a.orchestrator.send_forward(b_node_id, &endpoint_payload).await;
+        a.orchestrator
+            .send_forward(b_node_id, &endpoint_payload)
+            .await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(!waiter.is_finished(), "静默期内的帧与非承诺帧不得触发");
 
         // 静默期过后的承诺帧：触发
-        a.orchestrator.send_forward(b_node_id, &commit_payload).await;
+        a.orchestrator
+            .send_forward(b_node_id, &commit_payload)
+            .await;
         let woken = tokio::time::timeout(Duration::from_secs(2), waiter)
             .await
             .expect("应被触发")

@@ -98,9 +98,16 @@ async fn punch() -> Rig {
     let host_sink: Arc<dyn LinkSink> = Arc::new(ChannelSink(host_tx));
     let joiner_sink: Arc<dyn LinkSink> = Arc::new(ChannelSink(joiner_tx));
     let (host_id, joiner_id) = (host.node.node_id(), joiner.node.node_id());
+    let (host_identity_key, joiner_identity_key) = (
+        host.node.identity().verifying_key().to_bytes(),
+        joiner.node.identity().verifying_key().to_bytes(),
+    );
     let (r1, r2) = tokio::join!(
-        host.orchestrator.connect_peer(ROOM, joiner_id, host_sink),
-        joiner.orchestrator.connect_peer(ROOM, host_id, joiner_sink),
+        host.orchestrator
+            .connect_peer(ROOM, joiner_id, joiner_identity_key, host_sink),
+        joiner
+            .orchestrator
+            .connect_peer(ROOM, host_id, host_identity_key, joiner_sink),
     );
     assert!(r1.is_ok() && r2.is_ok(), "装配应成功：{r1:?} / {r2:?}");
 

@@ -59,7 +59,10 @@ async fn next_event(
 ) -> PortEvent {
     within(30, async {
         loop {
-            let event = rx.recv().await.unwrap_or_else(|| panic!("事件流结束，未等到：{what}"));
+            let event = rx
+                .recv()
+                .await
+                .unwrap_or_else(|| panic!("事件流结束，未等到：{what}"));
             if pred(&event) {
                 return event;
             }
@@ -216,7 +219,14 @@ async fn tcp_forward_over_udp_link() {
 
         // 房主侧能看到对端连入
         next_event(&mut rig.host_events, "房主侧入站流", |e| {
-            matches!(e, PortEvent::StreamOpened { port: SERVICE, inbound: true, .. })
+            matches!(
+                e,
+                PortEvent::StreamOpened {
+                    port: SERVICE,
+                    inbound: true,
+                    ..
+                }
+            )
         })
         .await;
     })
@@ -324,7 +334,12 @@ async fn assert_udp_forward(rig: &Rig) {
     client.connect(rig.udp_forward).await.unwrap();
     let mut buf = vec![0u8; 2048];
     // 含基岩版 RakNet 的 1200 MTU 探测包尺寸（载荷 1172B）
-    for (i, len) in [1usize, 17, 500, 1172].into_iter().cycle().take(40).enumerate() {
+    for (i, len) in [1usize, 17, 500, 1172]
+        .into_iter()
+        .cycle()
+        .take(40)
+        .enumerate()
+    {
         let msg = pattern(len, 300 + i as u64);
         // 数据报不保证送达：允许重发，但收到的回显必须与发出的完全一致
         let mut echoed = false;
@@ -380,7 +395,8 @@ async fn relink_replaces_old_tunnel() {
         let sa = udp_socket().await;
         let sb = udp_socket().await;
         let (a_addr, b_addr) = (sa.local_addr().unwrap(), sb.local_addr().unwrap());
-        rig.host.attach_link(BOB, udp_link(BOB, sa, b_addr, new_key));
+        rig.host
+            .attach_link(BOB, udp_link(BOB, sa, b_addr, new_key));
         rig.joiner
             .attach_link(ALICE, udp_link(ALICE, sb, a_addr, new_key));
 
@@ -453,7 +469,10 @@ async fn occupied_forward_port_fails_fast() {
         },
     )
     .await;
-    assert!(result.is_err(), "转发口被占用必须在启动时报错，而不是等到打洞成功之后");
+    assert!(
+        result.is_err(),
+        "转发口被占用必须在启动时报错，而不是等到打洞成功之后"
+    );
 }
 
 /// 全链路：种子（DHT）+ 观察者 + 两个引擎自动装配打洞 → 内核把链路交付给 PortHub
@@ -544,7 +563,11 @@ async fn full_pipeline_punch_then_forward() {
             .expect("房主建房");
         let mut joined = None;
         for _ in 0..20 {
-            if let Ok(handle) = joiner.engine.join_room(RoomCode(ROOM.to_string()), None).await {
+            if let Ok(handle) = joiner
+                .engine
+                .join_room(RoomCode(ROOM.to_string()), None)
+                .await
+            {
                 joined = Some(handle);
                 break;
             }
@@ -556,9 +579,16 @@ async fn full_pipeline_punch_then_forward() {
         let host_sink: Arc<dyn LinkSink> = Arc::new(host_hub.clone());
         let joiner_sink: Arc<dyn LinkSink> = Arc::new(joiner_hub.clone());
         let (host_id, joiner_id) = (host.node.node_id(), joiner.node.node_id());
+        let (host_identity_key, joiner_identity_key) = (
+            host.node.identity().verifying_key().to_bytes(),
+            joiner.node.identity().verifying_key().to_bytes(),
+        );
         let (r1, r2) = tokio::join!(
-            host.orchestrator.connect_peer(ROOM, joiner_id, host_sink),
-            joiner.orchestrator.connect_peer(ROOM, host_id, joiner_sink),
+            host.orchestrator
+                .connect_peer(ROOM, joiner_id, joiner_identity_key, host_sink,),
+            joiner
+                .orchestrator
+                .connect_peer(ROOM, host_id, host_identity_key, joiner_sink,),
         );
         assert!(r1.is_ok() && r2.is_ok(), "装配应成功：{r1:?} / {r2:?}");
 

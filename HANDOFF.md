@@ -116,6 +116,10 @@ mesh-tun-proto 一行未改。
 
 ---
 
+## 本轮补记（2026-11-18）：SIG v2 握手身份认证
+
+网络安全审计中的高危会话 MITM 已在当前代码中修复：协商 transcript 由房间成员长期身份签名，绑定双方 NodeId、房间键派生值、临时密钥/nonce、Commit 与每轮随机挑战；端点报告也签名，`connect_peer` 会重新验证房间签名记录并确认本端和对端成员身份。信令版本升为 v2，旧版客户端不兼容。回归测试与 Windows workspace 测试通过，但真实公网/NAT 测试仍未做。分类和后续任务见 [`reports/network-security-vps-task-triage-2026-11-18.md`](reports/network-security-vps-task-triage-2026-11-18.md)。
+
 ## 3. 现在卡在哪
 
 ### 3.1 最大的未知：真实网络

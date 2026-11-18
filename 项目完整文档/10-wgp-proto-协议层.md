@@ -205,7 +205,7 @@ impl SigHeader {
       └────┴────┴────────┴──────┴──────┴──────┴────────┴─────────┘
 ```
 
-- `decode` 校验：长度 ≥ 8、魔数匹配、`kind ∈ {COMMIT, REVEAL, COMMIT_ACK, ERROR}`；**不校验 version**（读到但不禁用任何版本号）。
+- `decode` 校验：长度 ≥ 8、魔数匹配、`version == SIG_VERSION (0x02)`、`kind ∈ {COMMIT, REVEAL, COMMIT_ACK, ERROR}`。v2 握手增加成员身份签名与双方新鲜挑战，v1 揭示包必须拒绝。
 - `body_len` 为 u8，与 `BODY_MAX = 200` 共同封顶包体。
 
 #### 包体类型
@@ -217,6 +217,7 @@ pub struct CommitBody {
     pub peer_id: [u8; 16],
     /// SHA256(pubkey||nonce) 截断 16B
     pub commit: [u8; 16],
+    pub session_nonce: [u8; 16], // 每轮随机挑战
 }
 impl CommitBody {
     pub const BODY_LEN: u8 = 48;
@@ -226,10 +227,10 @@ impl CommitBody {
 ```
 
 ```
-peer_id(16B) │ commit(16B) │ reserved(16B，先置零，未来算法标识扩展位)
+peer_id(16B) │ commit(16B) │ session_nonce(16B，CSPRNG 每轮新鲜挑战)
 ```
 
-- ⚠️ 源码注释写"承诺包（33B body）"，实际 `BODY_LEN = 48`（含 16B 保留位），`encode` 返回 `[u8; 48]`——**代码如此，意图待确认**（保留位为未来扩展预留）。
+- `BODY_LEN = 48`；最后 16B 作为每轮随机挑战，接收 Reveal 时必须精确回显。
 - `commit` 的 SHA-256 计算在本 crate 之外（零依赖无哈希原语），由上层填充。
 
 **`RevealBody`（揭示包）**：
@@ -239,20 +240,24 @@ pub struct RevealBody {
     pub peer_id: [u8; 16],
     pub pubkey: Vec<u8>, // X25519=32B；Hybrid=变长（由 algo 决定）
     pub nonce: [u8; 32],
+    pub session_nonce: [u8; 16],
+    pub peer_session_nonce: [u8; 16],
+    pub commitment: [u8; 16],
+    pub identity_signature: [u8; 64],
 }
 impl RevealBody {
-    pub const BODY_LEN_X25519: u8 = 80;
+    pub const BODY_LEN_X25519: u8 = 192;
     pub fn encode(&self) -> Vec<u8> { /* ... */ }
     pub fn decode(buf: &[u8], expected_pubkey_len: usize) -> Option<Self> { /* ... */ }
 }
 ```
 
 ```
-peer_id(16B) │ pubkey(expected_pubkey_len B) │ nonce(32B)
+peer_id(16B) │ pubkey(expected_len) │ nonce(32B) │ session_nonce(16B) │ peer_session_nonce(16B) │ commitment(16B) │ Ed25519 signature(64B)
 ```
 
-- `decode` 要求 `buf.len() == 16 + expected_pubkey_len + 32`，长度由调用方按 algo 推断。
-- X25519 模式定长 80B；Hybrid 模式长度由算法决定（当前 `SigPacket::decode` 对非 X25519 一律拒识，见 §6）。
+- `decode` 要求 `buf.len() == 16 + expected_pubkey_len + 32 + 16 + 16 + 16 + 64`，长度由调用方按 algo 推断。
+- X25519 模式定长 192B；v2 揭示签名由上层使用已验证房间成员公钥检查。签名绑定版本、房间、双方 NodeId、临时密钥/nonce、承诺和双方随机挑战。Hybrid 模式当前仍未实现。
 
 **`ErrorBody`（错误包）**：
 
@@ -292,17 +297,18 @@ impl SigPacket {
 }
 ```
 
-- `commit` / `reveal` / `commit_ack` / `error` 四个便捷构造器自动填 `version = PROTO_VERSION`；`reveal` 的 `body_len = (16 + pubkey.len() + 32) as u8`。
-- `decode` 校验链：头合法 → 总长 `== HEADER_LEN + body_len` → COMMIT 要求 body 恰 48B → REVEAL 按 algo 推 pubkey 长度（仅 X25519=32 放行）→ ERROR 要求 body 非空（至少含 1B code）。
+- `commit` / `reveal` / `commit_ack` / `error` 构造器写入 `version = SIG_VERSION = 0x02`；`reveal` 的 body 长度为 `16 + pubkey.len() + 32 + 16 + 16 + 16 + 64`。
+- `decode` 校验链：头合法且版本为 v2 → 总长 `== HEADER_LEN + body_len` → COMMIT body 恰 48B → REVEAL 按 algo 推公钥长度（当前仅 X25519=32 放行）→ ERROR body 非空。旧 v1 握手必须全量升级客户端；v1 与 v2 不互通。
 - `CommitAck` 无 body（`body_len = 0`）。
 
 #### 测试用例（5 个）
 
 | 测试名 | 测什么 | 测试向量/断言 |
 |---|---|---|
-| `header_roundtrip` | 8B 头编解码往返一致 | `version=1, kind=COMMIT, algo=X25519, flags=REQUIRE_ACK, body_len=48`；`assert_eq!(h, h2)` |
-| `commit_packet_roundtrip` | Commit 整包往返，总长 8+48=56B | `peer_id=[0xAB;16], commit=[0xCD;16]` |
-| `reveal_packet_x25519_roundtrip` | X25519 Reveal 整包往返，总长 8+80=88B | `peer_id=[0x12;16], pubkey=[0x99;32], nonce=[0x33;32]` |
+| `header_roundtrip` | 8B 头编解码往返一致 | `version=SIG_VERSION=2, kind=COMMIT, algo=X25519, flags=REQUIRE_ACK, body_len=48`；`assert_eq!(h, h2)` |
+| `rejects_legacy_unbound_handshake_version` | 拒绝未认证的 v1 握手 | v1 Reveal header → `None` |
+| `commit_packet_roundtrip` | Commit 整包往返，总长 8+48=56B | `peer_id=[0xAB;16], commit=[0xCD;16], session_nonce=[0xEF;16]` |
+| `reveal_packet_x25519_roundtrip` | X25519 Reveal 整包往返，总长 8+192=200B | 包含临时公钥、nonce、双方 session nonce、承诺和签名 |
 | `reject_bad_magic` | 魔数错误拒绝 | `[0x00,0x00,0x01,COMMIT,0x01,0x00,48,0x00]` → `decode` 为 `None` |
 | `reject_truncated` | 不足 8B 的截断头拒绝 | 7B 缓冲 → `None` |
 
@@ -1080,7 +1086,7 @@ pub use room_code::derive_room_code;
 ### 6.2 安全计算外置（本 crate 只定布局）
 
 6. **认证/签名计算均不在本 crate**：Probe/Heartbeat 的 `auth_tag`（HMAC-SHA256 截断 12B，覆盖前 19B）、Commit 的 `commit`（SHA-256 截断 16B）、StoreBody 的 `sender ↔ pubkey` SHA-256 绑定校验、SeedAdvertise 的 ed25519 签名/验签——本 crate 仅提供字段布局与 `signed_payload`/`payload_for_sign` 待签字节提取，实际密码学运算在 wgp-crypto 或上层。`md5` 是唯一例外（零依赖纪律下的自实现，且仅用于房间码标识符派生，13 §6 明确不作安全承诺）。
-7. **SigHeader::decode 不校验 version**：任何 version 字节都被接受（只校验魔数与 kind）；协议版本协商/拒绝逻辑需上层实现。
+7. **信令版本**：`SIG_VERSION=0x02`；`SigHeader::decode` 在协议层拒绝 v1 和未知版本。DHT RPC 另有自身兼容策略。
 
 ### 6.3 注释与代码不一致（代码如此，意图待确认）
 

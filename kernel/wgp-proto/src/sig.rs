@@ -1,7 +1,8 @@
 //! 信令包定长编解码（14 §11 协议版本化；00 §3 "禁止引入 serde/protobuf"）。
 //! 全部手写零分配解析；BodyLen 上限 200B 防恶意膨胀。
 
-use crate::consts::PROTO_VERSION;
+/// 当前承诺-揭示握手版本。v2 增加成员身份签名与双向新鲜挑战。
+pub const SIG_VERSION: u8 = 0x02;
 
 /// 信令魔数 "WG"（与 03 §3.2.3 思路一致）
 pub const SIG_MAGIC: [u8; 2] = [0x57, 0x47];
@@ -37,12 +38,14 @@ pub const PACKET_MAX: usize = HEADER_LEN + BODY_MAX;
 
 // —— 包类型 ——————————————————————————————————————————————————————
 
-/// 承诺包（33B body）
+/// 承诺包（48B body：peer_id + commit 前缀 + 会话挑战 nonce）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommitBody {
     pub peer_id: [u8; 16],
     /// SHA256(pubkey||nonce) 截断 16B
     pub commit: [u8; 16],
+    /// 每轮协商随机挑战值，用于拒绝旧 Reveal 重放。
+    pub session_nonce: [u8; 16],
 }
 
 impl CommitBody {
@@ -52,51 +55,86 @@ impl CommitBody {
         let mut out = [0u8; 48];
         out[0..16].copy_from_slice(&self.peer_id);
         out[16..32].copy_from_slice(&self.commit);
-        // 16B 保留位（未来算法标识扩展位，先置零）
+        out[32..48].copy_from_slice(&self.session_nonce);
         out
     }
 
     pub fn decode(buf: &[u8; 48]) -> Self {
         let mut peer_id = [0u8; 16];
         let mut commit = [0u8; 16];
+        let mut session_nonce = [0u8; 16];
         peer_id.copy_from_slice(&buf[0..16]);
         commit.copy_from_slice(&buf[16..32]);
-        Self { peer_id, commit }
+        session_nonce.copy_from_slice(&buf[32..48]);
+        Self {
+            peer_id,
+            commit,
+            session_nonce,
+        }
     }
 }
 
-/// 揭示包（X25519 模式 80B；Hybrid 模式长度由算法决定）
+/// 揭示包（X25519 模式 192B；Hybrid 模式长度由算法决定）
 #[derive(Debug, Clone)]
 pub struct RevealBody {
     pub peer_id: [u8; 16],
     pub pubkey: Vec<u8>, // X25519=32B；Hybrid=变长（由 algo 决定）
     pub nonce: [u8; 32],
+    /// 发送方 Commit 中的会话 nonce。
+    pub session_nonce: [u8; 16],
+    /// 接收方 Commit nonce 的回显，用于抵抗跨轮重放。
+    pub peer_session_nonce: [u8; 16],
+    /// 与先前 Commit 一致的承诺前缀。
+    pub commitment: [u8; 16],
+    /// 已登记房间成员的长期身份密钥对本次协商 transcript 的 Ed25519 签名。
+    pub identity_signature: [u8; 64],
 }
 
 impl RevealBody {
-    pub const BODY_LEN_X25519: u8 = 80;
+    pub const BODY_LEN_X25519: u8 = 192;
 
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(16 + self.pubkey.len() + 32);
+        let mut out = Vec::with_capacity(16 + self.pubkey.len() + 32 + 16 + 16 + 16 + 64);
         out.extend_from_slice(&self.peer_id);
         out.extend_from_slice(&self.pubkey);
         out.extend_from_slice(&self.nonce);
+        out.extend_from_slice(&self.session_nonce);
+        out.extend_from_slice(&self.peer_session_nonce);
+        out.extend_from_slice(&self.commitment);
+        out.extend_from_slice(&self.identity_signature);
         out
     }
 
     pub fn decode(buf: &[u8], expected_pubkey_len: usize) -> Option<Self> {
-        if buf.len() != 16 + expected_pubkey_len + 32 {
+        if buf.len() != 16 + expected_pubkey_len + 32 + 16 + 16 + 16 + 64 {
             return None;
         }
         let mut peer_id = [0u8; 16];
         let mut nonce = [0u8; 32];
+        let mut session_nonce = [0u8; 16];
+        let mut peer_session_nonce = [0u8; 16];
+        let mut commitment = [0u8; 16];
+        let mut identity_signature = [0u8; 64];
         peer_id.copy_from_slice(&buf[0..16]);
-        nonce.copy_from_slice(&buf[16 + expected_pubkey_len..]);
-        let pubkey = buf[16..16 + expected_pubkey_len].to_vec();
+        let nonce_start = 16 + expected_pubkey_len;
+        nonce.copy_from_slice(&buf[nonce_start..nonce_start + 32]);
+        let session_start = nonce_start + 32;
+        session_nonce.copy_from_slice(&buf[session_start..session_start + 16]);
+        let peer_session_start = session_start + 16;
+        peer_session_nonce.copy_from_slice(&buf[peer_session_start..peer_session_start + 16]);
+        let commit_start = peer_session_start + 16;
+        commitment.copy_from_slice(&buf[commit_start..commit_start + 16]);
+        let signature_start = commit_start + 16;
+        identity_signature.copy_from_slice(&buf[signature_start..]);
+        let pubkey = buf[16..nonce_start].to_vec();
         Some(Self {
             peer_id,
             pubkey,
             nonce,
+            session_nonce,
+            peer_session_nonce,
+            commitment,
+            identity_signature,
         })
     }
 }
@@ -146,6 +184,9 @@ impl SigHeader {
         if buf[0..2] != SIG_MAGIC {
             return None;
         }
+        if buf[2] != SIG_VERSION {
+            return None;
+        }
         let kind = buf[3];
         if kind != sig_type::COMMIT
             && kind != sig_type::REVEAL
@@ -184,7 +225,7 @@ impl SigPacket {
     pub fn commit(body: CommitBody, algo: u8, flags: u8) -> Self {
         Self {
             header: SigHeader {
-                version: PROTO_VERSION,
+                version: SIG_VERSION,
                 kind: sig_type::COMMIT,
                 algo,
                 flags,
@@ -195,10 +236,10 @@ impl SigPacket {
     }
 
     pub fn reveal(body: RevealBody, algo: u8, flags: u8) -> Self {
-        let body_len = (16 + body.pubkey.len() + 32) as u8;
+        let body_len = (16 + body.pubkey.len() + 32 + 16 + 16 + 16 + 64) as u8;
         Self {
             header: SigHeader {
-                version: PROTO_VERSION,
+                version: SIG_VERSION,
                 kind: sig_type::REVEAL,
                 algo,
                 flags,
@@ -211,7 +252,7 @@ impl SigPacket {
     pub fn commit_ack(algo: u8) -> Self {
         Self {
             header: SigHeader {
-                version: PROTO_VERSION,
+                version: SIG_VERSION,
                 kind: sig_type::COMMIT_ACK,
                 algo,
                 flags: 0,
@@ -226,7 +267,7 @@ impl SigPacket {
         reason.truncate(BODY_MAX - 1);
         Self {
             header: SigHeader {
-                version: PROTO_VERSION,
+                version: SIG_VERSION,
                 kind: sig_type::ERROR,
                 algo: 0,
                 flags: 0,
@@ -303,7 +344,7 @@ mod tests {
     #[test]
     fn header_roundtrip() {
         let h = SigHeader {
-            version: 1,
+            version: SIG_VERSION,
             kind: sig_type::COMMIT,
             algo: algo::X25519,
             flags: flag::REQUIRE_ACK,
@@ -320,6 +361,7 @@ mod tests {
         let body = CommitBody {
             peer_id: [0xAB; 16],
             commit: [0xCD; 16],
+            session_nonce: [0xEF; 16],
         };
         let pkt = SigPacket::commit(body, algo::X25519, 0);
         let bytes = pkt.encode();
@@ -338,10 +380,17 @@ mod tests {
             peer_id: [0x12; 16],
             pubkey: [0x99; 32].to_vec(),
             nonce: [0x33; 32],
+            session_nonce: [0x11; 16],
+            peer_session_nonce: [0x22; 16],
+            commitment: [0x66; 16],
+            identity_signature: [0x44; 64],
         };
         let pkt = SigPacket::reveal(body.clone(), algo::X25519, 0);
         let bytes = pkt.encode();
-        assert_eq!(bytes.len(), HEADER_LEN + 80);
+        assert_eq!(
+            bytes.len(),
+            HEADER_LEN + RevealBody::BODY_LEN_X25519 as usize
+        );
         let pkt2 = SigPacket::decode(&bytes).unwrap();
         if let SigBody::Reveal(r) = pkt2.body {
             assert_eq!(r.peer_id, body.peer_id);
@@ -350,6 +399,12 @@ mod tests {
         } else {
             panic!("expected Reveal");
         }
+    }
+
+    #[test]
+    fn rejects_legacy_unbound_handshake_version() {
+        let legacy = [SIG_MAGIC[0], SIG_MAGIC[1], 1, sig_type::REVEAL, algo::X25519, 0, 80, 0];
+        assert!(SigHeader::decode(&legacy).is_none());
     }
 
     #[test]

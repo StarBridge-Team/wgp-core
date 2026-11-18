@@ -243,7 +243,7 @@ impl Engine {
 | join_room | 同步 `→ RoomHandle` | `async → Result<RoomHandle, RoomError>`；**第一人加入自动建房**（房主=锚点） | DHT 读写天然异步；自动建房消除"建房与加入"双入口竞态 |
 | RoomHandle | `cancel()` | `leave()` | 语义更准（停 upkeep + 注销） |
 | 信令上下文 | 隐含 | 显式 `attach_dht(node, storage)` | 内核无隐式网络假设 |
-| mesh 边驱动 | join_room 内部驱动 | 外围 `SessionOrchestrator::connect_peer(room, peer, sink)`（client 的 member_watch 每 2s 感知新成员触发） | 打洞是对外部可见的副作用，归属编排层；join_room 仅保证入表；`connect_peer` commit 阶段 accept 放宽（Commit|Reveal），防成员加入时序错位导致的阶段漂移死锁 |
+| mesh 边驱动与认证 | join_room 内部驱动 | `connect_peer(room, peer, peer_identity_key, sink)`；外围传入签名房间记录中的成员公钥，内核再次核验房主签名记录及本端/对端成员身份；SIG v2 对 Commit/Reveal 与端点报告做身份签名 | 打洞是外部可见副作用；认证 transcript 绑定协议域、房间、双方 NodeId、临时密钥、承诺、nonce 与端点；SIG v1 不兼容，必须升级客户端 |
 | 竞速 | 未定义 | `race_punch` + `RaceOutcome`（UDP∥TCP 先通先用、一方先败不阻另一方）；T1 命中可跳过 UDP（`udp_enabled=false`） | 00 ADR D10 |
 | T1-T4 判定 | 文本 | `CircuitInput::tcp_triggered()` / `decide_race()` 纯函数 | 可单测的触发层 |
 | 载体集 | UDP/TCP | + ICMP 逃生（`IcEscape`，Win iphlpapi / Unix ping-socket 双后端）+ LAN 组播（`LanProbeCarrier`） | 00 ADR D11；Unix ICMP 后端待服务器首日编译验证 |
