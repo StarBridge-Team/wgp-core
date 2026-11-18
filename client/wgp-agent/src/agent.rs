@@ -65,11 +65,7 @@ pub struct Agent {
 }
 
 impl Agent {
-    pub fn new(
-        node: Arc<DhtNode>,
-        engine: Engine,
-        shutdown: watch::Sender<bool>,
-    ) -> Arc<Self> {
+    pub fn new(node: Arc<DhtNode>, engine: Engine, shutdown: watch::Sender<bool>) -> Arc<Self> {
         let agent = Arc::new(Self {
             node,
             engine,
@@ -189,15 +185,10 @@ impl Agent {
         }
         let eps = room::parse_seeds(&req.seeds).map_err(|e| (Status::BadRequest, e))?;
         let transport = room::choose_transport(&eps);
-        let pick = room::resolve_storage(
-            &self.node,
-            &eps,
-            transport,
-            &code,
-            req.storage.as_deref(),
-        )
-        .await
-        .map_err(|e| (Status::Internal, e))?;
+        let pick =
+            room::resolve_storage(&self.node, &eps, transport, &code, req.storage.as_deref())
+                .await
+                .map_err(|e| (Status::Internal, e))?;
         let cfg = room::build_port_config(&req).map_err(|e| (Status::BadRequest, e))?;
 
         // 选点之后，房间读写的承载以选中的候选为准（显式 storage 可能换了一条路）
@@ -218,10 +209,7 @@ impl Agent {
         let members = handle.members as u32;
         let created = pick.existed == Some(false);
         let room_id = wgp_dht::room_key(&code);
-        self.room_codes
-            .lock()
-            .await
-            .insert(room_id, code.clone());
+        self.room_codes.lock().await.insert(room_id, code.clone());
         self.rooms.lock().await.insert(
             code.clone(),
             RoomEntry {
@@ -251,10 +239,7 @@ impl Agent {
         } else {
             room::parse_observers(&req.observers)
         };
-        let tcp_seed = match eps
-            .iter()
-            .find(|e| e.scheme == wgp_proto::SeedScheme::Tcp)
-        {
+        let tcp_seed = match eps.iter().find(|e| e.scheme == wgp_proto::SeedScheme::Tcp) {
             Some(ep) => wgp_core::resolve_endpoint(ep).await,
             None => None,
         };
@@ -445,8 +430,7 @@ async fn punch_driver(
 ) {
     let sink: Arc<dyn wgp_core::LinkSink> = Arc::new(hub);
     let in_flight: Arc<Mutex<HashSet<NodeId>>> = Arc::new(Mutex::new(HashSet::new()));
-    let last_attempt: Arc<Mutex<HashMap<NodeId, Instant>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let last_attempt: Arc<Mutex<HashMap<NodeId, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
     let mut ticker = tokio::time::interval(MEMBER_POLL);
     loop {
         ticker.tick().await;
@@ -456,9 +440,11 @@ async fn punch_driver(
             }
             continue;
         };
-        agent.refresh_members(&code, record.members.len() as u32).await;
+        agent
+            .refresh_members(&code, record.members.len() as u32)
+            .await;
         let now = Instant::now();
-        for (member, _pk) in &record.members {
+        for (member, pk) in &record.members {
             if *member == my_id {
                 continue;
             }
@@ -478,6 +464,10 @@ async fn punch_driver(
                     continue;
                 }
             }
+            let Ok(peer_identity_key) = <[u8; 32]>::try_from(pk.as_slice()) else {
+                in_flight.lock().await.remove(member);
+                continue;
+            };
             let orch = orch.clone();
             let sink = sink.clone();
             let in_flight = in_flight.clone();
@@ -485,7 +475,9 @@ async fn punch_driver(
             let room = code.clone();
             let member = *member;
             tokio::spawn(async move {
-                let _ = orch.connect_peer(&room, member, sink).await;
+                let _ = orch
+                    .connect_peer(&room, member, peer_identity_key, sink)
+                    .await;
                 last_attempt.lock().await.insert(member, Instant::now());
                 in_flight.lock().await.remove(&member);
             });

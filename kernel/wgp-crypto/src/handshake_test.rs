@@ -8,9 +8,7 @@ mod tests {
     use crate::ka::{AnyAgreement, KeyAgreement};
     use rand_core::OsRng;
     use wgp_proto::consts::PROTO_VERSION;
-    use wgp_proto::sig::{
-        algo, sig_type, CommitBody, RevealBody, SigBody, SigPacket, SIG_MAGIC,
-    };
+    use wgp_proto::sig::{algo, sig_type, CommitBody, RevealBody, SigBody, SigPacket, SIG_MAGIC};
 
     /// 模拟两端各自走完"承诺-揭示-X25519-agree"全流程
     fn run_handshake(peer_a: [u8; 16], peer_b: [u8; 16]) -> (Commitment, Commitment) {
@@ -36,20 +34,28 @@ mod tests {
 
         // ④ 经 DHT 互发承诺包
         let c_pkt_a = SigPacket::commit(
-            CommitBody { peer_id: peer_a, commit: {
-                let mut c16 = [0u8; 16];
-                c16.copy_from_slice(&commit_a.0[..16]);
-                c16
-            }},
+            CommitBody {
+                peer_id: peer_a,
+                commit: {
+                    let mut c16 = [0u8; 16];
+                    c16.copy_from_slice(&commit_a.0[..16]);
+                    c16
+                },
+                session_nonce: [0xA1; 16],
+            },
             algo::X25519,
             0,
         );
         let c_pkt_b = SigPacket::commit(
-            CommitBody { peer_id: peer_b, commit: {
-                let mut c16 = [0u8; 16];
-                c16.copy_from_slice(&commit_b.0[..16]);
-                c16
-            }},
+            CommitBody {
+                peer_id: peer_b,
+                commit: {
+                    let mut c16 = [0u8; 16];
+                    c16.copy_from_slice(&commit_b.0[..16]);
+                    c16
+                },
+                session_nonce: [0xB2; 16],
+            },
             algo::X25519,
             0,
         );
@@ -58,12 +64,28 @@ mod tests {
 
         // ⑤ 互发揭示
         let r_pkt_a = SigPacket::reveal(
-            RevealBody { peer_id: peer_a, pubkey: pk_a.clone(), nonce: nonce_a },
+            RevealBody {
+                peer_id: peer_a,
+                pubkey: pk_a.clone(),
+                nonce: nonce_a,
+                session_nonce: [0xA1; 16],
+                peer_session_nonce: [0xB2; 16],
+                commitment: [0; 16],
+                identity_signature: [0; 64],
+            },
             algo::X25519,
             0,
         );
         let r_pkt_b = SigPacket::reveal(
-            RevealBody { peer_id: peer_b, pubkey: pk_b.clone(), nonce: nonce_b },
+            RevealBody {
+                peer_id: peer_b,
+                pubkey: pk_b.clone(),
+                nonce: nonce_b,
+                session_nonce: [0xB2; 16],
+                peer_session_nonce: [0xA1; 16],
+                commitment: [0; 16],
+                identity_signature: [0; 64],
+            },
             algo::X25519,
             0,
         );
@@ -81,8 +103,14 @@ mod tests {
         };
         let expect_a = commit(&reveal_a.pubkey, &reveal_a.nonce);
         let expect_b = commit(&reveal_b.pubkey, &reveal_b.nonce);
-        assert!(verify(&commit_b, &reveal_a.pubkey, &reveal_a.nonce), "MITM 检测 A");
-        assert!(verify(&commit_a, &reveal_b.pubkey, &reveal_b.nonce), "MITM 检测 B");
+        assert!(
+            verify(&commit_b, &reveal_a.pubkey, &reveal_a.nonce),
+            "MITM 检测 A"
+        );
+        assert!(
+            verify(&commit_a, &reveal_b.pubkey, &reveal_b.nonce),
+            "MITM 检测 B"
+        );
 
         // ⑦ ECDH 双方共享密钥必须一致
         let shared_a = ka.agree(&sk_a, &reveal_a.pubkey).expect("agree A");
@@ -98,14 +126,8 @@ mod tests {
         info.push(PROTO_VERSION);
         info.extend_from_slice(&SIG_MAGIC[..]);
 
-        let secrets_a = derive_all(
-            shared_a.as_slice().try_into().unwrap(),
-            &info,
-        );
-        let secrets_b = derive_all(
-            shared_b.as_slice().try_into().unwrap(),
-            &info,
-        );
+        let secrets_a = derive_all(shared_a.as_slice().try_into().unwrap(), &info);
+        let secrets_b = derive_all(shared_b.as_slice().try_into().unwrap(), &info);
         assert_eq!(secrets_a.session_key, secrets_b.session_key);
         assert_eq!(secrets_a.psk_identity, secrets_b.psk_identity);
         assert_eq!(secrets_a.probe_key, secrets_b.probe_key);
@@ -133,8 +155,8 @@ mod tests {
 
     #[test]
     fn mitm_detected_on_commit_swap() {
-        use rand_core::OsRng;
         use crate::ka::X25519Agreement;
+        use rand_core::OsRng;
         let mut rng = OsRng;
         let ka = X25519Agreement;
         let sk = ka.keygen(&mut rng);
@@ -169,12 +191,16 @@ mod tests {
     #[test]
     fn sig_type_routing() {
         let c = SigPacket::commit(
-            CommitBody { peer_id: [0; 16], commit: [0; 16] },
+            CommitBody {
+                peer_id: [0; 16],
+                commit: [0; 16],
+                session_nonce: [0; 16],
+            },
             algo::X25519,
             0,
         );
         let bytes = c.encode();
         assert_eq!(bytes[0..2], SIG_MAGIC);
-        assert_eq!(bytes[2], sig_type::COMMIT);
+        assert_eq!(bytes[3], sig_type::COMMIT);
     }
 }

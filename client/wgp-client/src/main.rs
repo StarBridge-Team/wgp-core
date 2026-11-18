@@ -470,10 +470,8 @@ async fn async_move(
     //
     // 承载选择：用户给的全是 tcp:// → 走 TCP 信令（UDP 被封时的兜底）。TCP 只能承担信令，
     // 打洞与数据面仍然需要 UDP，所以这里先把话说清楚，而不是等到入表阶段才超时。
-    let tcp_signaling = !endpoints.is_empty()
-        && endpoints
-            .iter()
-            .all(|ep| ep.scheme == SeedScheme::Tcp);
+    let tcp_signaling =
+        !endpoints.is_empty() && endpoints.iter().all(|ep| ep.scheme == SeedScheme::Tcp);
     let transport = if tcp_signaling {
         wgp_dht::Transport::Tcp
     } else {
@@ -481,9 +479,7 @@ async fn async_move(
     };
     node.set_signaling_transport(transport);
     if tcp_signaling {
-        println!(
-            "[信令] 使用 TCP 种子（UDP 被封时的兜底）：入表、选点、房间读写与报道中转走 TCP"
-        );
+        println!("[信令] 使用 TCP 种子（UDP 被封时的兜底）：入表、选点、房间读写与报道中转走 TCP");
         eprintln!(
             "[warn] 打洞与数据面仍然需要 UDP：两端之间 UDP 完全不通时隧道不会建立，\
              本端只能停在「已入表」"
@@ -518,9 +514,7 @@ async fn async_move(
             );
         }
         if !opts.allow_legacy_identity {
-            eprintln!(
-                "[hint] 若确认种子在线且是旧版本，加 --allow-legacy-identity 显式兼容旧协议"
-            );
+            eprintln!("[hint] 若确认种子在线且是旧版本，加 --allow-legacy-identity 显式兼容旧协议");
         }
     }
 
@@ -559,9 +553,15 @@ async fn async_move(
     }
 
     // ③ 房间键存储节点：显式优先；否则在已知种子里按房间键确定性选点
-    let (storage, room_exists, storage_transport) =
-        resolve_storage(&node, &code, &entries, &seeds, opts.storage.as_deref(), transport)
-            .await?;
+    let (storage, room_exists, storage_transport) = resolve_storage(
+        &node,
+        &code,
+        &entries,
+        &seeds,
+        opts.storage.as_deref(),
+        transport,
+    )
+    .await?;
 
     // 预热：让存储节点学习本端身份（失败不致命，但要给出可读原因）
     if let Err(e) = node.ping(storage).await {
@@ -989,12 +989,15 @@ async fn member_watch(
         let Ok(rec) = rt.fetch(&session.code).await else {
             continue;
         };
-        for (id, _pk) in &rec.members {
+        for (id, pk) in &rec.members {
             let id = *id;
+            let Ok(peer_identity_key) = <[u8; 32]>::try_from(pk.as_slice()) else {
+                continue;
+            };
             if id == my_id || !supervised.insert(id) {
                 continue;
             }
-            tokio::spawn(supervise_peer(session.clone(), id));
+            tokio::spawn(supervise_peer(session.clone(), id, peer_identity_key));
         }
     }
 }
@@ -1044,7 +1047,7 @@ async fn sleep_until_some(at: Option<tokio::time::Instant>) {
 
 /// 一个对端的链路监管：主动协商 → 等结果 → 失败/断开时按退避重试；全程挂着被动监听，
 /// 对端先发起（或重新发起）时立即响应——两端无需恰好同时动手。
-async fn supervise_peer(session: Arc<Session>, id: NodeId) {
+async fn supervise_peer(session: Arc<Session>, id: NodeId, peer_identity_key: [u8; 32]) {
     let peer = peer_id_from_node(&id);
     let name = hex(&peer);
     let mut state = session.states.subscribe(peer);
@@ -1052,7 +1055,7 @@ async fn supervise_peer(session: Arc<Session>, id: NodeId) {
     loop {
         let mut retry_at = match session
             .orch
-            .connect_peer(&session.code, id, session.sink.clone())
+            .connect_peer(&session.code, id, peer_identity_key, session.sink.clone())
             .await
         {
             Ok(()) => {
@@ -1595,9 +1598,7 @@ mod tests {
             }
         );
         // 没有任何已知种子：候选为空（调用方报错，而不是猜一个）
-        assert!(
-            storage_candidates(&[], &[dead_seed], &[], wgp_dht::Transport::Udp).is_empty()
-        );
+        assert!(storage_candidates(&[], &[dead_seed], &[], wgp_dht::Transport::Udp).is_empty());
     }
 
     #[test]

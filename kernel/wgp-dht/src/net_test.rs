@@ -313,6 +313,7 @@ mod tests {
             CommitBody {
                 peer_id: peer_a,
                 commit: commit16,
+                session_nonce: [0xA1; 16],
             },
             algo::X25519,
             0,
@@ -327,6 +328,10 @@ mod tests {
                 peer_id: peer_a,
                 pubkey: pk.clone(),
                 nonce,
+                session_nonce: [0xA1; 16],
+                peer_session_nonce: [0xB2; 16],
+                commitment: commit16,
+                identity_signature: [0; 64],
             },
             algo::X25519,
             0,
