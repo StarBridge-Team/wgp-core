@@ -2466,15 +2466,20 @@ mod tests {
 
     #[test]
     fn fallback_binary_is_looked_up_next_to_the_client() {
-        // 环境变量优先（别人可能把桥装在别处）
+        // 环境变量优先（别人可能把桥装在别处）；这条与平台无关
         assert_eq!(
             fallback_binary_path(Some(r"C:\tools\wgp-et-fallback.exe"), None).unwrap(),
             PathBuf::from(r"C:\tools\wgp-et-fallback.exe")
         );
-        // 空串当没给
-        let exe = Path::new(r"C:\apps\wgp-client.exe");
+        // 空串当没给：回退到"与当前 exe 同目录、同名（Windows 带 .exe）"
+        let exe = Path::new("apps/wgp-client");
         let got = fallback_binary_path(Some("  "), Some(exe)).unwrap();
-        assert_eq!(got, exe.with_file_name("wgp-et-fallback.exe"));
+        let want = exe.with_file_name(if cfg!(windows) {
+            "wgp-et-fallback.exe"
+        } else {
+            "wgp-et-fallback"
+        });
+        assert_eq!(got, want);
         // 连当前 exe 都不知道：可读错误，而不是猜一个路径
         let err = fallback_binary_path(None, None).unwrap_err();
         assert!(err.contains("WGP_ET_FALLBACK"), "{err}");
