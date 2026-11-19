@@ -28,6 +28,10 @@ pub enum RoomError {
     StoreFailed,
     NotExpired,
     PreemptedByOther,
+    /// 房间成员已满（[`crate::room::MAX_ROOM_MEMBERS`]）：显式拒绝，不落一份被截断的记录
+    RoomFull,
+    /// 记录本身超出 STORE 值上限（成员表 + PoW 凭证）：显式失败
+    RecordTooLarge,
 }
 
 /// 选点时最多向多少个候选（离房间键最近的）发起查询
@@ -240,7 +244,7 @@ impl RoomRuntime {
 
     /// 签名并存储记录
     pub async fn publish(&self, code: &str, record: &RoomRecord) -> Result<(), RoomError> {
-        let signed = sign_room(&self.identity, record);
+        let signed = sign_room(&self.identity, record).ok_or(RoomError::RecordTooLarge)?;
         self.rpc_store(room_key(code), signed)
             .await
             .map_err(|_| RoomError::StoreFailed)
@@ -254,7 +258,10 @@ impl RoomRuntime {
         Ok(next)
     }
 
-    /// 成员注册（仅锚点执行）：成员表追加后重签重存
+    /// 成员注册（仅锚点执行）：成员表追加后重签重存。
+    ///
+    /// 容量边界（审计 M5）：成员数已达 [`crate::room::MAX_ROOM_MEMBERS`] 时返回
+    /// [`RoomError::RoomFull`]，旧记录原样保留——绝不写一份会被 STORE 截断、读回来验签失败的记录。
     pub async fn add_member(
         &self,
         code: &str,
@@ -270,9 +277,17 @@ impl RoomRuntime {
         if record.members.iter().any(|(id, _)| *id == member_id) {
             return Ok(record.clone());
         }
+        if record.is_full() {
+            // 满员：显式失败。调用方据此给用户「房间已满」的提示，而不是让他一直补报道
+            return Err(RoomError::RoomFull);
+        }
         let mut next = record.clone();
         next.members.push((member_id, member_pk));
         next.lease.renew(now_ms);
+        // 先按容量上限验一遍再落盘：PoW 凭证过长也会在这里失败
+        if next.try_encode().is_none() {
+            return Err(RoomError::RecordTooLarge);
+        }
         self.publish(code, &next).await?;
         Ok(next)
     }
@@ -487,6 +502,7 @@ impl JoinRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::room::MAX_ROOM_MEMBERS;
     use rand_core::OsRng;
 
     async fn spawn_node() -> Arc<DhtNode> {
@@ -616,7 +632,7 @@ mod tests {
         // 篡改：把 Bob 塞进成员表但不重签 → 直接 publish 伪造
         record.members.push((node_id_of(&bob_node), pk_of(&bob_node)));
         let forged = sign_room(&owner_node.identity(), &record); // 用另一个身份签（Bob 不当锚点）
-        let _ = forged;
+        assert!(forged.is_some(), "两个成员仍在容量上限内");
         // 直接存储"未签名伪造体"：篡改成员表的字节流
         let body = record.encode();
         let mut tampered = Vec::new();
@@ -1031,6 +1047,40 @@ mod tests {
         let (owner_rt, _, _, _, _) = setup().await;
         let r = owner_rt.fetch("U/NO-SUCH-ROOM-0000-0000").await;
         assert_eq!(r, Err(RoomError::NotFound));
+    }
+
+    /// 审计 M5：房间满员时显式失败，且**不覆盖**已有的合法记录
+    #[tokio::test]
+    async fn add_member_refuses_when_room_is_full() {
+        const CODE: &str = "U/FULL-ROOM-0001-AA11";
+        let (owner_rt, _owner_node, _, bob_node, _) = setup().await;
+        let mut rec = owner_rt.create(CODE, 0).await.unwrap();
+
+        // 房主已占 1 个位置，再补到上限
+        for i in 0..(MAX_ROOM_MEMBERS - 1) as u8 {
+            let mut id = [0u8; 32];
+            id[0] = 100 + i;
+            rec = owner_rt
+                .add_member(CODE, &rec, NodeId(id), vec![0xAB; 32], 0)
+                .await
+                .expect("上限内应能入表");
+        }
+        assert_eq!(rec.members.len(), MAX_ROOM_MEMBERS);
+
+        let before = owner_rt.fetch(CODE).await.unwrap();
+        let late = owner_rt
+            .add_member(CODE, &before, node_id_of(&bob_node), pk_of(&bob_node), 0)
+            .await;
+        assert_eq!(late, Err(RoomError::RoomFull), "满员必须显式失败");
+        assert_eq!(
+            owner_rt.fetch(CODE).await.unwrap(),
+            before,
+            "失败不得改写存储节点上的旧记录"
+        );
+        assert!(!before
+            .members
+            .iter()
+            .any(|(id, _)| *id == node_id_of(&bob_node)));
     }
 
     #[test]

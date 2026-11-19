@@ -6,6 +6,23 @@ use sha2::{Digest, Sha256};
 use wgp_proto::consts::{
     LEASE_INTERVAL_S, LEASE_TIMEOUT_S, OLD_LINK_GRACE_S, ROOM_KEY_DOMAIN,
 };
+use wgp_proto::dht::STORE_VALUE_MAX;
+
+/// 房间成员上限（审计 M5）。
+///
+/// 记录要整块塞进一次 STORE（值上限 [`STORE_VALUE_MAX`] = 1024B）：
+/// `64B 签名 + 50B 记录头 + N×64B 成员 + 1B pow 长度 + pow`。
+/// N=12 时固定部分是 `64 + 50 + 12×64 + 1 = 883B`，留给 PoW 凭证 141B——够用且不越界。
+///
+/// 定这个上限的真正目的不是「够不够用」，而是**让越界显式失败**：旧实现在
+/// `encode()` 里写 `members.len() as u8`（超过 255 会静默回绕），超长记录又会被
+/// `StoreBody::encode` 静默截断到 1024B——两种都是「签名看着有效、成员表其实已被改」
+/// 的静默数据损坏。现在编码走 [`RoomRecord::try_encode`]，越界返回 `None`，
+/// 锚点侧直接报 [`RoomError::RoomFull`]，绝不落一份坏记录。
+pub const MAX_ROOM_MEMBERS: usize = 12;
+
+/// 房间记录（含签名）能安全编码出的最大字节数
+pub const ROOM_RECORD_MAX: usize = STORE_VALUE_MAX;
 
 /// U/ 房间码 → DHT 房间键（13 文档"未来 DHT 冷启动的房间键"落定）
 pub fn room_key(room_code: &str) -> [u8; 32] {
@@ -13,6 +30,30 @@ pub fn room_key(room_code: &str) -> [u8; 32] {
     h.update(ROOM_KEY_DOMAIN);
     h.update(room_code.as_bytes());
     h.finalize().into()
+}
+
+/// 由房间键派生「ET 回退」用的临时网络名与密钥（没有 wgp 种子时借 EasyTier 公共节点组网）。
+///
+/// 为什么在房间里派生：ET 只按「网络名 + 密钥摘要」做准入，所以这两个值就是那张临时网的
+/// 全部准入凭据。用房间键派生意味着**只有拿到房间码的人能算出它们**（房间码 → 房间键是
+/// 单向的），不同房间天然互不可见；代价是房间码泄露 = 临时网泄露，与现有房间语义一致。
+///
+/// 与桥侧 `wgp_et_bridge::fallback::derive_network` 逐字节一致（桥在独立 workspace 里，
+/// 无法直接引用本函数；两边用同一组测试向量钉住，见本模块与桥的 `network_is_derived…` 测试）：
+/// - 网络名 = `wgp-` + 房间键前 4 字节的十六进制（8 个字符，便于人眼在 ET 日志里区分房间）；
+/// - 密钥   = 房间键第 8..24 字节的十六进制（32 个字符，128 bit，取中段避开名前缀）。
+pub fn et_fallback_network(room_key: &[u8; 32]) -> (String, String) {
+    let hex = |bytes: &[u8]| -> String {
+        let mut s = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            s.push_str(&format!("{b:02x}"));
+        }
+        s
+    };
+    (
+        format!("wgp-{}", hex(&room_key[..4])),
+        hex(&room_key[8..24]),
+    )
 }
 
 /// 锚点租约
@@ -100,31 +141,55 @@ pub struct RoomRecord {
 /// version(1) | epoch(8) | anchor(32) | expires(8) | count(1)
 /// | count × (node_id 32 + pubkey 32) | pow_len(1) | pow
 impl RoomRecord {
-    pub fn encode(&self) -> Vec<u8> {
+    /// 成员数是否已到上限（锚点侧据此显式拒绝新成员）
+    pub fn is_full(&self) -> bool {
+        self.members.len() >= MAX_ROOM_MEMBERS
+    }
+
+    /// 结构化记录编码。**成员表越界或总长超 STORE 值上限时返回 `None`**——绝不静默截断。
+    pub fn try_encode(&self) -> Option<Vec<u8>> {
+        if self.members.len() > MAX_ROOM_MEMBERS {
+            return None;
+        }
         let mut out = Vec::with_capacity(64 + self.members.len() * 64);
         out.push(0x01); // version
         out.extend_from_slice(&self.lease.epoch.to_be_bytes());
         out.extend_from_slice(&self.lease.anchor.0);
         out.extend_from_slice(&self.lease.expires_at_ms.to_be_bytes());
-        out.push(self.members.len() as u8);
+        out.push(self.members.len() as u8); // <= MAX_ROOM_MEMBERS，不会回绕
         for (id, pk) in &self.members {
             out.extend_from_slice(&id.0);
-            debug_assert_eq!(pk.len(), 32);
-            out.extend_from_slice(&pk[..32.min(pk.len())]);
             if pk.len() != 32 {
-                // 防御：非 32B 公钥用零补齐
-                let need = 32usize.saturating_sub(pk.len());
-                out.extend_from_slice(&vec![0u8; need]);
+                // 防御：非 32B 公钥用零补齐（成员表本身已由签名与身份绑定校验守住）
+                let mut padded = [0u8; 32];
+                let n = pk.len().min(32);
+                padded[..n].copy_from_slice(&pk[..n]);
+                out.extend_from_slice(&padded);
+                continue;
             }
+            out.extend_from_slice(pk);
         }
         match &self.pow {
             Some(p) => {
+                if p.len() > u8::MAX as usize {
+                    return None;
+                }
                 out.push(p.len() as u8);
                 out.extend_from_slice(p);
             }
             None => out.push(0),
         }
-        out
+        // 整块（签名 + 记录）必须落在 STORE 值上限内，否则会被 StoreBody 截断
+        if out.len() + 64 > ROOM_RECORD_MAX {
+            return None;
+        }
+        Some(out)
+    }
+
+    /// 同 [`Self::try_encode`]，越界视为程序错误（只用于已校验容量的内部路径与测试）
+    pub fn encode(&self) -> Vec<u8> {
+        self.try_encode()
+            .expect("房间记录超出容量上限：调用方必须先检查 try_encode")
     }
 
     pub fn decode(buf: &[u8]) -> Option<Self> {
@@ -139,6 +204,9 @@ impl RoomRecord {
         anchor_arr.copy_from_slice(&buf[9..41]);
         let expires_at_ms = u64::from_be_bytes(buf[41..49].try_into().ok()?);
         let count = buf[49] as usize;
+        if count > MAX_ROOM_MEMBERS {
+            return None; // 超出本实现的容量上限：既不接受也不转述
+        }
         let mut i = 50usize;
         let mut members = Vec::with_capacity(count);
         for _ in 0..count {
@@ -181,14 +249,18 @@ impl RoomRecord {
     }
 }
 
-/// 签名房间记录（锚点以长期身份签名；DHT 存储值 = signature(64) || record_bytes）
-pub fn sign_room(identity: &NodeIdentity, record: &RoomRecord) -> Vec<u8> {
-    let body = record.encode();
+/// 签名房间记录（锚点以长期身份签名；DHT 存储值 = signature(64) || record_bytes）。
+///
+/// 记录超出容量上限（成员过多 / PoW 凭证过长）时返回 `None`——签名一份会被 STORE 截断的
+/// 记录等于自欺：读回来验签必然失败，别人看到的是「房间坏了」。调用方应把 `None` 转成
+/// 明确的错误（见 `RoomError::RoomFull` / `RoomError::RecordTooLarge`）。
+pub fn sign_room(identity: &NodeIdentity, record: &RoomRecord) -> Option<Vec<u8>> {
+    let body = record.try_encode()?;
     let sig = identity.sign(&body);
     let mut out = Vec::with_capacity(64 + body.len());
     out.extend_from_slice(&sig.to_bytes());
     out.extend_from_slice(&body);
-    out
+    Some(out)
 }
 
 /// 验证签名房间记录：锚点公钥须在成员表中；签名不匹配/结构损坏 → None
@@ -311,5 +383,87 @@ mod tests {
         assert_eq!(line[0], anchor(1));
         assert_eq!(line[1], anchor(5));
         assert_eq!(line[2], anchor(9));
+    }
+
+    /// ET 回退的临时网络：同一房间稳定、不同房间互不相同、形状与桥侧一致。
+    #[test]
+    fn et_fallback_network_is_room_scoped_and_stable() {
+        // 与桥侧测试同一组向量（bridge/wgp-et-bridge/src/fallback.rs 的
+        // `network_is_derived_from_the_room_key`）：0,1,2,…,31 的房间键
+        let mut key = [0u8; 32];
+        for (i, b) in key.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let (name, secret) = et_fallback_network(&key);
+        assert_eq!(name, "wgp-00010203", "名字带房间键前 4 字节");
+        assert_eq!(
+            secret, "08090a0b0c0d0e0f1011121314151617",
+            "密钥是房间键第 8..24 字节"
+        );
+
+        // 同一房间：两侧必须算出完全一样的网络（否则加不进同一张临时网）
+        assert_eq!(et_fallback_network(&key), (name.clone(), secret.clone()));
+
+        // 不同房间：名字与密钥都不同（名字只覆盖 4 字节，所以这里同时改名字段与密钥字段）
+        let mut other = key;
+        other[0] ^= 0xff;
+        other[20] ^= 0xff;
+        let (other_name, other_secret) = et_fallback_network(&other);
+        assert_ne!(other_name, name);
+        assert_ne!(other_secret, secret);
+
+        // 形状与字符集：名字 = "wgp-" + 8 位小写十六进制；密钥 = 32 位小写十六进制
+        let is_hex = |s: &str| {
+            s.chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+        };
+        for seed in [0u8, 7, 0x5a, 0xff] {
+            let (n, s) = et_fallback_network(&[seed; 32]);
+            assert!(n.starts_with("wgp-"), "{n}");
+            assert_eq!(n.len(), 12, "wgp- 加 4 字节十六进制：{n}");
+            assert!(is_hex(&n[4..]), "{n}");
+            assert_eq!(s.len(), 32, "16 字节密钥写 32 个十六进制字符：{s}");
+            assert!(is_hex(&s), "{s}");
+        }
+    }
+
+    fn full_record() -> RoomRecord {
+        RoomRecord {
+            members: (0..MAX_ROOM_MEMBERS)
+                .map(|i| (anchor(i as u8), vec![1u8; 32]))
+                .collect(),
+            lease: Lease::new(1, anchor(0), 0),
+            pow: None,
+        }
+    }
+
+    /// 审计 M5：记录编码绝不静默截断（成员数回绕 / 整块超 STORE 值上限）
+    #[test]
+    fn record_encoding_refuses_to_truncate() {
+        // 上限内：成员数如实写出，解码回得来
+        let rec = full_record();
+        let body = rec.try_encode().expect("上限内应可编码");
+        assert_eq!(body.len(), 50 + MAX_ROOM_MEMBERS * 64 + 1);
+        assert_eq!(body[49] as usize, MAX_ROOM_MEMBERS, "成员数必须如实写出");
+        assert_eq!(RoomRecord::decode(&body).unwrap().members.len(), MAX_ROOM_MEMBERS);
+        // 含 64B 签名在内必须落在一次 STORE 的值上限里
+        assert!(body.len() + 64 <= ROOM_RECORD_MAX);
+
+        // 多一个成员：显式 None（旧实现会把 13 写进 1 字节……超过 255 时静默回绕）
+        let mut over = rec.clone();
+        over.members.push((anchor(99), vec![2u8; 32]));
+        assert!(over.is_full(), "13 个成员已满");
+        assert!(over.try_encode().is_none(), "超出成员上限必须显式失败");
+        assert!(sign_room(&NodeIdentity::generate(&mut rand_core::OsRng), &over).is_none());
+
+        // PoW 凭证长度超过 u8 能表达的范围：显式 None
+        let mut big_pow = rec.clone();
+        big_pow.pow = Some(vec![0u8; 256]);
+        assert!(big_pow.try_encode().is_none(), "PoW 凭证过长必须显式失败");
+
+        // 解码侧同样守住上限：把 count 改大 → 拒绝
+        let mut tampered = body.clone();
+        tampered[49] = (MAX_ROOM_MEMBERS + 1) as u8;
+        assert!(RoomRecord::decode(&tampered).is_none());
     }
 }

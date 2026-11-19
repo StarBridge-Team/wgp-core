@@ -11,11 +11,13 @@
 //! 确实在所报地址上**证明持有该身份私钥**（挑战响应）。P0 不做信任评分：目录里的种子只代表
 //! 「存在且持有该身份」，不代表可信。
 
+use crate::addr::EndpointScope;
 use crate::advertise::{sign_advertise_v2, verify_advertise_v2, AdvertiseSpec};
 use crate::auth::{self, bound_identity};
 use crate::directory::{advert_addr, RawAdvert, SeedDirectory, SeedInfo, Verdict};
 use crate::id::{NodeId, NodeIdentity};
 use crate::kbucket::RoutingTable;
+use crate::ratelimit::{ByteBudget, ByteBudgetPolicy, RateGate, RatePolicy};
 use rand_core::OsRng;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
@@ -333,6 +335,15 @@ pub struct DhtNode {
     issued: Mutex<HashMap<[u8; AUTH_NONCE_LEN], (SocketAddr, Instant)>>,
     /// 入站挑战应答的限速状态
     auth_gate: Mutex<AuthGate>,
+    /// DHT socket 上直接应答 STUN 时的限速闸门（审计 M6：与观察者共用一套机制）。
+    /// 同一个 socket 既收 DHT RPC 又当观察者用，不设闸门就是一条无成本的上行放大面。
+    stun_gate: Mutex<RateGate>,
+    /// 放大应答（NEIGHBORS / VALUE / SEEDS）的字节预算（审计 M3 的缓解部分）
+    response_budget: Mutex<ByteBudget>,
+    /// 端点地址准入策略（审计 M2）：默认只收公网地址
+    endpoint_scope: AtomicU8,
+    /// 是否识别前置代理注入的 PROXY protocol v2（默认关闭；见 proxy_protocol 模块文档）
+    proxy_protocol: AtomicBool,
     /// 身份证明策略（严格 / 兼容旧 PING-PONG）
     identity_policy: AtomicU8,
     /// 对外信令的承载方式（UDP / TCP 兜底）。切换后所有出站 RPC 都按它分派，
@@ -354,6 +365,8 @@ impl DhtNode {
         let socket = Arc::new(UdpSocket::bind(local).await?);
         let identity = Arc::new(identity);
         let (inbox_tx, inbox_rx) = mpsc::channel(INBOX_CAP);
+        // 端点准入的初始策略取自实际绑定地址：绑回环/私网就是本机或局域网节点
+        let scope = EndpointScope::from_local_bind(socket.local_addr()?);
 
         let node = Arc::new(Self {
             socket: socket.clone(),
@@ -379,6 +392,10 @@ impl DhtNode {
             route_probe_cursor: Mutex::new(0),
             issued: Mutex::new(HashMap::new()),
             auth_gate: Mutex::new(AuthGate::new()),
+            stun_gate: Mutex::new(RateGate::new(RatePolicy::default())),
+            response_budget: Mutex::new(ByteBudget::new(ByteBudgetPolicy::default())),
+            endpoint_scope: AtomicU8::new(scope.as_u8()),
+            proxy_protocol: AtomicBool::new(false),
             identity_policy: AtomicU8::new(IdentityPolicy::Strict.as_u8()),
             signaling: AtomicU8::new(Transport::Udp.as_u8()),
             legacy_fallbacks: AtomicU64::new(0),
@@ -404,15 +421,36 @@ impl DhtNode {
                 let Some(node) = loop_node.upgrade() else {
                     break;
                 };
-                if let Some(pkt) = RpcPacket::decode(&buf[..n]) {
+                // 前置代理（FRP / nginx stream 等）注入 PROXY v2 时先剥掉头：
+                // STUN 用头里的真实来源出报告，RPC 只用剩下的载荷解帧。
+                let proxy_v2 = node.proxy_protocol();
+                let (claimed, body): (SocketAddr, &[u8]) = if proxy_v2 {
+                    match crate::proxy_protocol::strip_v2(&buf[..n]) {
+                        Some((info, rest)) => (info.source.unwrap_or(src), rest),
+                        None => (src, &buf[..n]),
+                    }
+                } else {
+                    (src, &buf[..n])
+                };
+                if let Some(pkt) = RpcPacket::decode(body) {
                     node.dispatch(pkt, Sink::Udp(src)).await;
-                } else if n == seed_advertise_v2::LEN
-                    && classify(&buf[..n]) == Some(seed_advertise_v2::TYPE)
+                } else if body.len() == seed_advertise_v2::LEN
+                    && classify(body) == Some(seed_advertise_v2::TYPE)
                 {
                     // 别的节点推送来的种子广告（非 RPC：定长报文，无应答）
-                    node.on_pushed_advert(&buf[..n]).await;
-                } else if let Some(resp) = crate::observe::try_answer_stun(&buf[..n], src) {
-                    let _ = node.socket.send_to(&resp, src).await;
+                    node.on_pushed_advert(body).await;
+                } else if let Some((_who, resp)) =
+                    crate::observe::try_answer_stun_ex(body, claimed, proxy_v2)
+                {
+                    // STUN 应答与观察者服务共用限速机制（审计 M6）：没人能从 DHT socket
+                    // 上无成本地刷出上行流量。限速按**声称的真实来源**计数（代理后面就是客户端）。
+                    let admitted = {
+                        let mut gate = node.stun_gate.lock().await;
+                        gate.admit(claimed.ip(), Instant::now())
+                    };
+                    if admitted {
+                        let _ = node.socket.send_to(&resp, src).await;
+                    }
                 }
             }
         });
@@ -476,6 +514,41 @@ impl DhtNode {
 
     pub fn signaling_transport(&self) -> Transport {
         Transport::from_u8(self.signaling.load(Ordering::Relaxed))
+    }
+
+    /// 设置端点地址准入策略（审计 M2）。默认 [`EndpointScope::Public`]：只收公网地址。
+    ///
+    /// 本机多进程联调、局域网部署（含 FRP 落在内网）要显式切到
+    /// [`EndpointScope::LocalNetwork`]，否则回环/私网地址的广告会被当作无效广告丢弃。
+    pub fn set_endpoint_scope(&self, scope: EndpointScope) {
+        self.endpoint_scope.store(scope.as_u8(), Ordering::Relaxed);
+    }
+
+    pub fn endpoint_scope(&self) -> EndpointScope {
+        EndpointScope::from_u8(self.endpoint_scope.load(Ordering::Relaxed))
+    }
+
+    /// 该端点是否可作为目的地址（按当前策略）
+    fn endpoint_ok(&self, addr: SocketAddr) -> bool {
+        is_usable_endpoint(addr, self.endpoint_scope())
+    }
+
+    /// 是否识别前置代理注入的 PROXY protocol v2（默认关闭）。
+    ///
+    /// 打开后：UDP 端口上的 STUN 应答会用头里的**真实客户端地址**做映射报告（观察者口径），
+    /// TCP 信令会在连接开头先吃掉这段头再解帧。**只能在「本端口只可能被可信代理访问」时打开**，
+    /// 否则任何人都能自称任意来源（污染映射报告、地址簿与限速）。
+    pub fn set_proxy_protocol(&self, enabled: bool) {
+        self.proxy_protocol.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn proxy_protocol(&self) -> bool {
+        self.proxy_protocol.load(Ordering::Relaxed)
+    }
+
+    /// 覆盖 DHT socket 上直接应答 STUN 的限速策略（运维配置注入；默认见 `RatePolicy`）
+    pub async fn set_stun_rate_policy(&self, policy: RatePolicy) {
+        self.stun_gate.lock().await.set_policy(policy);
     }
 
     /// 某个种子在当前承载下的可探测端点：UDP 模式用广告里的 DHT 地址，
@@ -799,7 +872,7 @@ impl DhtNode {
             .collect();
         drop(book);
         let pkt = RpcPacket::neighbors(txid, NeighborsBody { nodes: entries });
-        self.sink_send(sink, pkt.encode()).await;
+        self.sink_send_amplified(sink, pkt.encode()).await;
     }
 
     /// 按出口类型投递应答字节（UDP 回源 / TCP 写连接）
@@ -812,6 +885,25 @@ impl DhtNode {
                 let _ = tx.send(bytes);
             }
         }
+    }
+
+    /// 投递**放大应答**（NEIGHBORS / VALUE / SEEDS）：UDP 出口先按源 IP 记账字节预算。
+    ///
+    /// 这三类应答可以远大于请求（最多约 20 倍），而 UDP 源地址可伪造——不设预算就是
+    /// 现成的反射放大器（审计 M3 的缓解部分，真正的 cookie 方案要改协议）。超预算静默
+    /// 丢弃：请求方超时重试，攻击者拿不到放大倍数。TCP 出口是已完成三次握手的连接，
+    /// 不存在伪造源，不记账。
+    async fn sink_send_amplified(&self, sink: &Sink, bytes: Vec<u8>) {
+        if let Sink::Udp(addr) = sink {
+            let admitted = {
+                let mut budget = self.response_budget.lock().await;
+                budget.admit(addr.ip(), bytes.len(), Instant::now())
+            };
+            if !admitted {
+                return;
+            }
+        }
+        self.sink_send(sink, bytes).await;
     }
 
     /// 报文分发（UDP 读循环与 TCP 连接读端共用同一逻辑）
@@ -942,7 +1034,7 @@ impl DhtNode {
                     pkt.header.txid,
                     ValueBody { key: body.key, value },
                 );
-                self.sink_send(&sink, resp.encode()).await;
+                self.sink_send_amplified(&sink, resp.encode()).await;
             }
             RpcBody::Value(body) => {
                 if let Some(Pending::Value(tx)) = self.pending.lock().await.remove(&pkt.header.txid)
@@ -1159,7 +1251,11 @@ impl DhtNode {
 
     /// 单条 TCP 信令连接：读端解帧 → dispatch(Sink::Tcp)；写端将应答帧回灌。
     /// 空闲超时关闭（防慢连接长期占用名额）。
-    async fn serve_tcp_conn(&self, stream: TcpStream) {
+    async fn serve_tcp_conn(&self, mut stream: TcpStream) {
+        // 前置代理注入 PROXY v2 时先把头吃掉（只用 peek 确认签名，不消费正常流量）
+        if self.proxy_protocol() {
+            let _ = read_proxy_v2(&mut stream).await;
+        }
         let (mut rd, mut wr) = stream.into_split();
         let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let writer = tokio::spawn(async move {
@@ -1367,13 +1463,10 @@ struct Candidate {
 }
 
 /// 广告所报端点是否可用作目的地址（只做格式层面的排除；是否可达由探活回答）
-fn is_usable_endpoint(addr: SocketAddr) -> bool {
-    match addr.ip() {
-        IpAddr::V4(ip) => {
-            addr.port() != 0 && !ip.is_unspecified() && !ip.is_broadcast() && !ip.is_multicast()
-        }
-        IpAddr::V6(_) => false,
-    }
+///
+/// 具体规则见 [`EndpointScope`]：默认只收公网地址，本机/局域网联调要显式切换策略。
+fn is_usable_endpoint(addr: SocketAddr, scope: EndpointScope) -> bool {
+    scope.allows(addr)
 }
 
 /// 固定窗口限速：`gate` = (窗口起点, 窗口内已放行数)；每秒至多放行 ADVERT_VERIFY_PER_SEC 次
@@ -1490,6 +1583,7 @@ impl DhtNode {
         entry: &[SocketAddr],
     ) -> Vec<(NodeId, SocketAddr)> {
         let me = self.node_id();
+        let scope = self.endpoint_scope();
         let mut seen: HashSet<SocketAddr> = entry.iter().copied().collect();
         // (转述者声称的身份, 地址)；入口端点的身份未知（None），排序时排最前
         let mut pending: Vec<(Option<NodeId>, SocketAddr)> =
@@ -1527,7 +1621,7 @@ impl DhtNode {
                 }
                 for entry in neighbors {
                     let addr = SocketAddr::from((entry.ipv4, entry.port));
-                    if entry.id != me.0 && is_usable_endpoint(addr) && seen.insert(addr) {
+                    if entry.id != me.0 && is_usable_endpoint(addr, scope) && seen.insert(addr) {
                         pending.push((Some(NodeId(entry.id)), addr));
                     }
                 }
@@ -1737,7 +1831,7 @@ impl DhtNode {
             .await
             .closest_raw(&NodeId(req.target), req.quota(), own);
         let pkt = RpcPacket::seeds(txid, SeedsBody { adverts });
-        self.sink_send(sink, pkt.encode()).await;
+        self.sink_send_amplified(sink, pkt.encode()).await;
     }
 
     /// 验签一条入站广告，并按目录现状决定去向（同端点的更新广告在这里就地刷新）
@@ -1746,7 +1840,7 @@ impl DhtNode {
             return AdvertStep::Rejected;
         };
         let addr = advert_addr(&adv);
-        if id == self.node_id() || !is_usable_endpoint(addr) {
+        if id == self.node_id() || !self.endpoint_ok(addr) {
             return AdvertStep::Rejected;
         }
         let mut packet: RawAdvert = [0u8; seed_advertise_v2::LEN];
@@ -1957,6 +2051,36 @@ impl DhtNode {
         self.routing.lock().await.remove(&id);
         self.addr_book.lock().await.remove(&id);
     }
+}
+
+/// 若连接以 PROXY protocol v2 头开头，读掉它并返回头里声明的真实源地址。
+///
+/// 用 `peek` 先确认签名：不是 v2 就一个字节都不消费——同一个端口上「配了代理」和
+/// 「没配代理」的客户端可以共存，不会把正常帧当成头。
+async fn read_proxy_v2(stream: &mut TcpStream) -> Option<SocketAddr> {
+    use crate::proxy_protocol;
+    // 等头到达（代理连接建立后会立刻发头；正常客户端则永远不会发这 12 字节）
+    let mut sig = [0u8; 12];
+    let mut rounds = 0;
+    while rounds < 40 {
+        match stream.peek(&mut sig).await {
+            Ok(n) if n >= sig.len() => break,
+            Ok(_) => {}
+            Err(_) => return None,
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        rounds += 1;
+    }
+    if !proxy_protocol::looks_like_v2(&sig) {
+        return None;
+    }
+    let mut head = [0u8; proxy_protocol::FIXED_LEN];
+    stream.read_exact(&mut head).await.ok()?;
+    let addr_len = u16::from_be_bytes([head[14], head[15]]) as usize;
+    let mut full = vec![0u8; proxy_protocol::FIXED_LEN + addr_len];
+    full[..proxy_protocol::FIXED_LEN].copy_from_slice(&head);
+    stream.read_exact(&mut full[proxy_protocol::FIXED_LEN..]).await.ok()?;
+    proxy_protocol::parse_v2(&full).and_then(|info| info.source)
 }
 
 /// 写一帧：`[u16 BE 长度][payload]`
@@ -2647,14 +2771,26 @@ mod tests {
 
     #[test]
     fn endpoint_usability_filter() {
-        let ok = |s: &str| is_usable_endpoint(s.parse().unwrap());
-        assert!(ok("203.0.113.7:11010"));
-        assert!(ok("127.0.0.1:11010"), "回环地址不在格式层排除（本机联调要用；远程一侧探活自然失败）");
+        let ok = |s: &str| is_usable_endpoint(s.parse().unwrap(), EndpointScope::Public);
+        let local = |s: &str| is_usable_endpoint(s.parse().unwrap(), EndpointScope::LocalNetwork);
+        assert!(ok("1.1.1.1:11010"));
+        assert!(ok("8.8.8.8:3478"));
+        // 公网策略下回环/私网/文档网段一律不准入（审计 M2）
+        assert!(!ok("127.0.0.1:11010"), "回环地址不是公网端点");
+        assert!(!ok("10.0.0.5:11010"), "RFC1918 不是公网端点");
+        assert!(!ok("203.0.113.7:11010"), "TEST-NET-3 是文档地址，不可路由");
+        // 局域网策略显式放宽：本机多进程联调才用
+        assert!(local("127.0.0.1:11010"));
+        assert!(local("10.0.0.5:11010"));
+        // 两种策略都不接受这些
         assert!(!ok("0.0.0.0:11010"));
         assert!(!ok("255.255.255.255:11010"));
         assert!(!ok("224.0.0.1:11010"));
+        assert!(!ok("100.64.0.1:11010"));
         assert!(!ok("203.0.113.7:0"));
         assert!(!ok("[::1]:11010"));
+        assert!(!local("0.0.0.0:11010"));
+        assert!(!local("100.64.0.1:11010"));
     }
 
     #[test]

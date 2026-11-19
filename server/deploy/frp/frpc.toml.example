@@ -1,0 +1,53 @@
+# frpc.toml.example —— **仅作参考，本项目不下载、不安装、不管理 frpc**
+#
+# 为什么只是参考：用第三方 FRP 服务时，frpc 的版本、参数、甚至二进制都由服务商提供
+# （很多服务商要求用他们分发的 frpc，或者干脆在网页面板里填映射，根本不用你写配置）。
+# 自己下载一个 frpc 往往连不上。所以这里只说明「节点侧需要配合什么」，
+# 具体怎么起 frpc 由你和服务商决定。
+#
+# 拓扑：
+#   公网对端 ──► frps(公网IP:21010/23478/23481) ──► frpc ──► wgp-node(本机 11010/3478/3481)
+#
+# 与之配套的 wgp-node 启动参数（三个外部端口必须显式给出，否则别人连的是错的端口）：
+#   wgp-node --bind 0.0.0.0:11010 --stun 3478 --tcp 3481 \
+#            --advertise <frps 的公网 IPv4 或 DDNS 域名> \
+#            --advertise-dht-port 21010 \
+#            --advertise-stun-port 23478 \
+#            --advertise-tcp-port 23481
+#
+# 若你的服务商/自建 frps 会在转发时注入 **PROXY protocol v2**（把真实客户端地址放在
+# 连接/数据报最前面），给 wgp-node 加 `--proxy-protocol v2`，观察者与信令就会用真实来源
+# 而不是中继地址（详见 DEPLOY.md §10.6）。没有这个能力就别开，否则正常流量会被当成坏包。
+#
+# 注意：
+#   * 这里的 localPort 必须与 wgp-node 实际监听端口一致（默认 11010 / 3478 / 3481）。
+#   * 本机不需要、也不应该在路由器上做端口映射：入站流量全部经 frps 进来。
+
+serverAddr = "frps.example.com"   # 或 frps 的公网 IPv4
+serverPort = 7000
+auth.method = "token"
+auth.token = "REPLACE_WITH_LONG_RANDOM_TOKEN"
+
+# 断线不退出：wgp-node 与 frpc 都是常驻服务，断了要自己接上
+loginFailExit = false
+
+[[proxies]]
+name = "wgp-dht-udp"
+type = "udp"
+localIP = "127.0.0.1"
+localPort = 11010
+remotePort = 21010
+
+[[proxies]]
+name = "wgp-stun-udp"
+type = "udp"
+localIP = "127.0.0.1"
+localPort = 3478
+remotePort = 23478
+
+[[proxies]]
+name = "wgp-tcp-signal"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 3481
+remotePort = 23481

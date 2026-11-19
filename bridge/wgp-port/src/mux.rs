@@ -418,6 +418,18 @@ pub struct Tunnel {
 }
 
 impl Tunnel {
+    /// 取走入站数据报的接收端，换上一个新的空通道。
+    ///
+    /// 给「不使用端口转发、而是自己按端口分流数据报」的调用方（例如 ET 桥接把 IP 帧放数据报里传）：
+    /// 直接把字段移出去会让 `Tunnel` 处于半残状态，所以在原位置换一个没人用的通道。
+    /// 换出来的旧接收端由调用方持有；此后再发到该隧道的入站数据报都只进这个旧通道。
+    pub fn take_dgrams(&mut self) -> mpsc::Receiver<InboundDgram> {
+        let (tx, rx) = mpsc::channel(1);
+        // 新通道的发送端立刻丢掉：之后若还有人从 `self.dgrams` 读，只会读到通道关闭
+        drop(tx);
+        std::mem::replace(&mut self.dgrams, rx)
+    }
+
     /// 接管内核交付物，启动隧道（必须在 tokio 运行时内调用）。
     ///
     /// `local`：本端 PeerId。收发密钥方向与流号奇偶都由双方 PeerId 的字节序决定，

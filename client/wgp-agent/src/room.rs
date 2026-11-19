@@ -63,6 +63,8 @@ pub async fn resolve_storage(
         let addr = resolve_endpoint(&ep)
             .await
             .ok_or_else(|| format!("storage 无法解析为地址：{spec}"))?;
+        // 端点准入（审计 M2）：显式存储节点若是回环/私网地址，说明这是本机或局域网形态
+        node.set_endpoint_scope(wgp_dht::scope_for_endpoints([addr]));
         let explicit_transport = match ep.scheme {
             SeedScheme::Tcp => Transport::Tcp,
             SeedScheme::Udp => Transport::Udp,
@@ -95,6 +97,9 @@ pub async fn resolve_storage(
             transport.scheme()
         ));
     }
+    // 端点准入（审计 M2）：与客户端同一规则——入口里出现回环/私网地址就放宽，
+    // 否则只收公网地址（避免公共目录被内网地址污染，也让本机联调无需额外开关）
+    node.set_endpoint_scope(wgp_dht::scope_for_endpoints(entries.iter().copied()));
     node.discover(&entries).await;
     node.seek_seeds(wgp_dht::NodeId(wgp_dht::room_key(code)))
         .await;

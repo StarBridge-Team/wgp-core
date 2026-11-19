@@ -131,6 +131,31 @@ mod frame {
 /// 对端只报告了实测映射端口、没有步长模型时，兜底模型取的置信度（中档：±400 窗口）
 const OBSERVED_PORT_CONFIDENCE: f64 = 0.5;
 
+/// 把「回退形态对外宣告的端点」写进端点报告（[`SessionOrchestrator::with_advertise_override`]）。
+///
+/// 为什么需要：ET 回退时本端的真实地址空间在桥后面——观察者看到的映射端口是**桥**的
+/// 服务端口（3478）而不是打洞载体的端口，对端照它撒网只会打到桥上，永远打不到打洞载体。
+/// 桥已经约定好"对端按 `绑定地址:punch(我)` 找过来"，所以这里直接用桥给的 `(bind, punch)`
+/// 顶替观察者报告，并把 `udp_ok` 置 true（对端据此仍走 UDP 路径，而不是被 T1 判成
+/// "UDP 不可用"降级成纯 TCP——桥上根本没有 TCP 通道）。
+///
+/// 同时**作废观察者学到的步长模型**（`has_model` / `last_port` / 步长 / 置信度）：模型里的
+/// `last_port` 就是观察者看到的桥端口，保留它会让对端把首包直打到桥上，与上面那句
+/// "按 punch(我) 找过来" 直接冲突。清掉以后对端按 `peer_model_from` 的兜底分支建模，
+/// 中心正是这里覆盖进去的 punch 端口。
+fn apply_advertise_override(ep: &mut frame::Endpoints, advertised: Option<(Ipv4Addr, u16)>) {
+    let Some((ip, port)) = advertised else {
+        return;
+    };
+    ep.ipv4 = ip.octets();
+    ep.port = port;
+    ep.udp_ok = true;
+    ep.has_model = false;
+    ep.last_port = 0;
+    ep.mean_delta_q = 0;
+    ep.confidence = 0;
+}
+
 /// 由对端的端点报告重建它的端口模型（供三波规划预测对端端口）。
 ///
 /// 对端学出了步长模型就照搬；没学出（观察者丢包或限频导致三连测不全）但报告了实测映射
@@ -304,6 +329,10 @@ pub struct SessionOrchestrator {
     /// 种子的 TCP 信令兜底地址（UDP 被封/受限时同发一份；None = 无 TCP 通道）
     storage_tcp: Option<SocketAddr>,
     observers: Vec<SocketAddr>,
+    /// 打洞载体（[`UdpProbeCarrier`]）的绑定地址；None = 内核默认的 `0.0.0.0:0`（临时端口）
+    punch_bind: Option<SocketAddr>,
+    /// 端点交换时顶替观察者报告的对外端点；None = 如实报告观察者看到的地址
+    advertise_override: Option<(Ipv4Addr, u16)>,
 }
 
 impl SessionOrchestrator {
@@ -319,6 +348,8 @@ impl SessionOrchestrator {
             storage,
             storage_tcp: None,
             observers,
+            punch_bind: None,
+            advertise_override: None,
         }
     }
 
@@ -326,6 +357,29 @@ impl SessionOrchestrator {
     /// 设置后，信令每次重传同时经 UDP 与 TCP 各投一份（Fire-and-forget + 幂等 accept）。
     pub fn with_tcp_fallback(mut self, storage_tcp: Option<SocketAddr>) -> Self {
         self.storage_tcp = storage_tcp;
+        self
+    }
+
+    /// 指定打洞载体的绑定地址（默认 `0.0.0.0:0`，即由系统挑一个临时端口）。
+    ///
+    /// **为什么需要**：ET 回退时打洞报文要穿过桥。桥在回退形态下按派生端口
+    /// （`42100 + peer_id % 900`）把对端报文**固定写回** `127.0.0.1:<punch>`
+    /// （房主侧）或"本机应用最近从这个端口发出的地址"（加入方侧），所以本端的打洞载体
+    /// 必须正好坐在 `<punch>` 上：绑定临时端口的话，桥写回来的那枚报文没有任何 socket 接收，
+    /// 打洞永远收不到对端探针。代价是同一台机器上不能同时跑两个回退客户端（抢同一个 UDP 端口），
+    /// 跨机部署没有这个问题。
+    pub fn with_punch_bind(mut self, punch_bind: Option<SocketAddr>) -> Self {
+        self.punch_bind = punch_bind;
+        self
+    }
+
+    /// 用给定端点顶替观察者报告的对外端点（`(ipv4, 端口)`），并把 `udp_ok` 置 true。
+    ///
+    /// **为什么需要**：ET 回退时本端在桥后面，观察者看到的是桥的地址与端口，而不是本端
+    /// 打洞载体的端口。加入方要让对端按 `127.0.0.2:punch(我)` 找过来，所以由外围把桥
+    /// READY 行里的 `(bind, punch)` 注入这里，端点交换（④）时直接用它替代观察结果。
+    pub fn with_advertise_override(mut self, advertised: Option<(Ipv4Addr, u16)>) -> Self {
+        self.advertise_override = advertised;
         self
     }
 
@@ -520,7 +574,12 @@ impl SessionOrchestrator {
         // —— ② 密钥族派生 + 打洞 socket（学习与打洞同源端口，03 §3.4）——
         let secrets = derive_all(&shared, &info_ctx(room_code, my_node_id, peer_node_id));
         let tag4 = tag.to_be_bytes();
-        let carrier = UdpProbeCarrier::bind("0.0.0.0:0".parse().unwrap(), secrets.probe_key, tag4)
+        // 绑定地址默认临时端口；ET 回退时由外围指定成桥派生出的固定打洞端口（见
+        // `with_punch_bind` 的 doc 注释：桥只会把对端报文写回那个端口）
+        let punch_bind = self
+            .punch_bind
+            .unwrap_or_else(|| SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0));
+        let carrier = UdpProbeCarrier::bind(punch_bind, secrets.probe_key, tag4)
             .await
             .map_err(|_| OrchestratorError::NoRoute)?;
 
@@ -530,8 +589,8 @@ impl SessionOrchestrator {
         let mut model: Option<PortStepModel> = None;
         let mut first_ok: Option<SocketAddr> = None;
         for &obs in self.observers.iter() {
-            let mut txid = [0u8; 12];
-            txid[..4].copy_from_slice(&my_peer_id[..4]);
+            // 每次探测用独立随机 txid（审计 M1）：可预测的 txid 让攻击者能提前拼出应答
+            let (txid, _nonce) = crate::engine::nat_probe::fresh_probe_ids();
             if let Some(r) = probe.probe_observer(obs, txid, None).await {
                 my_mapped = Some((r.ipv4, r.port));
                 first_ok = Some(obs);
@@ -562,6 +621,9 @@ impl SessionOrchestrator {
             full_commit: my_commit.0,
             identity_signature: [0; 64],
         };
+        // ET 回退：用桥给的 (bind, punch) 顶替观察者报告（必须在签名之前，
+        // 否则签名盖住的是旧端点，对端复验会失败）
+        apply_advertise_override(&mut my_ep, self.advertise_override);
         let endpoint_transcript =
             endpoint_signing_message(room_code, tag, my_node_id, peer_node_id, &my_ep);
         my_ep.identity_signature = self.node.identity().sign(&endpoint_transcript).to_bytes();
@@ -1195,6 +1257,78 @@ mod tests {
         })
         .is_none());
         assert!(peer_model_from(&frame::Endpoints { port: 0, ..base }).is_none());
+    }
+
+    /// ET 回退：端点交换时用桥给的 `(bind, punch)` 顶替观察者报告。
+    #[test]
+    fn advertise_override_replaces_observed_endpoint() {
+        // 观察者看到的实例：桥的服务端口 3478，且已学出步长模型
+        let observed = frame::Endpoints {
+            ipv4: [127, 0, 0, 2],
+            port: 3478,
+            udp_ok: true,
+            tcp_ok: true,
+            has_model: true,
+            last_port: 3478,
+            mean_delta_q: 3 * 64,
+            confidence: 90,
+            full_commit: [0x33; 32],
+            identity_signature: [0x44; 64],
+        };
+
+        // 没配置 override：一个字节都不许改（默认行为不变）
+        let mut untouched = observed;
+        apply_advertise_override(&mut untouched, None);
+        assert_eq!(untouched.port, 3478);
+        assert_eq!(untouched.ipv4, [127, 0, 0, 2]);
+        assert!(untouched.has_model);
+        assert_eq!(untouched.confidence, 90);
+
+        // 配置了 override：ipv4/端口换成桥的自报值，udp_ok 置 true，观察者模型作废
+        let mut overridden = observed;
+        apply_advertise_override(&mut overridden, Some((Ipv4Addr::new(127, 0, 0, 2), 42_133)));
+        assert_eq!(overridden.ipv4, [127, 0, 0, 2]);
+        assert_eq!(overridden.port, 42_133, "必须换成桥的 punch 端口");
+        assert!(overridden.udp_ok, "回退形态下对端仍应走 UDP 路径");
+        assert!(!overridden.has_model, "桥端口学出来的步长模型必须作废");
+        assert_eq!(overridden.last_port, 0);
+        assert_eq!(overridden.mean_delta_q, 0);
+        assert_eq!(overridden.confidence, 0);
+        // 承诺与签名不受影响（签名由调用方在覆盖之后重算）
+        assert_eq!(overridden.full_commit, [0x33; 32]);
+    }
+
+    /// 覆盖之后，对端的撒网首包必须落在 punch 端口上——这是回退形态能打通的全部理由。
+    #[test]
+    fn advertise_override_points_the_peer_punch_at_the_bridge_port() {
+        let mut ep = frame::Endpoints {
+            // 观察者看到的是桥上那个端口，且它还给出了步长模型
+            ipv4: [127, 0, 0, 2],
+            port: 3478,
+            udp_ok: true,
+            tcp_ok: true,
+            has_model: true,
+            last_port: 3478,
+            mean_delta_q: 0,
+            confidence: 80,
+            full_commit: [0; 32],
+            identity_signature: [0; 64],
+        };
+        // 没覆盖：对端会把首包直打桥端口（回退形态下等于打到服务口，什么也打不通）
+        let before = peer_model_from(&ep).expect("有模型");
+        assert_eq!(
+            wgp_punch::plan_waves(Some(&before), 7, 47).wave1.first(),
+            Some(&3478)
+        );
+
+        apply_advertise_override(&mut ep, Some((Ipv4Addr::new(127, 0, 0, 2), 42_133)));
+        let after = peer_model_from(&ep).expect("UDP 可用即有兜底模型");
+        assert_eq!(after.last_port, 42_133);
+        assert_eq!(
+            wgp_punch::plan_waves(Some(&after), 7, 47).wave1.first(),
+            Some(&42_133),
+            "撒网首包应打向桥派生出的打洞端口"
+        );
     }
 
     /// 端点帧/承诺帧体来自网络，任何长度都必须安全解析（回归：空帧体曾触发切片越界 panic）

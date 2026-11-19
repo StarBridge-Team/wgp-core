@@ -1,0 +1,33 @@
+# frps.toml.example —— **仅作参考，本项目不安装、不启动、不管理 frps/frpc**
+#
+# 用途：自建 FRP 中继时的服务端配置样例。用第三方 FRP 服务的话，这份文件与你无关——
+# 服务商面板/文档会告诉你该填什么端口、token 从哪来。
+#
+# 部署（由你自己决定，本项目不代劳）：
+#   sudo install -d /etc/frp && sudo cp frps.toml.example /etc/frp/frps.toml
+#   sudo vi /etc/frp/frps.toml      # 改 token、按需改 allowPorts
+#   frps -c /etc/frp/frps.toml      # 或用 systemd 单元
+#
+# 注意：
+#   * 中继机必须放行 bindPort（默认 7000/TCP）与下面 allowPorts 里的三个远端端口；
+#   * UDP 代理按「访客」跟踪：种子主动推给别人的广告在还没有访客时会被丢弃，
+#     所以 FRP 形态的种子主要靠被别人 PING / FIND_SEEDS / FIND_VALUE 访问；
+#   * token 就是这层隧道的唯一凭据：用长随机串，不要出现在仓库、聊天记录或截图里。
+
+bindPort = 7000
+
+# 鉴权（强烈建议开启）
+auth.method = "token"
+auth.token = "REPLACE_WITH_LONG_RANDOM_TOKEN"
+
+# 只允许我们规划的三个远端端口，避免这台机器被当成任意端口的开放中继
+allowPorts = [
+  { start = 21010, end = 21010 },  # DHT UDP   → 对应 wgp-node --advertise-dht-port
+  { start = 23478, end = 23478 },  # STUN UDP  → --advertise-stun-port
+  { start = 23481, end = 23481 },  # TCP 信令  → --advertise-tcp-port
+]
+
+# 日志（排障时把 level 调到 info）
+log.to = "/var/log/frps.log"
+log.level = "info"
+log.maxDays = 7

@@ -52,9 +52,12 @@
 | `stun` | `3478` | 观察者/STUN 端口，`none` 关闭 |
 | `tcp` | `3481` | TCP 信令端口，`none` 关闭 |
 | `hobby` | `true` | 贡献模式（本二进制恒为 true） |
-| `advertise` | 不宣告 | 本节点的公网 IPv4；宣告后能被其他种子与客户端自动发现（地址会变的家宽先别开） |
+| `advertise` | 不宣告 | 本节点的对外地址：公网 IPv4 或 DDNS 域名；宣告后能被其他种子与客户端自动发现。写域名时按 `ddns_refresh` 自动重解析并重宣告 |
+| `advertise_dht_port` / `advertise_stun_port` / `advertise_tcp_port` | `0`（= 本机） | 对外 DHT/STUN/TCP 端口（路由器换了外部端口或走 FRP 时必须显式给出） |
+| `ddns_refresh` | `300` | DDNS 域名重解析周期（秒；0 = 只在启动时解析） |
+| `allow_local_endpoints` | `false` | 接受回环/私网端点（局域网或本机联调） |
 | `peers` | 无 | 启动时去认识的其他种子，逗号分隔（`udp://主机:端口`） |
-| `observer_rate_limit` / `observer_rate_window` | `12` / `10` | 观察者每 IP 限频 |
+| `observer_rate_limit` / `observer_rate_window` | `60` / `10` | 观察者每 IP 限频（≈15 个成员并发协商） |
 | `identity` | `node_identity.key` | 身份文件路径 |
 | `log_level` | `info` | `error`/`warn`/`info`/`debug` |
 

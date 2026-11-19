@@ -120,6 +120,29 @@ mesh-tun-proto 一行未改。
 
 网络安全审计中的高危会话 MITM 已在当前代码中修复：协商 transcript 由房间成员长期身份签名，绑定双方 NodeId、房间键派生值、临时密钥/nonce、Commit 与每轮随机挑战；端点报告也签名，`connect_peer` 会重新验证房间签名记录并确认本端和对端成员身份。信令版本升为 v2，旧版客户端不兼容。回归测试与 Windows workspace 测试通过，但真实公网/NAT 测试仍未做。分类和后续任务见 [`reports/network-security-vps-task-triage-2026-11-18.md`](reports/network-security-vps-task-triage-2026-11-18.md)。
 
+## 本轮补记（2026-11-19）：审计中低难度项 + FRP/DDNS 部署 + ET 推进
+
+按交接报告里「中等难度 M1/M2/M5/M6 + 全部简单项」收口，并新增两条产品能力：
+
+| 主题 | 结果 | 落点 |
+|---|---|---|
+| STUN 响应绑定 | 类型/txid/nonce/映射地址四道校验 + 来源地址绑定 + CSPRNG txid | `wgp-core::engine::nat_probe`（5 个新用例） |
+| 端点地址准入 | 默认只收公网地址（回环/RFC1918/链路本地/CGNAT/保留/文档网段/IPv6 全拒），局域网形态显式放宽 | `wgp-dht::addr`（新）、`--allow-local-endpoints`（node / client） |
+| 房间容量 | `MAX_ROOM_MEMBERS=12`；`try_encode` 不再静默截断；满员 `RoomFull` 且不改写旧记录 | `wgp-dht::room`、`runtime` |
+| 入站限速 | 单源窗口 + 全局每秒 + 源表上限的统一闸门；DHT socket 上的 STUN 也纳入；放大应答加字节预算 | `wgp-dht::ratelimit`（新）、`observe`、`node` |
+| 种子部署 | `--advertise` 支持 DDNS 域名并自动重宣告；外部端口可独立（FRP / 端口映射）；`--allow-local-endpoints` | `wgp-core::AdvertiseTarget`、`wgp-node`、`server/deploy/frp/*`、`install-seed-frp.sh` |
+| 简单项 | 观察者默认额度 12→60 次/10s（另加全局）；TCP-only 文案；测试临时目录不再互相删除；格式整治仍单独立项 | 见 [`20-变更追补-2026-11.md`](项目完整文档/20-变更追补-2026-11.md) §22 |
+| ET（TUN 之外） | mesh-tun-proto 升到 **0.2.0**：路由同步按连接关系合并、RPC 分片重组、保活/对端超时、Data flags、虚拟 IPv4 与冲突检测；补 CHANGELOG/.gitattributes/CI。桥接侧：数据帧走隧道数据报、确定性开流、双向 IP 帧与第三节点加入/离开验收通过 | `mesh-tun-proto`（独立仓库）、`bridge/wgp-et-bridge`、`bridge/wgp-port::Tunnel::take_dgrams` |
+
+ET 仍未做：TUN 设备、与官方 EasyTier 节点对测、面向用户的主 CLI；轻量客户端只能当叶子（不替别人转发）。
+版本号已升到 **0.1.2**，部署主线是「公网 VPS」与「NAT 机手动端口映射」，FRP 是没有公网 IPv4 时的可选扩展。
+
+验证：`cargo check --workspace --all-targets` 0 warning；`cargo test --workspace` 全绿（22 个测试目标，0 failed）。
+**仍然没有真实 NAT / 真实 FRP / 真实 DDNS 验证**——脚本与参数解析有测试，拓扑可用性只有检查表。
+
+M3 只做了「不改变报文格式」的缓解（放大应答字节预算），**源地址 cookie 仍待协议决策**；
+M4/M7-M12 未动（都需要先有 M12 的基线与多机环境）。
+
 ## 3. 现在卡在哪
 
 ### 3.1 最大的未知：真实网络
@@ -142,14 +165,14 @@ mesh-tun-proto 一行未改。
 | 3 | ~~入站 PING 不证明私钥持有权~~ **已修（2026-11-16）** | 一次一密挑战响应（`AUTH_CHALLENGE/PROOF/REJECT`），签名绑定域、双方 NodeId、txid 与新鲜 nonce，验证通过前不写路由表/地址簿。旧节点需 `--allow-legacy-identity` 才被采信。残留风险见 17 §11.8 第 1 条：在线中继仍可把「别人的身份」证明到自己的地址上（可用性问题，探活连续失败即淘汰） |
 | 14 | 普通 DHT 路由桶死项不主动淘汰 | 本轮已加每 20s 最多 8 项的轮转探活，连续 3 次失败后删除路由及地址簿；需要多机/真实网络压测确认间隔与误删率 |
 | 15 | DHT 节点释放不能停止 UDP 接收任务 | 本轮读任务改持 `Weak` 并监听 sender 关闭；固定端口丢弃后重绑回归测试通过 |
-| 4 | FIND_NODE / FIND_VALUE 应答远大于请求 | UDP 源地址可伪造，这两个既有 RPC 是约 20 倍的反射放大器。新增的 FIND_SEEDS 已按「应答不长于请求」设计，旧的没动（改了就是协议变更） |
-| 5 | 观察者限频与用量不匹配 | 默认每 IP 12 次 / 10s，而每次协商每端要 4 次：同一公网 IP 下多人或多对端并发协商会被限 |
+| 4 | FIND_NODE / FIND_VALUE 应答远大于请求 | UDP 源地址可伪造，这两个既有 RPC 是约 20 倍的反射放大器。FIND_SEEDS 已按「应答不长于请求」设计。**2026-11-19**：三类放大应答（NEIGHBORS/VALUE/SEEDS）加了按源 IP 的字节预算（单源 32 KiB/s、全局 1 MiB/s），但彻底的源地址 cookie 要改线协议，仍待决策 |
+| 5 | ~~观察者限频与用量不匹配~~ **已修（2026-11-19）** | 默认从 12 次/10s 提到 60 次/10s（≈15 个成员并发协商），并加全局 600 次/秒兜底；`--observer-rate-limit` 仍可覆盖 |
 | 6 | 弱房间名 / 密钥可被离线猜解 | 存储节点知道 room_key（房间码的哈希），可对弱口令做字典攻击。「开房」不给密钥时默认随机生成 |
 | 7 | 房间记录仍是单存储点（K=1） | 存储节点掉线则房间不可达；两端认识的种子不一样时靠「跟随既有房间」缓解，不能根除分裂。一旦同一个房间被建到了两个种子上，之后即使种子目录补全也不会自愈 |
 | 8 | 协商最后一帧丢失 | 「两将军」问题：一端以为完成、另一端超时；靠客户端的重试兜底 |
 | 9 | Unix 的 ICMP 逃生后端收不到包 | socket 设了非阻塞又立即同步读；该载体本来也没有接线 |
 | 10 | 重度乱序下可靠层吞吐低 | 标准阈值把乱序判成丢包；调优要等真实数据 |
-| 11 | `--advertise` 只支持固定 IPv4 | 家宽动态 IP 的节点换了地址要重启；外部端口必须与本机端口一致 |
+| 11 | ~~`--advertise` 只支持固定 IPv4~~ **已修（2026-11-19）** | 现在接受 `ipv4 / DDNS 域名 / none`；域名按 `--ddns-refresh`（默认 300s）重解析，地址变化自动换纪元重宣告。外部端口可用 `--advertise-{dht,stun,tcp}-port` 独立指定（FRP / 端口映射）。仍未做 UPnP/NAT-PMP 自动映射与 IPv6 广告 |
 | 12 | P0 不校验信任 | 任何人都能宣告自己是种子并可能被选为存储节点；目录只代表「存在且连得上」 |
 | 13 | `rust-version = "1.75"` 与锁文件不符 | 锁定的 `zeroize_derive 1.5.0` 要求 Rust 1.85 以上（用 1.83 构建会在解析依赖时失败）。基线就是如此；CI 用最新稳定版，不受影响 |
 | 16 | 多进程阶段 1 的已知缺口 | `GetSnapshot.links` 恒为空；`LeaveRoom` 不释放转发端口（`PortHub` 没有关监听的 API）；多房间共用一份 `Engine`，暂定只开一个；IPC 只有「同一用户」这一层鉴权，没有方法级授权与重放保护。逐条写在 `client/wgp-agent/README.md` |
@@ -232,7 +255,7 @@ mesh-tun-proto 一行未改。
 - **发版工作流配置**（`.github/workflows/release.yml`）：代码已实现，推送 `v*` 标签时构建 8 个目标并发布为 **pre-release**；但截至 2026-11-16 检查，当前远端分支有 workflow 文件，`main` 尚无此文件，Actions run / pushed tag / Release 均为 0，因此还没有发生自动发版：
 
   ```
-  git tag v0.1.0-preview.1 && git push origin v0.1.0-preview.1
+  git tag v0.1.2 && git push origin v0.1.2
   ```
 
   Windows：x86_64 / i686 / ARM64；Linux（musl 静态）：x86_64 / i686 / ARM64 / ARMv7 / 龙架构 64。
@@ -277,7 +300,7 @@ target\release\wgp-client join -n t -k k -p udp://127.0.0.1:11010 -i b.key --for
 **标签还没打**——公开预览版发布是刻意留到下次的：
 
 `ash
-git tag v0.1.0-preview.1 && git push origin v0.1.0-preview.1     # 会真的发布公开 pre-release
+git tag v0.1.2 && git push origin v0.1.2     # 会真的发布公开 pre-release
 `
 
 打完标签要核对：Release 页面 8 个资产 + SHA256SUMS.txt + 每目标 .sha256；把 run/Release 链接补进本文 §6。

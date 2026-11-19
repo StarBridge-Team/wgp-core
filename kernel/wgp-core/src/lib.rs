@@ -23,7 +23,9 @@ pub mod transport;
 #[cfg(feature = "client")]
 pub mod types;
 
-pub use engine::{Engine, LinkStream, NodeConfig, NodeHandle, NodeRole};
+pub use engine::{
+    AdvertisePorts, AdvertiseTarget, Engine, LinkStream, NodeConfig, NodeHandle, NodeRole,
+};
 #[cfg(feature = "client")]
 pub use engine::{PunchInput, RoomHandle};
 pub use event::{
