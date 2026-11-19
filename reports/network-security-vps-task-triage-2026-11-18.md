@@ -112,9 +112,17 @@
 
 ### ET（TUN 之外）
 
-见 `bridge/wgp-et-bridge/README.md` 与 mesh-tun-proto 仓库的 `CHANGELOG.md`；本轮把路由同步合并、RPC 分片重组、
-数据帧走隧道数据报通道、确定性开流规则等落在库侧，并把 mesh-tun-proto 的提交/CI/文档补齐。
-**TUN 设备、与官方 EasyTier 节点互通仍未做**（前者需要 Wintun 驱动与管理员权限，后者需要一台真实官方节点对测）。
+- **mesh-tun-proto 0.2.0**（独立仓库）：`link_state` 路由同步按版本号增量合并 + 按连接关系图算可达性/下一跳、
+  `rpc_merge` 重组官方节点的分片 RPC、保活与对端超时、Data 帧标志位、虚拟 IPv4 分配与冲突检测、
+  `PeerInfo` 的 `ipv4_str` 语义修正（行为变化已标注）。仓库管理补齐：CHANGELOG、`.gitattributes`、
+  Linux/Windows CI、去掉未使用的 `stun` 依赖。`cargo test` 40 个全绿。
+- **wgp-et-bridge**：数据帧改走隧道数据报通道（控制帧留可靠流）、按 PeerId 的确定性开流、
+  双向 IP 帧与「第三节点加入/离开」验收；新增 `wgp-port::Tunnel::take_dgrams`。
+  6 个单测 + 2 个集成用例全绿（回环）。
+- **没做**：TUN 设备（Wintun 驱动/管理员权限）、与官方 EasyTier 节点对测、面向用户的主 CLI；
+  轻量客户端是叶子，不替别的节点转发，两个叶子之间必须有真正的 ET relay。
+- 无种子回退（经 ET 公共节点建临时网络）的可行性评估见
+  [`et-fallback-seed-feasibility-2026-11-19.md`](et-fallback-seed-feasibility-2026-11-19.md)。
 
 ### 仍然只能由人/外部环境完成
 

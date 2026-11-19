@@ -132,6 +132,10 @@ mesh-tun-proto 一行未改。
 | 入站限速 | 单源窗口 + 全局每秒 + 源表上限的统一闸门；DHT socket 上的 STUN 也纳入；放大应答加字节预算 | `wgp-dht::ratelimit`（新）、`observe`、`node` |
 | 种子部署 | `--advertise` 支持 DDNS 域名并自动重宣告；外部端口可独立（FRP / 端口映射）；`--allow-local-endpoints` | `wgp-core::AdvertiseTarget`、`wgp-node`、`server/deploy/frp/*`、`install-seed-frp.sh` |
 | 简单项 | 观察者默认额度 12→60 次/10s（另加全局）；TCP-only 文案；测试临时目录不再互相删除；格式整治仍单独立项 | 见 [`20-变更追补-2026-11.md`](项目完整文档/20-变更追补-2026-11.md) §22 |
+| ET（TUN 之外） | mesh-tun-proto 升到 **0.2.0**：路由同步按连接关系合并、RPC 分片重组、保活/对端超时、Data flags、虚拟 IPv4 与冲突检测；补 CHANGELOG/.gitattributes/CI。桥接侧：数据帧走隧道数据报、确定性开流、双向 IP 帧与第三节点加入/离开验收通过 | `mesh-tun-proto`（独立仓库）、`bridge/wgp-et-bridge`、`bridge/wgp-port::Tunnel::take_dgrams` |
+
+ET 仍未做：TUN 设备、与官方 EasyTier 节点对测、面向用户的主 CLI；轻量客户端只能当叶子（不替别人转发）。
+版本号已升到 **0.1.2**，部署主线是「公网 VPS」与「NAT 机手动端口映射」，FRP 是没有公网 IPv4 时的可选扩展。
 
 验证：`cargo check --workspace --all-targets` 0 warning；`cargo test --workspace` 全绿（22 个测试目标，0 failed）。
 **仍然没有真实 NAT / 真实 FRP / 真实 DDNS 验证**——脚本与参数解析有测试，拓扑可用性只有检查表。
