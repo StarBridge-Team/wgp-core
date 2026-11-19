@@ -2,7 +2,6 @@
 //! 公共 STUN 仅回 MAPPED（一级）；本观察者额外回显 WGP-PEER 扩展（二级）。
 //! wgp-node 四职之一；可独立 socket（配置的观察者端口）或与 DhtNode 同 socket。
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -10,10 +9,16 @@ use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 use wgp_proto::stun::{binding_response, decode_attrs, wgp_attr, StunHeader, WgpPeerAttr};
 
-/// 观察者响应限频默认值（07 §7 贡献模式防滥用）：
-/// 每 IP 12 次 / 10s——正常打洞信令（探测+步长三连测）远低于此，
-/// 超出即视为滥用（刷子/洪流），静默丢弃。
-pub const OBSERVER_RATE_LIMIT: u32 = 12;
+use crate::ratelimit::{RateGate, RatePolicy};
+
+/// 观察者响应限频默认值（07 §7 贡献模式防滥用）。
+///
+/// **额度与真实用量对齐**（审计简单项）：一次协商里每端向观察者发 4 次探测
+/// （观测 + 步长三连测），而同一个公网 IP 后面可能坐着多台机器（家庭 / 网吧 / 运营商 NAT）。
+/// 旧值 12 次 / 10s 在 4 个成员并发协商时就会打满，被限的是正常用户。现在 60 次 / 10s
+/// 约等于 15 个成员并发；再叠加全局 600 次 / 秒与「按 IP 归一」两道，滥用仍然被挡。
+/// 超出即视为滥用（刷子/洪流），静默丢弃。运维可用 `--observer-rate-limit` 覆盖。
+pub const OBSERVER_RATE_LIMIT: u32 = 60;
 pub const OBSERVER_RATE_WINDOW: Duration = Duration::from_secs(10);
 
 /// 观察者限频策略（每 IP / 窗口允许的响应数）。
@@ -35,55 +40,14 @@ impl Default for ObserverPolicy {
     }
 }
 
-struct IpBucket {
-    window_start: Instant,
-    count: u32,
-}
-
-/// 限频表追踪的源 IP 数上限（按 IP 归一后单主机只占一格；超限说明是
-/// 分布式源洪流——整表清空重新计数：用短期宽松换内存确定性）
-const GATE_MAX_IPS: usize = 65_536;
-
-/// 限频闸门：按 **IP 归一**（换源端口不再重置额度，堵住端口轮换绕过）、
-/// 惰性窗口清扫 + 硬上限（杜绝表无界增长）。
-struct RateGate {
-    buckets: HashMap<std::net::IpAddr, IpBucket>,
-    last_sweep: Instant,
-}
-
-impl RateGate {
-    fn new() -> Self {
-        Self {
-            buckets: HashMap::new(),
-            last_sweep: Instant::now(),
+impl ObserverPolicy {
+    /// 转成通用闸门策略：保留运维给出的单源额度与窗口，全局额度用默认值
+    pub fn rate_policy(&self) -> RatePolicy {
+        RatePolicy {
+            per_ip: self.rate_limit.max(1),
+            window: self.rate_window,
+            ..RatePolicy::default()
         }
-    }
-
-    /// 判定并计数：true = 额度内（本次计数）；false = 超限静默丢弃
-    fn admit(&mut self, ip: std::net::IpAddr, policy: &ObserverPolicy, now: Instant) -> bool {
-        // 周期性清扫过期窗口（间隔一个窗口即可，防长期闲置条目堆积）
-        if now.duration_since(self.last_sweep) > policy.rate_window {
-            self.buckets
-                .retain(|_, b| now.duration_since(b.window_start) <= policy.rate_window);
-            self.last_sweep = now;
-        }
-        // 清扫后仍逼近硬上限（海量源 IP 洪流）→ 整表清空
-        if self.buckets.len() >= GATE_MAX_IPS {
-            self.buckets.clear();
-        }
-        let bucket = self.buckets.entry(ip).or_insert(IpBucket {
-            window_start: now,
-            count: 0,
-        });
-        if now.duration_since(bucket.window_start) > policy.rate_window {
-            bucket.window_start = now;
-            bucket.count = 0;
-        }
-        if bucket.count >= policy.rate_limit {
-            return false;
-        }
-        bucket.count += 1;
-        true
     }
 }
 
@@ -135,7 +99,7 @@ impl ObserverServer {
         let socket = Arc::new(UdpSocket::bind(addr).await?);
         let server = Arc::new(Self {
             socket: socket.clone(),
-            gate: Mutex::new(RateGate::new()),
+            gate: Mutex::new(RateGate::new(policy.rate_policy())),
             policy,
         });
         let loop_socket = socket.clone();
@@ -151,7 +115,7 @@ impl ObserverServer {
                     // 限频闸门：超限丢弃（防刷观察者/贡献节点保带宽特征）
                     let admitted = {
                         let mut g = loop_server.gate.lock().await;
-                        g.admit(src.ip(), &loop_server.policy, Instant::now())
+                        g.admit(src.ip(), Instant::now())
                     };
                     if !admitted {
                         continue; // 静默丢弃
@@ -165,6 +129,11 @@ impl ObserverServer {
 
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
         self.socket.local_addr()
+    }
+
+    /// 当前生效的限频策略（运维诊断 / 日志用）
+    pub fn policy(&self) -> ObserverPolicy {
+        self.policy
     }
 }
 
@@ -285,7 +254,7 @@ mod tests {
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
         let req = client_binding_with_echo([0x55; 12], [0; 8]);
-        for _ in 0..30 {
+        for _ in 0..(OBSERVER_RATE_LIMIT + 8) {
             client.send_to(&req, server_addr).await.unwrap();
         }
 
@@ -326,9 +295,9 @@ mod tests {
         .parse()
         .unwrap();
 
-        // 30 个独立源端口（同 127.0.0.1），每端口只发 1 请求
+        // 全部源端口各只发 1 请求，端口数超过单 IP 额度——额度必须按 IP 归一
         let mut clients = Vec::new();
-        for i in 0..30u16 {
+        for i in 0..(OBSERVER_RATE_LIMIT + 6) as u16 {
             let client = UdpSocket::bind(format!("127.0.0.1:{}", 20_000 + i))
                 .await
                 .unwrap();

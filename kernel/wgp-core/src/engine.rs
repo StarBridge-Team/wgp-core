@@ -52,8 +52,8 @@ use tokio::sync::broadcast;
 use tokio::sync::watch;
 #[cfg(feature = "client")]
 use wgp_crypto::SecretBox;
-use wgp_dht::{AdvertiseSpec, DhtNode, NodeIdentity, ObserverPolicy, ObserverServer};
-use wgp_proto::packet::seed_advertise_v2;
+use wgp_dht::{DhtNode, NodeIdentity, ObserverPolicy, ObserverServer};
+use wgp_proto::packet::seed_advertise_v2::{FLAG_AUTH_V1, FLAG_RELAY};
 #[cfg(feature = "client")]
 use wgp_dht::{RoomError, RoomRuntime, room_key as room_key_of};
 #[cfg(feature = "client")]
@@ -108,6 +108,73 @@ fn engine_now_ms() -> u64 {
     Instant::now().duration_since(anchor).as_millis() as u64
 }
 
+/// 本机实际绑定的三个对外端口（广告里「沿用本机端口」时用它）
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AdvertisePorts {
+    /// DHT UDP 信令端口
+    pub dht: u16,
+    /// 观察者 / STUN 端口（0 = 未启用）
+    pub stun: u16,
+    /// TCP 信令端口（0 = 未启用）
+    pub tcp: u16,
+}
+
+/// 对外宣告目标（部署层注入）。
+///
+/// **为什么要和 bind 分开**（审计简单项「`--advertise` 只支持固定 IPv4」+ FRP/NAT 部署）：
+/// 种子不总是在「本机端口 = 外部端口」的公网机器上。常见两种变形：
+///
+/// - **FRP / 端口映射**：外部端口由中继端决定（`frps` 的 `remote_port`），和本机监听端口不同；
+///   地址也不是本机地址，而是中继机的公网地址。
+/// - **DDNS**：地址是域名，解析结果会变；变化后要**重新宣告**（换纪元），否则别人一直用旧地址。
+///
+/// 所以这里显式分开「对外地址」与「对外端口」；端口填 0 表示沿用本机实际绑定端口。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdvertiseTarget {
+    /// 对外 IPv4（域名由外围解析后注入；内核不解析域名）
+    pub addr_v4: [u8; 4],
+    /// 对外端口（0 = 沿用本机端口）
+    pub ports: AdvertisePorts,
+}
+
+impl AdvertiseTarget {
+    /// 只给地址，端口全部沿用本机
+    pub fn addr(addr_v4: [u8; 4]) -> Self {
+        Self {
+            addr_v4,
+            ports: AdvertisePorts::default(),
+        }
+    }
+
+    /// 组装内核广告 spec：外部端口 0 时沿用本机；本机没开的能力对外一律 0。
+    pub fn spec(&self, local: AdvertisePorts, hobby: bool) -> wgp_dht::AdvertiseSpec {
+        let pick = |ext: u16, local: u16| if ext != 0 { ext } else { local };
+        wgp_dht::AdvertiseSpec {
+            addr_v4: self.addr_v4,
+            dht_port: pick(self.ports.dht, local.dht),
+            stun_port: if local.stun == 0 {
+                0
+            } else {
+                pick(self.ports.stun, local.stun)
+            },
+            tcp_port: if local.tcp == 0 {
+                0
+            } else {
+                pick(self.ports.tcp, local.tcp)
+            },
+            priority: 0,
+            // 贡献模式不中转：如实写进广告，客户端据此避开「报道永远送不到」的存储节点。
+            // FLAG_AUTH_V1 恒定置位：本版本支持挑战响应身份证明，对端可据此决定是否值得试。
+            flags: if hobby {
+                FLAG_AUTH_V1
+            } else {
+                FLAG_RELAY | FLAG_AUTH_V1
+            },
+            name_hash: [0u8; 4],
+        }
+    }
+}
+
 /// 节点角色（07 §1/§6：公网固定地址节点 = Seed）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeRole {
@@ -129,13 +196,14 @@ pub struct NodeConfig {
     pub hobby: bool,
     /// 观察者限频策略（运维参数；默认 `ObserverPolicy::default`）
     pub observer_policy: ObserverPolicy,
-    /// 对外宣告的公网 IPv4（None = 不宣告，别的节点只能靠手工配置找到本节点）。
-    /// 内核不猜测自己的公网地址；端口沿用 bind / stun / tcp_signal 的实际绑定值，
-    /// 即假定外部端口与本机端口一致（端口映射请按原号映射）。
-    pub advertise: Option<std::net::Ipv4Addr>,
+    /// 对外宣告目标（None = 不宣告，别的节点只能靠手工配置找到本节点）。
+    /// 内核不猜测自己的公网地址；地址与外部端口都由部署层给出（DDNS / FRP / 固定 IP）。
+    pub advertise: Option<AdvertiseTarget>,
     /// 广告纪元（17 §5）：接收端只采纳更大的纪元，同一身份每次启动都要比上次大。
     /// 内核不读系统时钟也不落盘，由外围持久化后注入。仅在 advertise 为 Some 时有意义。
     pub advertise_epoch: u64,
+    /// 端点地址准入策略（审计 M2）。默认只收公网地址；本机/局域网部署由部署层显式放宽。
+    pub endpoint_scope: wgp_dht::EndpointScope,
     /// 入网引导端点：其他种子的 DHT 地址（已解析）。空 = 独立运行，等别人来找
     pub peers: Vec<std::net::SocketAddr>,
     /// 身份证明兼容策略（17 §11.6）：true = 允许回退到旧 PING/PONG 学习（迁移期）。
@@ -216,6 +284,8 @@ pub struct NodeHandle {
     pub observer: Option<Arc<ObserverServer>>,
     /// TCP 信令监听地址（None = 未启用）
     pub tcp: Option<std::net::SocketAddr>,
+    /// 本机实际绑定的三个对外端口：DDNS / FRP 场景下重新宣告时要靠它重建 spec
+    pub ports: AdvertisePorts,
 }
 
 impl Engine {
@@ -573,25 +643,19 @@ impl Engine {
 
         if let Some(node) = dht.as_ref() {
             node.pin_seeds(&cfg.peers).await;
-            if let (Some(ip), Ok(local)) = (cfg.advertise, node.local_addr()) {
-                let spec = AdvertiseSpec {
-                    addr_v4: ip.octets(),
-                    dht_port: local.port(),
-                    stun_port: observer
-                        .as_ref()
-                        .and_then(|o| o.local_addr().ok())
-                        .map_or(0, |a| a.port()),
-                    tcp_port: tcp.map_or(0, |a| a.port()),
-                    priority: 0,
-                    // 贡献模式不中转：如实写进广告，客户端据此避开「报道永远送不到」的存储节点。
-                    // FLAG_AUTH_V1 恒定置位：本版本支持挑战响应身份证明，对端可据此决定是否值得试。
-                    flags: if cfg.hobby {
-                        seed_advertise_v2::FLAG_AUTH_V1
-                    } else {
-                        seed_advertise_v2::FLAG_RELAY | seed_advertise_v2::FLAG_AUTH_V1
-                    },
-                    name_hash: [0u8; 4],
-                };
+            // 端点准入策略由部署层决定（默认公网；本机/局域网/FRP 内网部署显式放宽）
+            node.set_endpoint_scope(cfg.endpoint_scope);
+            let ports = AdvertisePorts {
+                dht: node.local_addr().map(|a| a.port()).unwrap_or(0),
+                stun: observer
+                    .as_ref()
+                    .and_then(|o| o.local_addr().ok())
+                    .map_or(0, |a| a.port()),
+                tcp: tcp.map_or(0, |a| a.port()),
+            };
+            if let Some(target) = cfg.advertise {
+                // 端口口径：外部端口优先（FRP / 端口映射），否则沿用本机端口
+                let spec = target.spec(ports, cfg.hobby);
                 node.start_advertising(spec, cfg.advertise_epoch).await;
             }
             node.spawn_maintenance();
@@ -612,7 +676,23 @@ impl Engine {
                 });
             }
         }
-        NodeHandle { dht, observer, tcp }
+        let ports = AdvertisePorts {
+            dht: dht
+                .as_ref()
+                .and_then(|n| n.local_addr().ok())
+                .map_or(0, |a| a.port()),
+            stun: observer
+                .as_ref()
+                .and_then(|o| o.local_addr().ok())
+                .map_or(0, |a| a.port()),
+            tcp: tcp.map_or(0, |a| a.port()),
+        };
+        NodeHandle {
+            dht,
+            observer,
+            tcp,
+            ports,
+        }
     }
 }
 
@@ -652,6 +732,51 @@ mod tests {
     use super::*;
     use crate::event::EngineEvent;
     use tokio::sync::mpsc;
+
+    /// 广告端口口径：外部端口优先（FRP / 端口映射），本机没开的能力对外一律 0
+    #[test]
+    fn advertise_target_prefers_external_ports_and_respects_disabled_services() {
+        let local = AdvertisePorts {
+            dht: 11010,
+            stun: 3478,
+            tcp: 3481,
+        };
+        // 只给地址：三个端口全部沿用本机
+        let spec = AdvertiseTarget::addr([203, 0, 113, 7]).spec(local, false);
+        assert_eq!(
+            (spec.dht_port, spec.stun_port, spec.tcp_port),
+            (11010, 3478, 3481)
+        );
+        assert_ne!(spec.flags & FLAG_RELAY, 0, "完整节点声明可中转");
+
+        // 外部端口（FRP）：全部覆盖
+        let target = AdvertiseTarget {
+            addr_v4: [198, 51, 100, 9],
+            ports: AdvertisePorts {
+                dht: 21010,
+                stun: 23478,
+                tcp: 23481,
+            },
+        };
+        let spec = target.spec(local, true);
+        assert_eq!(
+            (spec.dht_port, spec.stun_port, spec.tcp_port),
+            (21010, 23478, 23481)
+        );
+        assert_eq!(spec.flags & FLAG_RELAY, 0, "贡献模式声明不中转");
+
+        // 本机没开 STUN / TCP：即使配了外部端口，广告里也必须是 0
+        let spec = target.spec(
+            AdvertisePorts {
+                dht: 11010,
+                stun: 0,
+                tcp: 0,
+            },
+            false,
+        );
+        assert_eq!((spec.stun_port, spec.tcp_port), (0, 0));
+        assert_eq!(spec.dht_port, 21010, "DHT 端口仍按外部端口");
+    }
 
     const SHARED_KEY: [u8; 32] = [0x71; 32];
 
@@ -884,8 +1009,9 @@ mod tests {
                 tcp_signal: Some(0),
                 hobby,
                 observer_policy: ObserverPolicy::default(),
-                advertise: Some(Ipv4Addr::LOCALHOST),
+                advertise: Some(AdvertiseTarget::addr(Ipv4Addr::LOCALHOST.octets())),
                 advertise_epoch: 1,
+                endpoint_scope: wgp_dht::EndpointScope::LocalNetwork,
                 peers,
                 allow_legacy_identity: false,
             }
@@ -956,8 +1082,9 @@ mod tests {
                 tcp_signal: None,
                 hobby: false,
                 observer_policy: ObserverPolicy::default(),
-                advertise: Some(Ipv4Addr::LOCALHOST),
+                advertise: Some(AdvertiseTarget::addr(Ipv4Addr::LOCALHOST.octets())),
                 advertise_epoch: 1,
+                endpoint_scope: wgp_dht::EndpointScope::LocalNetwork,
                 peers,
                 allow_legacy_identity: false,
             }

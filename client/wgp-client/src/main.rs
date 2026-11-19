@@ -107,6 +107,8 @@ struct Opts {
     once: bool,
     /// 兼容旧节点：身份证明失败时回退到旧 PING/PONG 学习（默认关闭）
     allow_legacy_identity: bool,
+    /// 接受回环/私网端点（本机与局域网联调；默认只收公网地址，见审计 M2）
+    allow_local_endpoints: bool,
     /// 端口转发规则（原始字符串，可重复给出；解析见 build_port_config）
     expose: Vec<String>,
     forward: Vec<String>,
@@ -161,6 +163,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
             "--forward-udp" => push_list(&mut o.forward_udp, &take(&mut i)?),
             "--once" => o.once = true,
             "--allow-legacy-identity" => o.allow_legacy_identity = true,
+            "--allow-local-endpoints" => o.allow_local_endpoints = true,
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -535,6 +538,14 @@ async fn async_move(
             transport.scheme()
         ));
     }
+    // 端点准入（审计 M2）：用户配置的种子里出现回环/私网地址，说明这是本机或局域网形态，
+    // 放宽到接受这类广告；否则保持默认（只收公网地址）。
+    let endpoint_scope = if opts.allow_local_endpoints {
+        wgp_dht::EndpointScope::LocalNetwork
+    } else {
+        wgp_dht::scope_for_endpoints(entries.iter().copied())
+    };
+    node.set_endpoint_scope(endpoint_scope);
     if !entries.is_empty() {
         node.discover(&entries).await;
         // 再问一遍「离这个房间最近的种子」：种子很多时，让各端对选点的看法一致
@@ -1315,6 +1326,8 @@ fn print_help() {
          选项：\n\
            -s, --seed <list>      种子端点（可重复；也支持逗号/分号/空白分隔）\n\
                                   udp://host:port 或 tcp://host:port\n\
+                                  ◦ tcp:// 只兜底信令（bootstrap / 选点 / 房间 KV / 报道中转）；\n\
+                                    打洞与业务隧道仍要 UDP，两端 UDP 全不通时隧道建不起来\n\
            -p, --peers <list>     等价 --seed（EasyTier 习惯）\n\
            --storage <ep>         显式房间键存储节点（默认在已知种子里按房间键选定，两端结果一致）\n\
            --observer <list>      观察者/STUN 端点，逗号分隔 ip:port\n\
@@ -1323,6 +1336,8 @@ fn print_help() {
            --once                 入表后立即退出（默认驻留并打印事件）\n\
            --allow-legacy-identity  兼容旧节点：身份证明失败时回退到旧 PING/PONG 学习\n\
                                    （默认关闭；严格模式只把旧协议用于存活诊断）\n\
+           --allow-local-endpoints  接受回环/私网种子端点（本机多进程联调、局域网或 FRP 内网部署；\n\
+                                   默认只收公网地址，回环/内网地址的种子广告会被丢弃）\n\
            -h, --help             显示本帮助\n\
            -V, --version          显示版本\n\
          \n\
