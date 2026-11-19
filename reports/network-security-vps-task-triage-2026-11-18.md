@@ -66,6 +66,64 @@
 
 当前环境未提供可确认的 VPS 登录凭据、云安全组权限或两台真实客户端，因此本轮未尝试登录、未部署远端主机，也未执行真实 NAT 测试。
 
+## 本轮完成情况（2026-11-19）
+
+同一轮还完成两条产品线要求：**种子节点支持 FRP / NAT 后 / DDNS 部署**，以及**把 ET 支持推进到 TUN 之外尽量落在 mesh-tun-proto 库侧**
+（含该仓库的源码管理）。逐项证据见 [`20-变更追补-2026-11.md`](../项目完整文档/20-变更追补-2026-11.md) §17-§23。
+
+### 中等难度
+
+| 项 | 状态 | 落点与验收证据 |
+|---|---|---|
+| **M1** STUN 响应绑定与投毒防护 | **完成** | `wgp-core::engine::nat_probe`：类型/txid/nonce/映射地址四道校验 + 来源地址绑定 + CSPRNG txid；5 个新用例含「另一源持续伪造应答仍不采信」「未回显 nonce 被拒」「反射请求被拒」 |
+| **M2** 公共 DHT 端点地址准入 | **完成** | `wgp-dht::addr::EndpointScope`：默认公网白名单式排除（回环/RFC1918/链路本地/CGNAT/0-8/协议分配/TEST-NET×3/198.18-15/组播/240-4/IPv6），局域网形态显式 `--allow-local-endpoints`；广告与 `NEIGHBORS` 转述两条路径都过闸 |
+| **M3** DHT 反射放大缓解 | **部分完成（缓解）** | 放大应答（NEIGHBORS/VALUE/SEEDS）按源 IP 与全局限字节速率（`ratelimit::ByteBudget`）；**源地址 cookie 需改线协议，仍待决策**，单元测试只覆盖闸门本身 |
+| **M4** 远端可驱动队列与字节预算 | **未做** | 需要先有统一基准（M12）。现有 `inbox` 512 的有界队列、`Forward` 邮件语义保持不变；会话表/`wgp-port` mux 接收队列仍未定量化预算 |
+| **M5** 房间成员容量边界 | **完成** | `MAX_ROOM_MEMBERS=12` + `try_encode` 不再静默截断（原 `as u8` 回绕与 STORE 1024B 截断两条都堵住）；`RoomError::{RoomFull, RecordTooLarge}`；满员失败不改写旧记录 |
+| **M6** STUN DHT socket 限速 | **完成** | 统一 `RateGate`（单源窗口 + 全局每秒 + 源表硬上限），DHT 读循环与观察者服务共用；`set_stun_rate_policy()` 可覆盖 |
+| **M7** UDP datagram pacing 与公平性 | **未做** | 依赖 M12 基准与真实丢包矩阵 |
+| **M8** 网络切换后持续恢复 | **未做** | 依赖多机/真实网络；代码未改 |
+| **M9** K>1 房间副本 | **未做** | 需先定一致性设计 |
+| **M10** 探针新鲜度与地址迁移验证 | **未做** | 需多机/网络仿真；本轮只做到观察者应答来源绑定 |
+| **M11** TCP 信令与 Forward 地址簿解耦 | **未做** | 需产品决策（可选 relay 数据面） |
+| **M12** 网络基线与热路径 profiling | **未做** | 依赖 VPS/基准环境；`DEPLOY.md` §10.4 给了首轮真机检查表 |
+
+### 简单项
+
+| 项 | 状态 |
+|---|---|
+| 观察者用量与限频对齐 | 完成：默认 12 → **60 次/10s**，另加全局 600 次/秒，文档写明换算 |
+| 端点广告配置说明 | 完成：`--advertise` 现支持 IPv4 **与 DDNS 域名**，外部端口可独立配置，动地址自动重宣告；`DEPLOY.md` §7.2/§10、`17-部署与运维.md` §7 与 `--help` 三处一致 |
+| TCP-only 文案复核 | 完成：`wgp-node --help`、`wgp-client --help` 明确只兜底信令 |
+| 测试临时目录错误处理 | 完成：改用 `target/test-tmp/<用例>`，不忽略 `create_dir_all` 失败，并修掉两个用例共用同一临时目录的相互删除 |
+| 格式基线 | 记录在案：本轮不做全库机械格式化（见 HANDOFF §3.3），只保证新增/修改文件风格一致 |
+
+### 部署形态（新增能力）
+
+- 内核 `AdvertiseTarget`：对外地址与三个外部端口分开，端口 0 = 沿用本机。
+- `wgp-node`：`--advertise <ipv4|域名|none>`、`--advertise-{dht,stun,tcp}-port`、`--ddns-refresh`、`--allow-local-endpoints`。
+- 资产：`server/deploy/frp/{frps,frpc}.toml.example`、`server/deploy/install-seed-frp.sh`。
+- 文档：`server/deploy/DEPLOY.md` §10（四种拓扑、FRP 限制、验证清单）、`项目完整文档/17-部署与运维.md` §7。
+- **未验证**：真实 FRP 中继 + 真实 NAT + 真实 DDNS 都没有跑过（没有中继机/域名/第二台客户端）。
+
+回环端到端（真实二进制、Windows）单种子与 `-Discovery` 两种模式本轮均 **PASS**；
+`cargo test --workspace` 22 个目标 0 failed；`cargo check --workspace --all-targets` 0 warning。
+（沙箱内跑端到端要把 `TEMP`/`TMP` 指到仓库 `target\` 目录：受限沙箱不允许写系统临时目录。）
+
+### ET（TUN 之外）
+
+见 `bridge/wgp-et-bridge/README.md` 与 mesh-tun-proto 仓库的 `CHANGELOG.md`；本轮把路由同步合并、RPC 分片重组、
+数据帧走隧道数据报通道、确定性开流规则等落在库侧，并把 mesh-tun-proto 的提交/CI/文档补齐。
+**TUN 设备、与官方 EasyTier 节点互通仍未做**（前者需要 Wintun 驱动与管理员权限，后者需要一台真实官方节点对测）。
+
+### 仍然只能由人/外部环境完成
+
+1. 真实 NAT 双端联调（最高优先级）——一台可达公网种子 + 两台异 NAT 客户端。
+2. FRP 拓扑首次上线验证（中继机安全组、`allowPorts`、端口映射一致性）。
+3. 发布 SIG v2 客户端（协议不兼容，必须全体升级）。
+4. hobby 中转策略、Sybil 准入、K>1 存储三个待决策项。
+
+
 ## 推荐执行顺序
 
 1. 合并/评审 SIG v2 P0 修复和协议/API 文档，明确 v1/v2 不互通，随后制作所有参与者统一升级的预览构建。

@@ -1004,7 +1004,8 @@ pub async fn run(profile: &str, force_hobby: bool) {
             }
             if ip.is_loopback() || ip.is_private() || ip.is_link_local() {
                 log_warn(format!(
-                    "宣告地址 {ip} 不是公网地址：只有本机 / 同一局域网内的节点能据此连到本节点"
+                    "宣告地址 {ip} 不是公网地址：只有本机 / 同一局域网内的节点能据此连到本节点；\
+                     对端也要用 --allow-local-endpoints 才会采纳这类广告"
                 ));
             }
         }

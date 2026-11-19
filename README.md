@@ -73,10 +73,10 @@ bash scripts/e2e-local.sh target/release --discovery
 
 ## 发版
 
-推送 `v*` 标签，GitHub Actions 为 8 个目标构建、验证、打包并发布为 **pre-release**：
+当前源码版本 **0.1.2**。推送 `v*` 标签，GitHub Actions 为 8 个目标构建、验证、打包并发布为 **pre-release**：
 
 ```bash
-git tag v0.1.0-preview.1 && git push origin v0.1.0-preview.1
+git tag v0.1.2 && git push origin v0.1.2          # 预览版可写 v0.1.2-preview.1
 ```
 
 | 系统 | 64 位 | 32 位 |
