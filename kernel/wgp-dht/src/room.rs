@@ -32,6 +32,30 @@ pub fn room_key(room_code: &str) -> [u8; 32] {
     h.finalize().into()
 }
 
+/// 由房间键派生「ET 回退」用的临时网络名与密钥（没有 wgp 种子时借 EasyTier 公共节点组网）。
+///
+/// 为什么在房间里派生：ET 只按「网络名 + 密钥摘要」做准入，所以这两个值就是那张临时网的
+/// 全部准入凭据。用房间键派生意味着**只有拿到房间码的人能算出它们**（房间码 → 房间键是
+/// 单向的），不同房间天然互不可见；代价是房间码泄露 = 临时网泄露，与现有房间语义一致。
+///
+/// 与桥侧 `wgp_et_bridge::fallback::derive_network` 逐字节一致（桥在独立 workspace 里，
+/// 无法直接引用本函数；两边用同一组测试向量钉住，见本模块与桥的 `network_is_derived…` 测试）：
+/// - 网络名 = `wgp-` + 房间键前 4 字节的十六进制（8 个字符，便于人眼在 ET 日志里区分房间）；
+/// - 密钥   = 房间键第 8..24 字节的十六进制（32 个字符，128 bit，取中段避开名前缀）。
+pub fn et_fallback_network(room_key: &[u8; 32]) -> (String, String) {
+    let hex = |bytes: &[u8]| -> String {
+        let mut s = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            s.push_str(&format!("{b:02x}"));
+        }
+        s
+    };
+    (
+        format!("wgp-{}", hex(&room_key[..4])),
+        hex(&room_key[8..24]),
+    )
+}
+
 /// 锚点租约
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Lease {
@@ -359,6 +383,48 @@ mod tests {
         assert_eq!(line[0], anchor(1));
         assert_eq!(line[1], anchor(5));
         assert_eq!(line[2], anchor(9));
+    }
+
+    /// ET 回退的临时网络：同一房间稳定、不同房间互不相同、形状与桥侧一致。
+    #[test]
+    fn et_fallback_network_is_room_scoped_and_stable() {
+        // 与桥侧测试同一组向量（bridge/wgp-et-bridge/src/fallback.rs 的
+        // `network_is_derived_from_the_room_key`）：0,1,2,…,31 的房间键
+        let mut key = [0u8; 32];
+        for (i, b) in key.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let (name, secret) = et_fallback_network(&key);
+        assert_eq!(name, "wgp-00010203", "名字带房间键前 4 字节");
+        assert_eq!(
+            secret, "08090a0b0c0d0e0f1011121314151617",
+            "密钥是房间键第 8..24 字节"
+        );
+
+        // 同一房间：两侧必须算出完全一样的网络（否则加不进同一张临时网）
+        assert_eq!(et_fallback_network(&key), (name.clone(), secret.clone()));
+
+        // 不同房间：名字与密钥都不同（名字只覆盖 4 字节，所以这里同时改名字段与密钥字段）
+        let mut other = key;
+        other[0] ^= 0xff;
+        other[20] ^= 0xff;
+        let (other_name, other_secret) = et_fallback_network(&other);
+        assert_ne!(other_name, name);
+        assert_ne!(other_secret, secret);
+
+        // 形状与字符集：名字 = "wgp-" + 8 位小写十六进制；密钥 = 32 位小写十六进制
+        let is_hex = |s: &str| {
+            s.chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+        };
+        for seed in [0u8, 7, 0x5a, 0xff] {
+            let (n, s) = et_fallback_network(&[seed; 32]);
+            assert!(n.starts_with("wgp-"), "{n}");
+            assert_eq!(n.len(), 12, "wgp- 加 4 字节十六进制：{n}");
+            assert!(is_hex(&n[4..]), "{n}");
+            assert_eq!(s.len(), 32, "16 字节密钥写 32 个十六进制字符：{s}");
+            assert!(is_hex(&s), "{s}");
+        }
     }
 
     fn full_record() -> RoomRecord {
