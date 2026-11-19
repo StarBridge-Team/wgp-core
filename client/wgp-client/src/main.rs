@@ -11,7 +11,7 @@
 //!   join <U/房间码> [--seed ...]             加入房间（报道至锚点）
 //!
 //! 通用选项：
-//!   --seed <list>      种子端点（逗号/分号/空白分隔；udp://host:port | tcp://host:port）
+//!   --seed <list>      种子端点（逗号/分号/空白分隔；udp://host:port | tcp://host:port | et://host:port）
 //!   --storage <ep>     显式指定房间键存储节点（默认在已知种子里按房间键确定性选点）
 //!   --observer <list>  观察者端点（默认用发现到的种子自带的观察者）
 //!   --identity <path>  身份文件（默认 {DEFAULT_IDENTITY_FILE}；首启生成）
@@ -19,18 +19,24 @@
 //!   --forward <spec>   本地监听并转发到对端暴露的端口（游戏直连 localhost）
 //!   --once             入表后立即退出（默认驻留并打印链路/房间事件，Ctrl+C 退出）
 //!   -h, --help         帮助；  -V, --version   版本
+//!
+//! ET 回退（S3/S4）：`-p et://主机:端口` 收集 ET 公共节点。**一个真种子都测不通**时才启用：
+//! 房主在进程内起一个本地种子，两侧各拉起 `wgp-et-fallback` 桥，把这台机器的
+//! DHT/观察者/打洞端口经 EasyTier 公共中继送到对端（详见 `bridge/wgp-et-bridge`）。
+//! 不信任公共中继的人可以用 `--no-et-fallback` 关掉它。
 
 use std::collections::{HashMap, HashSet};
+use std::io::BufRead;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::watch;
 use wgp_core::{
     measure_seeds, peer_id_from_node, resolve_endpoint, types::LinkSink, Engine, EngineEvent,
-    PeerId, RoomCode, SeedPick, SessionOrchestrator,
+    NodeConfig, NodeHandle, NodeRole, PeerId, RoomCode, SeedPick, SessionOrchestrator,
 };
 use wgp_dht::{
     room_key, DhtNode, NodeId, NodeIdentity, RoomError, RoomRuntime, SeedInfo, StorageCandidate,
@@ -109,6 +115,8 @@ struct Opts {
     allow_legacy_identity: bool,
     /// 接受回环/私网端点（本机与局域网联调；默认只收公网地址，见审计 M2）
     allow_local_endpoints: bool,
+    /// 关掉 ET 回退（给了 `et://` 入口也不用公共中继；给不信任公共中继的人）
+    no_et_fallback: bool,
     /// 端口转发规则（原始字符串，可重复给出；解析见 build_port_config）
     expose: Vec<String>,
     forward: Vec<String>,
@@ -164,6 +172,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
             "--once" => o.once = true,
             "--allow-legacy-identity" => o.allow_legacy_identity = true,
             "--allow-local-endpoints" => o.allow_local_endpoints = true,
+            "--no-et-fallback" => o.no_et_fallback = true,
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -343,11 +352,14 @@ fn seed_string(opts: &Opts) -> String {
 
 /// 给同伴的加入命令：把房主这边已经确定的东西都带上——种子、手工指定的观察者、与暴露端口对应的
 /// 转发规则。只给一个房间码的话，同伴还得自己知道种子地址、知道该转发哪个端口。
+/// `et://` 入口原样带过去：同伴同样可能在真种子全灭时回退到公共 ET 中继。
 fn join_command(code: &str, seeds: &str, observer: Option<&str>, cfg: &PortConfig) -> String {
     let mut cmd = format!("wgp-client join {code}");
-    let (endpoints, _) = SeedEndpoint::parse_list(seeds);
-    if !endpoints.is_empty() {
-        let list: Vec<String> = endpoints.iter().map(SeedEndpoint::display).collect();
+    let (et_peers, rest) = split_et_peers(seeds);
+    let (endpoints, _) = SeedEndpoint::parse_list(&rest);
+    let mut list: Vec<String> = endpoints.iter().map(SeedEndpoint::display).collect();
+    list.extend(et_peers.iter().map(EtPeer::display));
+    if !list.is_empty() {
         cmd.push_str(&format!(" -p {}", list.join(",")));
     }
     let observers = parse_observers(observer);
@@ -415,16 +427,24 @@ fn runtime_worker_threads_for(configured: Option<&str>, available: usize) -> usi
 
 fn run_room(code: &str, opts: Opts, joining: bool) -> Result<(), String> {
     let seed_str = seed_string(&opts);
-    let (endpoints, bad) = SeedEndpoint::parse_list(&seed_str);
+    // `et://` 入口先摘出来：它不是种子（不参加测速），只在种子全灭时当 ET 中继用
+    let (et_peers, rest) = split_et_peers(&seed_str);
+    let (endpoints, bad) = SeedEndpoint::parse_list(&rest);
     for b in &bad {
         eprintln!("[warn] 忽略非法种子端点：{b}");
     }
-    if endpoints.is_empty() && opts.storage.is_none() {
+    if endpoints.is_empty() && et_peers.is_empty() && opts.storage.is_none() {
         return Err(
-            "未提供可用种子端点。请用 `--seed udp://host:port[,tcp://host:port]` \
+            "未提供可用种子端点。请用 `--seed udp://host:port[,tcp://host:port]`、\
+             `-p et://<ET 公共节点>:<端口>`（没有种子时经 EasyTier 公共节点组临时网络）\
              或环境变量 WGP_SEED 注入（内核不内置任何部署地址）"
                 .to_string(),
         );
+    }
+    if endpoints.is_empty() && !et_peers.is_empty() && opts.no_et_fallback {
+        return Err("只给了 et:// 入口，但 --no-et-fallback 关掉了 ET 回退：\
+             请补一个真种子，或去掉 --no-et-fallback"
+            .to_string());
     }
     // 转发规则在联网之前校验：写错了立刻报，而不是等入表、打洞之后
     let port_cfg = build_port_config(&opts)?;
@@ -444,16 +464,19 @@ fn run_room(code: &str, opts: Opts, joining: bool) -> Result<(), String> {
         code.to_string(),
         identity,
         endpoints,
+        et_peers,
         opts,
         port_cfg,
         joining,
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn async_move(
     code: String,
     identity: NodeIdentity,
     endpoints: Vec<SeedEndpoint>,
+    et_peers: Vec<EtPeer>,
     opts: Opts,
     port_cfg: PortConfig,
     joining: bool,
@@ -469,13 +492,16 @@ async fn async_move(
         wgp_dht::IdentityPolicy::Strict
     });
 
+    // 装配线引擎：建得比原来早——回退形态下房主要先用它起一个进程内本地种子
+    let (engine, _rx) = Engine::new();
+
     // ② 选路：测速全部种子（顺带打印观测 RTT）
     //
     // 承载选择：用户给的全是 tcp:// → 走 TCP 信令（UDP 被封时的兜底）。TCP 只能承担信令，
     // 打洞与数据面仍然需要 UDP，所以这里先把话说清楚，而不是等到入表阶段才超时。
     let tcp_signaling =
         !endpoints.is_empty() && endpoints.iter().all(|ep| ep.scheme == SeedScheme::Tcp);
-    let transport = if tcp_signaling {
+    let mut transport = if tcp_signaling {
         wgp_dht::Transport::Tcp
     } else {
         wgp_dht::Transport::Udp
@@ -521,16 +547,53 @@ async fn async_move(
         }
     }
 
+    // ②c ET 回退（S3）：一个真种子都测不通、但用户给了 `et://` 入口 → 借公共 ET 中继组临时网络。
+    // 变量必须活到函数返回：`Drop` 时才会 kill 桥进程、停掉进程内的本地种子。
+    let fallback = if et_fallback_wanted(picks.len(), &et_peers, opts.no_et_fallback) {
+        match start_et_fallback(
+            &engine,
+            !joining,
+            &et_peers,
+            &code,
+            opts.allow_legacy_identity,
+        )
+        .await
+        {
+            Ok(f) => Some(f),
+            Err(e) => {
+                // 拉不起来就照原路失败，绝不假装成功：下面会按"没有可用种子"报错
+                eprintln!("[回退] 无法经公共 EasyTier 中继组网：{e}");
+                eprintln!("[回退] 继续按「没有可用种子」处理");
+                None
+            }
+        }
+    } else {
+        if !et_peers.is_empty() && opts.no_et_fallback {
+            eprintln!("[回退] 给了 et:// 入口，但 --no-et-fallback 已关掉回退：按普通种子流程继续");
+        }
+        None
+    };
+
     // ②b 种子发现（07 §5 第③层）：以配置的种子为入口，学到它们认识的其他种子，并启动
     // 后台维护（探活 + 保住到各种子的 NAT 映射）。入口种子没有宣告自己时目录为空，一切照旧——
     // 只认手工配置的那几个。
-    let entries: Vec<SocketAddr> = picks
+    let mut entries: Vec<SocketAddr> = picks
         .iter()
         .filter(|p| {
             (transport == wgp_dht::Transport::Tcp) == (p.endpoint.scheme == SeedScheme::Tcp)
         })
         .map(|p| p.addr)
         .collect();
+    if let Some(f) = &fallback {
+        // 回退形态下"种子"只有一个：桥的 DHT 服务口（房主侧由桥写回本机种子）
+        entries = vec![f.seed_addr];
+        // 桥只搬 UDP；TCP 种子在这条路上不存在，信令承载必须跟着切回 UDP
+        if transport != wgp_dht::Transport::Udp {
+            transport = wgp_dht::Transport::Udp;
+            node.set_signaling_transport(transport);
+            println!("[回退] 信令改走 UDP 种子（= 桥）：回退形态下没有 TCP 信令通道");
+        }
+    }
     if entries.is_empty() && !endpoints.is_empty() {
         return Err(format!(
             "没有可用的 {} 种子端点：房间读写至少要一个能连上的种子。\
@@ -546,6 +609,11 @@ async fn async_move(
         wgp_dht::scope_for_endpoints(entries.iter().copied())
     };
     node.set_endpoint_scope(endpoint_scope);
+    if let Some(f) = &fallback {
+        // 桥刚起来，ET 握手可能还没完成：重试几次把"第一次 PING"送过桥，
+        // 否则 storage_candidates 拿不到这个种子的身份，后面会报"已知种子全部不可达"
+        warm_up_fallback_seed(&node, f.seed_addr).await;
+    }
     if !entries.is_empty() {
         node.discover(&entries).await;
         // 再问一遍「离这个房间最近的种子」：种子很多时，让各端对选点的看法一致
@@ -564,7 +632,7 @@ async fn async_move(
     }
 
     // ③ 房间键存储节点：显式优先；否则在已知种子里按房间键确定性选点
-    let (storage, room_exists, storage_transport) = resolve_storage(
+    let storage_pick = resolve_storage(
         &node,
         &code,
         &entries,
@@ -572,7 +640,19 @@ async fn async_move(
         opts.storage.as_deref(),
         transport,
     )
-    .await?;
+    .await;
+    let (storage, room_exists, storage_transport) = match (storage_pick, &fallback) {
+        (Ok(v), _) => v,
+        // 回退形态下选不到存储点只可能是"桥那边还没有对端"：把话说清楚，别让用户去查 --seed
+        (Err(e), Some(f)) => {
+            return Err(format!(
+                "{e}\n[回退] 回退形态下这句通常意味着经桥到房主种子 {} 的通道还没通：\
+                 两侧要同时在线，且 et:// 入口指向同一个 ET 公共节点",
+                f.seed_addr
+            ))
+        }
+        (Err(e), None) => return Err(e),
+    };
 
     // 预热：让存储节点学习本端身份（失败不致命，但要给出可读原因）
     if let Err(e) = node.ping(storage).await {
@@ -599,7 +679,6 @@ async fn async_move(
         .map_err(|e| format!("端口转发启动失败：{e}"))?;
 
     // ⑤ 装配内核
-    let (engine, _rx) = Engine::new();
     engine
         .attach_dht_with_transport(node.clone(), storage, storage_transport)
         .await;
@@ -623,8 +702,16 @@ async fn async_move(
     // 由引擎按 T1-T4 判定自动降级到 TCP 兜底——不让用户为打洞必须配齐 STUN。
     let explicit_observers = parse_observers(opts.observer.as_deref());
     let auto = explicit_observers.is_empty();
-    let observers = choose_observers(explicit_observers, &seeds);
-    if auto {
+    let observers = match (&fallback, auto) {
+        // 回退形态没显式指定观察者：用桥/本机种子那一侧的观察者（见 EtFallback::observers）
+        (Some(f), true) => {
+            let list: Vec<String> = f.observers.iter().map(SocketAddr::to_string).collect();
+            println!("[观察者] 回退形态使用 {}", list.join(", "));
+            f.observers.clone()
+        }
+        _ => choose_observers(explicit_observers, &seeds),
+    };
+    if auto && fallback.is_none() {
         if observers.is_empty() {
             println!(
                 "[观察者] 未指定，也没有发现带观察者的种子：将跳过 NAT 探测、只能尝试 TCP 兜底\
@@ -639,10 +726,18 @@ async fn async_move(
         .iter()
         .find(|p| p.endpoint.scheme == SeedScheme::Tcp)
         .map(|p| p.addr);
+    let mut orch = SessionOrchestrator::new(node.clone(), engine.clone(), storage, observers)
+        .with_tcp_fallback(tcp_seed);
+    if let Some(f) = &fallback {
+        // 回退形态的三根线：打洞载体坐到桥的派生端口上；对外宣告 (bind, punch)；
+        // 观察者的地址已经在上面换成桥/本机种子那一侧
+        orch = orch
+            .with_punch_bind(Some(f.punch_bind()))
+            .with_advertise_override(Some(f.advertised()));
+    }
     let session = Arc::new(Session {
         code: code.clone(),
-        orch: SessionOrchestrator::new(node.clone(), engine.clone(), storage, observers)
-            .with_tcp_fallback(tcp_seed),
+        orch,
         engine: engine.clone(),
         sink: Arc::new(hub.clone()),
         states: PeerStates::default(),
@@ -916,6 +1011,413 @@ fn parse_observers(list: Option<&str>) -> Vec<SocketAddr> {
         .filter(|s| !s.trim().is_empty())
         .filter_map(|s| s.trim().parse::<SocketAddr>().ok())
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// ET 回退：一个真种子都测不通时，借 EasyTier 公共节点组一张临时网络
+// ---------------------------------------------------------------------------
+//
+// 拓扑（详见 `bridge/wgp-et-bridge/src/fallback.rs`）：
+//
+// ```text
+// 房主                                       公共 ET 中继                    加入方
+// 进程内本地种子 127.0.0.1:11010/3478                                         本机客户端
+//      ▲                                                                        ▲
+// 桥 127.0.0.2:{11010,3478,punch} ── ET 自定义帧 ──► relay ──► 桥 127.0.0.2:{...}
+// ```
+//
+// 本文件只做接线：把 `et://` 入口收出来、条件满足时拉起桥、把"种子/观察者/打洞端口"
+// 三样换成桥那一侧的地址。桥在独立 workspace（依赖 mesh-tun-proto + protoc），
+// 所以只能以子进程方式用，不能在本 crate 里引用。
+
+/// ET 回退入口（`et://主机:端口`）：只在中继回退时用，不参加种子测速。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EtPeer {
+    host: String,
+    port: u16,
+}
+
+impl EtPeer {
+    /// 回显成命令行里的样子（`-p` 与给同伴的加入命令都用它）
+    fn display(&self) -> String {
+        format!("et://{}:{}", self.host, self.port)
+    }
+
+    /// 桥的中继参数：它只认 `tcp://主机:端口`
+    fn relay_spec(&self) -> String {
+        format!("tcp://{}:{}", self.host, self.port)
+    }
+}
+
+/// 桥在 stdout 上打出的机器可读行（格式由 `wgp-et-fallback` 固定，改之前两边一起改）
+const ET_READY_PREFIX: &str = "WGP-ET-FALLBACK READY";
+/// 等 READY 的上限：桥要先连上公共中继、完成 ET 握手才打这一行
+const ET_READY_TIMEOUT: Duration = Duration::from_secs(15);
+/// 回退形态下本机种子的固定服务端口（DHT / 观察者）
+const FALLBACK_SEED_PORT: u16 = 11_010;
+const FALLBACK_STUN_PORT: u16 = 3_478;
+/// 与桥上种子互认的重试次数（第一次 PING 要等桥的 ET 握手完成，一次就放弃太早）
+const FALLBACK_PING_ATTEMPTS: usize = 10;
+
+/// 桥 READY 行的解析结果：桥自报的身份、监听地址、打洞端口
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EtReady {
+    peer: u32,
+    bind: Ipv4Addr,
+    punch: u16,
+}
+
+/// `et://主机:端口` → [`EtPeer`]；不是 `et://` 或形状不对返回 None（其余 scheme 照旧交给种子解析）。
+fn parse_et_peer(item: &str) -> Option<EtPeer> {
+    let rest = item
+        .strip_prefix("et://")
+        .or_else(|| item.strip_prefix("ET://"))?;
+    let (host, port) = rest.rsplit_once(':')?;
+    if host.trim().is_empty() {
+        return None;
+    }
+    let port: u16 = port.trim().parse().ok().filter(|p| *p != 0)?;
+    Some(EtPeer {
+        host: host.trim().to_string(),
+        port,
+    })
+}
+
+/// 从种子列表里挑出 `et://` 入口，返回 `(et 入口, 其余条目拼回的原样串)`。
+///
+/// 其余条目原样返回（不在这里解析），继续走 [`SeedEndpoint::parse_list`]——`et://`
+/// 混在里面会让它整条报"非法端点"，所以必须先摘出来。
+fn split_et_peers(list: &str) -> (Vec<EtPeer>, String) {
+    let mut et = Vec::new();
+    let mut rest: Vec<&str> = Vec::new();
+    for raw in list.split(|c: char| c == ',' || c == ';' || c.is_whitespace()) {
+        let item = raw.trim();
+        if item.is_empty() {
+            continue;
+        }
+        match parse_et_peer(item) {
+            Some(peer) => et.push(peer),
+            None => rest.push(item),
+        }
+    }
+    (et, rest.join(","))
+}
+
+/// 是否启用 ET 回退：**一个真种子都没测通** + 给了 `et://` 入口 + 没被 `--no-et-fallback` 关掉。
+///
+/// 只在"全灭"时触发是刻意的：连上了种子却进不去房间，多半是房间码写错了，
+/// 那种情况下再起一张临时网络只会掩盖真正的问题。
+fn et_fallback_wanted(live_seeds: usize, et_peers: &[EtPeer], disabled: bool) -> bool {
+    live_seeds == 0 && !et_peers.is_empty() && !disabled
+}
+
+/// 解析 `WGP-ET-FALLBACK READY peer=<u32> bind=<IPv4> punch=<u16>`。
+///
+/// 按 `key=value` 取字段（不依赖顺序），三个值缺一个就当解析失败——拿不到打洞端口就没法接线，
+/// 与其猜一个默认值，不如显式失败。
+fn parse_ready_line(line: &str) -> Option<EtReady> {
+    let rest = line.trim().strip_prefix(ET_READY_PREFIX)?;
+    let (mut peer, mut bind, mut punch) = (None, None, None);
+    for kv in rest.split_whitespace() {
+        let Some((key, value)) = kv.split_once('=') else {
+            continue;
+        };
+        match key {
+            "peer" => peer = value.parse::<u32>().ok(),
+            "bind" => bind = value.parse::<Ipv4Addr>().ok(),
+            "punch" => punch = value.parse::<u16>().ok().filter(|p| *p != 0),
+            _ => {}
+        }
+    }
+    Some(EtReady {
+        peer: peer?,
+        bind: bind?,
+        punch: punch?,
+    })
+}
+
+/// 桥可执行文件的位置：环境变量 `WGP_ET_FALLBACK` 优先，否则与当前可执行文件同目录
+/// （发布包里 `wgp-client` 与 `wgp-et-fallback` 并排）。
+fn fallback_binary_path(
+    explicit: Option<&str>,
+    current_exe: Option<&Path>,
+) -> Result<PathBuf, String> {
+    if let Some(path) = explicit.map(str::trim).filter(|p| !p.is_empty()) {
+        return Ok(PathBuf::from(path));
+    }
+    let exe = current_exe.ok_or("无法确定当前可执行文件的位置（可用 WGP_ET_FALLBACK 指定桥）")?;
+    let dir = exe.parent().ok_or_else(|| {
+        format!(
+            "无法确定 {} 所在目录（可用 WGP_ET_FALLBACK 指定桥）",
+            exe.display()
+        )
+    })?;
+    let name = if cfg!(windows) {
+        "wgp-et-fallback.exe"
+    } else {
+        "wgp-et-fallback"
+    };
+    Ok(dir.join(name))
+}
+
+/// 桥子进程。`Drop` 里 kill + wait：客户端正常退出、报错返回、还是 Ctrl+C 之后清理，
+/// 都不会把桥留在后台（否则下一次启动会撞上它占着的 11010/3478 端口）。
+struct EtBridge {
+    child: std::process::Child,
+}
+
+impl EtBridge {
+    fn spawn(program: &Path, args: &[String]) -> Result<Self, String> {
+        let child = Command::new(program)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            // 桥的事件与错误直接落到用户的终端（它只往 stderr 写，stdout 只给 READY）
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|e| {
+                format!(
+                    "找不到或拉不起桥 `{}`：{e}（可用环境变量 WGP_ET_FALLBACK 指到 wgp-et-fallback）",
+                    program.display()
+                )
+            })?;
+        Ok(Self { child })
+    }
+
+    /// 读一行 READY（上限 [`ET_READY_TIMEOUT`]）。
+    ///
+    /// 桥在这个时限内退出（没连上中继、端口被占、参数不对）时，read_line 立刻返回 EOF，
+    /// 于是这里马上报错，而不是干等到超时。
+    async fn read_ready(&mut self) -> Result<EtReady, String> {
+        let stdout = self
+            .child
+            .stdout
+            .take()
+            .ok_or("桥的 stdout 不可读（内部错误）")?;
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let read = std::io::BufReader::new(stdout)
+                .read_line(&mut line)
+                .unwrap_or(0);
+            let _ = tx.send(if read == 0 { String::new() } else { line });
+        });
+        let line = tokio::task::spawn_blocking(move || rx.recv_timeout(ET_READY_TIMEOUT))
+            .await
+            .map_err(|e| format!("等待桥的 READY 时任务失败：{e}"))?
+            .map_err(|_| {
+                format!(
+                    "桥在 {} 秒内没有打出 READY（公共 ET 节点不可达？网络被拦？）",
+                    ET_READY_TIMEOUT.as_secs()
+                )
+            })?;
+        if line.trim().is_empty() {
+            return Err("桥还没打出 READY 就退出了（具体原因看它上面打印的错误）".to_string());
+        }
+        parse_ready_line(&line).ok_or_else(|| format!("桥的 READY 行无法解析：{}", line.trim()))
+    }
+}
+
+impl Drop for EtBridge {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// 已接好的 ET 回退：桥进程 + 房主的进程内本地种子。
+///
+/// **必须活到房间会话结束**：`Drop` 才是桥与本地种子的收尾动作（由调用方的局部变量保证）。
+struct EtFallback {
+    /// 房主侧：进程内本地种子（DHT 127.0.0.1:11010 + 观察者 3478）；加入方为 None。
+    /// 这里是**持有**而非读取：句柄一 drop，种子就停了。
+    #[allow(dead_code)]
+    local_seed: Option<NodeHandle>,
+    /// 桥子进程（同样只为持有：`Drop` 里 kill + wait）
+    #[allow(dead_code)]
+    bridge: EtBridge,
+    ready: EtReady,
+    /// 本侧当"种子"用的地址 = 桥的 DHT 服务口
+    seed_addr: SocketAddr,
+    /// 本侧当"观察者"用的候选地址（房主自己有本地观察者，加入方只能用桥）
+    observers: Vec<SocketAddr>,
+}
+
+impl EtFallback {
+    /// 桥自报的对外端点：有了它，对端才会按 `绑定地址:punch` 找过来
+    fn advertised(&self) -> (Ipv4Addr, u16) {
+        (self.ready.bind, self.ready.punch)
+    }
+
+    /// 打洞载体的绑定地址（固定端口，不是临时端口）。
+    ///
+    /// 桥只会把对端报文写回 `:<punch>`——房主侧固定写回 `127.0.0.1:<同名端口>`，
+    /// 加入方侧写回"本机应用最近从这个端口发出的地址"。载体绑临时端口的话那枚报文没人收，
+    /// 打洞永远收不到对端探针。代价：同一台机器跑两个回退客户端会抢同一个 UDP 端口。
+    fn punch_bind(&self) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), self.ready.punch)
+    }
+}
+
+/// 房主侧的进程内本地种子：DHT 绑 `127.0.0.1:11010`、同进程观察者 `3478`。
+///
+/// `hobby: false` 是**必须**的：`hobby: true` 会把节点设成贡献模式
+/// （`RelayPolicy::Deny`），它拒绝 Forward 中转——而"加入方报道 → 锚点"正是靠这条中转
+/// 送到房间锚点手上的，置成贡献模式的话加入方永远入不了表。
+async fn start_local_seed(
+    engine: &Engine,
+    allow_legacy_identity: bool,
+) -> Result<NodeHandle, String> {
+    let mut rng = rand_core::OsRng;
+    let identity = NodeIdentity::generate(&mut rng);
+    let handle = engine
+        .run_node(
+            NodeConfig {
+                role: NodeRole::Seed,
+                bind: format!("127.0.0.1:{FALLBACK_SEED_PORT}"),
+                stun: Some(FALLBACK_STUN_PORT),
+                tcp_signal: None,
+                hobby: false,
+                observer_policy: wgp_dht::ObserverPolicy::default(),
+                advertise: None,
+                advertise_epoch: 0,
+                endpoint_scope: wgp_dht::EndpointScope::LocalNetwork,
+                // 回退种子只服务本机（127.0.0.1），不经过任何前置代理，不需要 PROXY v2
+                proxy_protocol: false,
+                peers: Vec::new(),
+                allow_legacy_identity,
+            },
+            identity,
+        )
+        .await;
+    if handle.dht.is_none() {
+        return Err(format!(
+            "本地种子绑定 127.0.0.1:{FALLBACK_SEED_PORT} 失败（端口被占用？\
+             同一台机器只能跑一个回退房主）"
+        ));
+    }
+    if handle.observer.is_none() {
+        return Err(format!(
+            "本地种子的观察者绑定 {FALLBACK_STUN_PORT} 失败（端口被占用？）"
+        ));
+    }
+    println!(
+        "[回退] 已在进程内起本地种子：DHT 127.0.0.1:{FALLBACK_SEED_PORT}、观察者 {FALLBACK_STUN_PORT}"
+    );
+    Ok(handle)
+}
+
+/// 拉起回退：房主先起本地种子，再起桥；加入方只起桥。成功后把接好的三样地址打给用户看。
+async fn start_et_fallback(
+    engine: &Engine,
+    host: bool,
+    et_peers: &[EtPeer],
+    code: &str,
+    allow_legacy_identity: bool,
+) -> Result<EtFallback, String> {
+    let key = room_key(code);
+    // 与桥同一处派生（`wgp_dht::et_fallback_network`）：桥侧也有同一份实现，
+    // 这里只用来把网络名打给用户看，密钥仍由桥按 --room-key 自己算，保证两边一致。
+    let (network_name, _secret) = wgp_dht::et_fallback_network(&key);
+    let relay = et_peers.first().ok_or("没有可用的 et:// 入口")?;
+
+    // b) 房主：进程内本地种子（加入方把桥当种子，不需要）
+    let local_seed = if host {
+        Some(start_local_seed(engine, allow_legacy_identity).await?)
+    } else {
+        None
+    };
+
+    // c) 桥子进程：路径 = WGP_ET_FALLBACK 或与当前 exe 同目录
+    let program = fallback_binary_path(
+        std::env::var("WGP_ET_FALLBACK").ok().as_deref(),
+        std::env::current_exe().ok().as_deref(),
+    )?;
+    let mode = if host { "host" } else { "joiner" };
+    let args: Vec<String> = vec![
+        "--relay".to_string(),
+        relay.relay_spec(),
+        "--room-key".to_string(),
+        hex(&key),
+        "--mode".to_string(),
+        mode.to_string(),
+    ];
+    let mut bridge = EtBridge::spawn(&program, &args)?;
+    let ready = bridge.read_ready().await?;
+
+    // d) 接线：种子 = 桥的 DHT 口；观察者见下；打洞端口由桥派生
+    let seed_addr = SocketAddr::new(IpAddr::V4(ready.bind), FALLBACK_SEED_PORT);
+    let bridge_observer = SocketAddr::new(IpAddr::V4(ready.bind), FALLBACK_STUN_PORT);
+    let observers = if host {
+        // 房主：本地种子的观察者就在 127.0.0.1:3478，直接探它。桥在 host 模式只会把
+        // 本机发出的报文送去对端、不会作答，探桥端口必然是"观察者全灭"，进而把打洞
+        // 降级成纯 TCP（而桥上根本没有 TCP 通道）。桥端口仍然留在候选里兜底。
+        vec![
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), FALLBACK_STUN_PORT),
+            bridge_observer,
+        ]
+    } else {
+        // 加入方：探桥的 3478，那枚报文经桥落到房主的观察者上——回退形态里唯一
+        // 能拿到 STUN 应答的方向
+        vec![bridge_observer]
+    };
+
+    println!(
+        "[回退] 没有可用种子：经公共 EasyTier 中继 {} 组临时网络 {network_name}\
+         （带宽与稳定性不受本项目控制）",
+        relay.display()
+    );
+    println!(
+        "[回退] 种子    = udp://{seed_addr}（{}）",
+        if host {
+            "桥写回本机种子 127.0.0.1:11010"
+        } else {
+            "经桥访问房主的种子"
+        }
+    );
+    let obs: Vec<String> = observers.iter().map(SocketAddr::to_string).collect();
+    println!("[回退] 观察者  = {}", obs.join(", "));
+    println!(
+        "[回退] 打洞    = 绑定 0.0.0.0:{}（固定端口），对外宣告 {}:{}",
+        ready.punch, ready.bind, ready.punch
+    );
+    println!(
+        "[回退] 桥进程  = {}（peer={}；同一台机器只能跑一个回退客户端，否则抢同一个打洞端口）",
+        program.display(),
+        ready.peer
+    );
+
+    Ok(EtFallback {
+        local_seed,
+        bridge,
+        ready,
+        seed_addr,
+        observers,
+    })
+}
+
+/// 与桥上的种子互认：桥刚起来时 ET 握手可能还没完成，第一枚 PING 会掉，
+/// 所以要重试几次。失败也不致命——后面 `resolve_storage` 会给出可读错误。
+async fn warm_up_fallback_seed(node: &Arc<DhtNode>, seed: SocketAddr) {
+    for attempt in 1..=FALLBACK_PING_ATTEMPTS {
+        if node.ping(seed).await.is_ok() {
+            if attempt > 1 {
+                println!("[回退] 与桥上的种子互认成功（第 {attempt} 次尝试）");
+            }
+            return;
+        }
+        if attempt < FALLBACK_PING_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+    eprintln!(
+        "[回退] warn: {} 次都没能与桥上的种子 {seed} 互认——检查桥的 stderr（ET 中继通不通）",
+        FALLBACK_PING_ATTEMPTS
+    );
+    eprintln!(
+        "[回退] hint: 桥还没看到 ET 对端。两侧要**同时在线**，且 `-p et://<主机>:<端口>` \
+         填同一个 ET 公共节点（临时网络名由房间码派生，两侧必须一致）"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1325,10 +1827,14 @@ fn print_help() {
          \n\
          选项：\n\
            -s, --seed <list>      种子端点（可重复；也支持逗号/分号/空白分隔）\n\
-                                  udp://host:port 或 tcp://host:port\n\
+                                  udp://host:port 或 tcp://host:port 或 et://host:port\n\
                                   ◦ tcp:// 只兜底信令（bootstrap / 选点 / 房间 KV / 报道中转）；\n\
                                     打洞与业务隧道仍要 UDP，两端 UDP 全不通时隧道建不起来\n\
+                                  ◦ et:// = EasyTier 公共节点：一个真种子都连不上时，经它组\n\
+                                    一张临时网络（见下面「ET 回退」）；流量经公共中继，\n\
+                                    带宽与稳定性不受本项目控制\n\
            -p, --peers <list>     等价 --seed（EasyTier 习惯）\n\
+           --no-et-fallback       关掉 ET 回退：即使给了 et:// 入口也不往公共中继上跑\n\
            --storage <ep>         显式房间键存储节点（默认在已知种子里按房间键选定，两端结果一致）\n\
            --observer <list>      观察者/STUN 端点，逗号分隔 ip:port\n\
                                   （缺省用发现到的种子自带的观察者；一个也没有则跳过 NAT 探测、只试 TCP 兜底）\n\
@@ -1341,14 +1847,23 @@ fn print_help() {
            -h, --help             显示本帮助\n\
            -V, --version          显示版本\n\
          \n\
+         ET 回退（没有 wgp 种子时）：\n\
+           · 触发条件：一个真种子都测不通 + 给了 et:// 入口（--no-et-fallback 可关掉）\n\
+           · 房主在进程内起本地种子（127.0.0.1:11010 + 观察者 3478），两侧各拉起\n\
+             wgp-et-fallback 桥，把 DHT/观察者/打洞端口经公共 ET 中继送到对端\n\
+           · 同一台机器只能跑一个回退客户端：打洞端口按 ET 节点号派生，是固定端口\n\
+         \n\
          环境变量：\n\
            WGP_SEED               种子端点列表（等价 --seed；内核不内置任何地址）\n\
+           WGP_ET_FALLBACK        wgp-et-fallback 可执行文件路径（缺省与 wgp-client 同目录）\n\
          \n\
          示例：\n\
            wgp-client code 示例房间 123456\n\
            wgp-client 开房 --network-name 示例房间 --network-secret 123456 -p udp://轻松.躺进.icu:11010\n\
            wgp-client join --network-name 示例房间 --network-secret 123456 -p udp://轻松.躺进.icu:11010\n\
            wgp-client join U/C2G9-GYET-311W-R636 -p udp://轻松.躺进.icu:11010\n\
+           wgp-client 开房 -n 我的房间 -k 密钥 -p et://<ET 公共节点>:11010\n\
+             ↑ 一个真种子都没有时：经 EasyTier 公共节点组临时网络（同伴也用同一个 et:// 入口）\n\
          \n\
          联机示例（Minecraft Java 版，服务器在房主本机 25565）：\n\
            房主：wgp-client 开房 -n 我的房间 -k 密钥 -p udp://<种子>:11010 --expose 25565\n\
@@ -1765,5 +2280,264 @@ mod tests {
         );
         let unreachable = describe_join_error(&RoomError::StoreFailed, storage);
         assert!(unreachable.contains("没有应答"), "{unreachable}");
+    }
+
+    // -----------------------------------------------------------------------
+    // ET 回退（S3/S4）：纯函数部分
+    // -----------------------------------------------------------------------
+
+    fn et(host: &str, port: u16) -> EtPeer {
+        EtPeer {
+            host: host.to_string(),
+            port,
+        }
+    }
+
+    #[test]
+    fn et_entries_are_split_out_of_the_seed_list() {
+        // 混合写法：逗号/分号/空白都算分隔符，et:// 摘出来，其余原样交给种子解析
+        let (et_peers, rest) = split_et_peers(
+            "udp://seed.example:11010, et://relay.example:11010; et://198.51.100.7:11010\n\
+             tcp://seed.example:3481",
+        );
+        assert_eq!(
+            et_peers,
+            vec![et("relay.example", 11010), et("198.51.100.7", 11010)]
+        );
+        assert_eq!(rest, "udp://seed.example:11010,tcp://seed.example:3481");
+        // 其余条目仍然能被种子解析器接受（et:// 摘干净了）
+        let (endpoints, bad) = SeedEndpoint::parse_list(&rest);
+        assert_eq!(endpoints.len(), 2);
+        assert!(bad.is_empty(), "不该有非法项：{bad:?}");
+
+        // 只有 et://：种子列表为空
+        let (only_et, rest) = split_et_peers("et://relay.example:11010");
+        assert_eq!(only_et.len(), 1);
+        assert!(rest.is_empty());
+        // 没有 et://：一个都不动
+        let (none, rest) = split_et_peers("udp://seed.example:11010");
+        assert!(none.is_empty());
+        assert_eq!(rest, "udp://seed.example:11010");
+    }
+
+    #[test]
+    fn et_peer_shapes_are_validated() {
+        assert_eq!(
+            parse_et_peer("et://relay.example:11010"),
+            Some(et("relay.example", 11010))
+        );
+        assert_eq!(
+            parse_et_peer("ET://198.51.100.7:11010"),
+            Some(et("198.51.100.7", 11010))
+        );
+        for bad in [
+            "et://",
+            "et://relay.example",
+            "et://relay.example:0",
+            "et://relay.example:abc",
+            "et://relay.example:70000",
+            "et://:11010",
+            "udp://relay.example:11010",
+            "relay.example:11010",
+            "",
+        ] {
+            assert!(parse_et_peer(bad).is_none(), "`{bad}` 应被拒绝");
+        }
+        // 桥只认 tcp:// 的中继参数，et:// 要翻译过去
+        assert_eq!(
+            et("relay.example", 11010).relay_spec(),
+            "tcp://relay.example:11010"
+        );
+        // 回显成命令行里的样子，能被自己解析回来
+        assert_eq!(
+            et("relay.example", 11010).display(),
+            "et://relay.example:11010"
+        );
+        assert_eq!(
+            parse_et_peer(&et("relay.example", 11010).display()),
+            Some(et("relay.example", 11010))
+        );
+    }
+
+    #[test]
+    fn et_fallback_triggers_only_when_no_live_seed() {
+        let et_peers = vec![et("relay.example", 11010)];
+        // 全灭 + 有 et:// → 回退
+        assert!(et_fallback_wanted(0, &et_peers, false));
+        // 有一个真种子能连上 → 不回退（哪怕还给了 et://）
+        assert!(!et_fallback_wanted(1, &et_peers, false));
+        // 没给 et:// → 不触发（照旧按"没有可用种子"失败）
+        assert!(!et_fallback_wanted(0, &[], false));
+        // 显式关掉 → 不触发
+        assert!(!et_fallback_wanted(0, &et_peers, true));
+    }
+
+    #[test]
+    fn ready_line_is_parsed_into_the_three_wiring_values() {
+        let ready =
+            parse_ready_line("WGP-ET-FALLBACK READY peer=1950183742 bind=127.0.0.2 punch=42133")
+                .expect("标准 READY 行应能解析");
+        assert_eq!(
+            ready,
+            EtReady {
+                peer: 1_950_183_742,
+                bind: Ipv4Addr::new(127, 0, 0, 2),
+                punch: 42_133,
+            }
+        );
+        // 字段顺序不敏感、多余空白与未知字段都不影响
+        let reordered =
+            parse_ready_line("WGP-ET-FALLBACK READY  punch=42133 bind=127.0.0.2 peer=7 extra=1")
+                .expect("按 key=value 取值");
+        assert_eq!(reordered.punch, 42_133);
+        assert_eq!(reordered.peer, 7);
+        // 缺字段 / 前缀不对 / 端口为 0 / 不是 IPv4：都当解析失败（宁可报错，不猜默认值）
+        for bad in [
+            "WGP-ET-FALLBACK READY peer=7 bind=127.0.0.2",
+            "WGP-ET-FALLBACK READY peer=7 punch=42133",
+            "WGP-ET-FALLBACK READY bind=127.0.0.2 punch=42133",
+            "WGP-ET-FALLBACK READY peer=7 bind=127.0.0.2 punch=0",
+            "WGP-ET-FALLBACK READY peer=7 bind=nope punch=42133",
+            "READY peer=7 bind=127.0.0.2 punch=42133",
+            "",
+        ] {
+            assert!(parse_ready_line(bad).is_none(), "`{bad}` 应解析失败");
+        }
+    }
+
+    #[test]
+    fn fallback_binary_is_looked_up_next_to_the_client() {
+        // 环境变量优先（别人可能把桥装在别处）
+        assert_eq!(
+            fallback_binary_path(Some(r"C:\tools\wgp-et-fallback.exe"), None).unwrap(),
+            PathBuf::from(r"C:\tools\wgp-et-fallback.exe")
+        );
+        // 空串当没给
+        let exe = Path::new(r"C:\apps\wgp-client.exe");
+        let got = fallback_binary_path(Some("  "), Some(exe)).unwrap();
+        assert_eq!(got, exe.with_file_name("wgp-et-fallback.exe"));
+        // 连当前 exe 都不知道：可读错误，而不是猜一个路径
+        let err = fallback_binary_path(None, None).unwrap_err();
+        assert!(err.contains("WGP_ET_FALLBACK"), "{err}");
+    }
+
+    #[test]
+    fn et_network_is_derived_from_the_room_code() {
+        // 客户端与桥必须从同一个房间键派生同一张临时网
+        let key = room_key("U/C2G9-GYET-311W-R636");
+        let (name, secret) = wgp_dht::et_fallback_network(&key);
+        assert_eq!(
+            wgp_dht::et_fallback_network(&key),
+            (name.clone(), secret.clone())
+        );
+        // 交给桥的参数是一整串 64 位十六进制房间键
+        assert_eq!(hex(&key).len(), 64);
+        // 不同房间 → 不同网络
+        let other = room_key("U/8SRU-FM1Q-XTDQ-LL36");
+        assert_ne!(wgp_dht::et_fallback_network(&other), (name, secret));
+    }
+
+    #[test]
+    fn join_command_keeps_et_entries_for_the_peer() {
+        // 房主用 et:// 组网时，给同伴的命令必须也带上 et:// 入口（否则同伴没法回退到同一张网）
+        let cfg = PortConfig::default();
+        let cmd = join_command(
+            "U/C2G9-GYET-311W-R636",
+            "et://relay.example:11010,udp://seed.example:11010",
+            None,
+            &cfg,
+        );
+        assert_eq!(
+            cmd,
+            "wgp-client join U/C2G9-GYET-311W-R636 \
+             -p udp://seed.example:11010,et://relay.example:11010"
+        );
+        // 能被自己解析回同样的 et 入口
+        let args: Vec<String> = cmd.split(' ').skip(2).map(str::to_string).collect();
+        let parsed = parse_opts(&args).unwrap();
+        let (et_peers, rest) = split_et_peers(parsed.seed.as_deref().unwrap());
+        assert_eq!(et_peers, vec![et("relay.example", 11010)]);
+        assert_eq!(rest, "udp://seed.example:11010");
+    }
+
+    #[test]
+    fn no_et_fallback_flag_parses() {
+        let o = parse_opts(&v(&["-p", "et://relay.example:11010", "--no-et-fallback"])).unwrap();
+        assert!(o.no_et_fallback);
+        // 默认不受影响
+        assert!(
+            !parse_opts(&v(&["-p", "et://relay.example:11010"]))
+                .unwrap()
+                .no_et_fallback
+        );
+    }
+
+    /// 端到端（真的起桥）**不进 `cargo test --workspace`**，要靠环境变量显式打开：
+    ///
+    /// ```text
+    /// # 先构建桥（独立 workspace，需要 protoc 与同级目录的 mesh-tun-proto）
+    /// cd bridge/wgp-et-bridge && cargo build --bin wgp-et-fallback
+    /// # 再跑这个测试：把桥指过去，relay 填一个能连上的 ET 公共节点
+    /// set WGP_ET_E2E=1
+    /// set WGP_ET_FALLBACK=bridge\wgp-et-bridge\target\debug\wgp-et-fallback.exe
+    /// set WGP_ET_RELAY=tcp://<ET 公共节点>:11010
+    /// cargo test -p wgp-client et_fallback_bridge_e2e -- --nocapture
+    /// ```
+    ///
+    /// 期望：打印 `WGP-ET-FALLBACK READY peer=… bind=127.0.0.2 punch=…` 并被解析成三个值；
+    /// 没有可连的中继时，断言"失败也是可读的失败"（找不到可执行文件 / 桥立刻退出 / READY 超时），
+    /// 而不是挂着不动或假装成功。
+    #[test]
+    fn et_fallback_bridge_e2e() {
+        if std::env::var("WGP_ET_E2E").is_err() {
+            eprintln!("跳过 ET 端到端测试（设 WGP_ET_E2E=1 才跑，做法见本测试的注释）");
+            return;
+        }
+        let program = fallback_binary_path(
+            std::env::var("WGP_ET_FALLBACK").ok().as_deref(),
+            std::env::current_exe().ok().as_deref(),
+        )
+        .expect("桥路径");
+        assert!(
+            program.exists(),
+            "{} 不存在：先 `cd bridge/wgp-et-bridge && cargo build --bin wgp-et-fallback`",
+            program.display()
+        );
+        let relay =
+            std::env::var("WGP_ET_RELAY").unwrap_or_else(|_| "tcp://127.0.0.1:1".to_string());
+        let key = room_key("U/C2G9-GYET-311W-R636");
+        let args: Vec<String> = vec![
+            "--relay".to_string(),
+            relay.clone(),
+            "--room-key".to_string(),
+            hex(&key),
+            "--mode".to_string(),
+            "joiner".to_string(),
+        ];
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("测试运行时");
+        let outcome: Result<EtReady, String> = rt.block_on(async {
+            let mut bridge = EtBridge::spawn(&program, &args)?;
+            bridge.read_ready().await
+        });
+        match outcome {
+            Ok(ready) => {
+                assert!(
+                    ready.punch >= 42_100 && ready.punch < 43_000,
+                    "打洞端口按节点号派生"
+                );
+                eprintln!("桥起来了：{ready:?}");
+            }
+            Err(e) => {
+                // 中继不可达时的预期失败：必须是可读的人话，而不是静默/挂死
+                eprintln!("桥没有起来（预期，若 {relay} 不可达）：{e}");
+                assert!(
+                    e.contains("READY") || e.contains("拉不起") || e.contains("无法解析"),
+                    "失败信息应说清楚卡在哪一步：{e}"
+                );
+            }
+        }
     }
 }
