@@ -21,6 +21,24 @@ use wgp_et_bridge::fallback::{
 const DHT_PORT: u16 = 21_010;
 const STUN_PORT: u16 = 23_478;
 
+/// 桥与内核必须用**同一套**网络派生：两侧算出不同网络就根本碰不到一起。
+///
+/// 这条用例是防漂移的钉子：一边改了派生规则而另一边没改，这里立刻红。
+#[test]
+fn network_derivation_matches_the_core() {
+    for seed in [0u8, 7, 0x5a, 0xff] {
+        let key = [seed; 32];
+        assert_eq!(
+            derive_network(&key),
+            wgp_dht::et_fallback_network(&key),
+            "seed={seed}：桥侧派生必须与 wgp-dht 一致"
+        );
+    }
+    // 用房间码派生的真实路径也一致
+    let key = room_key("U/FALLBACK-ROOM-01-AB12");
+    assert_eq!(derive_network(&key), wgp_dht::et_fallback_network(&key));
+}
+
 /// 只转发字节的测试 relay（同 fallback_bridge.rs）
 fn byte_pipe_relay() -> SocketAddr {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("relay 绑定");
