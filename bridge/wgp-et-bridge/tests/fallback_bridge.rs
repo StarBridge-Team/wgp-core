@@ -137,3 +137,110 @@ async fn udp_datagram_crosses_the_et_link_both_ways() {
         "报文必须经 ET 链路往返（含房主侧应用与回程地址映射）"
     );
 }
+
+/// 打洞端口：两侧应用各自绑在自己的 `punch` 端口上，通过桥互相打洞。
+///
+/// 这是 S4（数据面）的桥接层前提：对端会按「我的 ET 节点号」算出端口并把打洞报文发到
+/// `bind_ip:punch(me)`，所以桥必须真的在那个端口上听，并把报文交给本机绑定在同号端口的应用。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn punch_ports_reach_the_peer_application() {
+    let relay = byte_pipe_relay();
+    let (name, secret) = derive_network(&[5u8; 32]);
+
+    let host_cfg = ProxyConfig {
+        bind_ip: Ipv4Addr::new(127, 0, 0, 5),
+        local_app_ip: Some(Ipv4Addr::LOCALHOST),
+        service_ports: vec![SERVICE_PORT_DHT],
+    };
+    let (host_bridge, mut host_events) = FallbackBridge::start(
+        host_cfg,
+        name.clone(),
+        secret.clone(),
+        relay,
+    )
+    .await
+    .expect("房主桥");
+    let host_punch = host_bridge.punch_port();
+    let (host_stop, host_stop_rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(host_bridge.run(host_stop_rx));
+
+    let joiner_cfg = ProxyConfig {
+        bind_ip: Ipv4Addr::new(127, 0, 0, 6),
+        local_app_ip: None,
+        service_ports: vec![SERVICE_PORT_DHT],
+    };
+    let (joiner_bridge, mut joiner_events) = FallbackBridge::start(
+        joiner_cfg,
+        name,
+        secret,
+        relay,
+    )
+    .await
+    .expect("加入方桥");
+    let joiner_punch = joiner_bridge.punch_port();
+    let (joiner_stop, joiner_stop_rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(joiner_bridge.run(joiner_stop_rx));
+
+    // 两侧应用：绑在自己的打洞端口上（回退形态里 wgp 的打洞载体就是这个端口）
+    assert_ne!(host_punch, joiner_punch, "两个节点号派生的端口不应相同");
+    let host_app = UdpSocket::bind((Ipv4Addr::LOCALHOST, host_punch)).expect("房主应用绑定打洞端口");
+    host_app.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+    let joiner_app =
+        UdpSocket::bind((Ipv4Addr::LOCALHOST, joiner_punch)).expect("加入方应用绑定打洞端口");
+    joiner_app.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let (mut host_up, mut joiner_up) = (false, false);
+    while Instant::now() < deadline && !(host_up && joiner_up) {
+        tokio::select! {
+            Some(ev) = host_events.recv() => {
+                if matches!(ev, wgp_et_bridge::fallback::BridgeEvent::PeerUp { .. }) { host_up = true; }
+            }
+            Some(ev) = joiner_events.recv() => {
+                if matches!(ev, wgp_et_bridge::fallback::BridgeEvent::PeerUp { .. }) { joiner_up = true; }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+    }
+    assert!(host_up && joiner_up, "两侧都要看到对端");
+
+    // 加入方按「对端的打洞端口」发包。注意：同一台机器上两侧桥绑在不同回环地址（.5/.6），
+    // 所以每侧都往**自己那边**的 bind_ip 发——真实部署里两侧的 bind_ip 都是 127.0.0.2，
+    // 这两个写法就合并成同一个地址。
+    let host_punch_addr = SocketAddr::new(Ipv4Addr::new(127, 0, 0, 6).into(), host_punch);
+    let joiner = tokio::task::spawn_blocking(move || {
+        let mut buf = [0u8; 64];
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut got = None;
+        while Instant::now() < deadline {
+            let _ = joiner_app.send_to(b"punch", host_punch_addr);
+            if let Ok((n, src)) = joiner_app.recv_from(&mut buf) {
+                // 房主应用回显的 pong
+                let _ = src;
+                got = Some(buf[..n].to_vec());
+                break;
+            }
+        }
+        got
+    });
+
+    // 房主应用：收到就回 pong（它看到的来源就是桥给它的对端地址）
+    let host_reply = tokio::task::spawn_blocking(move || {
+        let mut buf = [0u8; 64];
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if let Ok((n, src)) = host_app.recv_from(&mut buf) {
+                let _ = host_app.send_to(b"pong", src);
+                let _ = n;
+                return true;
+            }
+        }
+        false
+    });
+
+    let (got, replied) = (joiner.await.unwrap(), host_reply.await.unwrap());
+    let _ = host_stop.send(());
+    let _ = joiner_stop.send(());
+    assert!(replied, "房主应用应收到打洞报文");
+    assert_eq!(got.as_deref(), Some(&b"pong"[..]), "加入方应收到回程打洞报文");
+}

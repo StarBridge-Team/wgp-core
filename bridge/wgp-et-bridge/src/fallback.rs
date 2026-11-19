@@ -294,7 +294,7 @@ pub struct FallbackBridge {
 }
 
 impl FallbackBridge {
-    /// 建桥：先在 `bind_ip` 上绑好固定端口，再连 relay。
+    /// 建桥：先连 relay（拿到自己的 ET 节点号），再在 `bind_ip` 上绑好固定端口。
     /// 返回桥本身与事件接收端（命令行用来打日志）。
     pub async fn start(
         config: ProxyConfig,
@@ -302,7 +302,9 @@ impl FallbackBridge {
         secret: String,
         relay: SocketAddr,
     ) -> anyhow::Result<(Self, tokio_mpsc::UnboundedReceiver<BridgeEvent>)> {
+        let link = EtLink::connect(network, secret, relay)?;
         let mut sockets = HashMap::new();
+        // 服务端口（DHT / 观察者）
         for port in &config.service_ports {
             let addr = SocketAddr::new(IpAddr::V4(config.bind_ip), *port);
             let sock = TokioUdp::bind(addr)
@@ -310,7 +312,16 @@ impl FallbackBridge {
                 .map_err(|e| anyhow!("绑定 {addr} 失败（{e}）"))?;
             sockets.insert(*port, Arc::new(sock));
         }
-        let link = EtLink::connect(network, secret, relay)?;
+        // 自己的打洞端口：对端会按「我的节点号」算出这个端口并把打洞报文发到这里，
+        // 所以本侧必须真的有一个 socket 在听（否则对端写回来的包没人收）。
+        let my_punch = punch_port(link.peer_id);
+        if !sockets.contains_key(&my_punch) {
+            let addr = SocketAddr::new(IpAddr::V4(config.bind_ip), my_punch);
+            let sock = TokioUdp::bind(addr)
+                .await
+                .map_err(|e| anyhow!("绑定打洞端口 {addr} 失败（{e}）"))?;
+            sockets.insert(my_punch, Arc::new(sock));
+        }
         let (event_tx, events) = tokio_mpsc::unbounded_channel();
         Ok((
             Self {

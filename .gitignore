@@ -22,6 +22,9 @@ wgp-client.key
 /bridge/wgp-et-bridge/target/
 /bridge/wgp-et-bridge/.tools/
 
+# 受限沙箱/CI 里的临时目录（PROTOC&TEMP 指到仓库内时用；et-bridge README 有说明）
+/.tmp/
+
 # 本机工具产物（沙箱 ACL 诊断报告、编辑器规则），与代码无关
 /.acl-report/
 /.cursor/
