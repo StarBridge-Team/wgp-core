@@ -545,6 +545,14 @@ async fn async_move(
         if !opts.allow_legacy_identity {
             eprintln!("[hint] 若确认种子在线且是旧版本，加 --allow-legacy-identity 显式兼容旧协议");
         }
+        // 最常见的一种「填错了」：把 EasyTier 公共节点当成 wgp 种子。
+        // 两者都是 host:port，但协议完全不同（ET 节点不会应答 wgp 的 DHT）。
+        if et_peers.is_empty() {
+            eprintln!(
+                "[hint] 如果这是 EasyTier 公共节点（如 us01.*），它不是 wgp 种子、不会应答 DHT：\
+                 请写成 -p et://<主机>:<端口>（需要同目录的 wgp-et-fallback）"
+            );
+        }
     }
 
     // ②c ET 回退（S3）：一个真种子都测不通、但用户给了 `et://` 入口 → 借公共 ET 中继组临时网络。
