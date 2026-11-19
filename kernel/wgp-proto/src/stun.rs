@@ -63,6 +63,15 @@ impl StunHeader {
     pub fn is_binding_request(&self) -> bool {
         self.msg_type == BINDING_REQUEST
     }
+
+    /// 是否是 Binding Success Response。
+    ///
+    /// 客户端必须显式判定这一点：STUN 头部只有 cookie 校验（`decode`），攻击者可以把我们
+    /// 发出的 Binding Request 原样反射回来——它带的是同一个 txid、同一个 cookie，只有类型
+    /// 不同。只校验 txid 的实现会把反射包当成「我的公网端点」。
+    pub fn is_binding_response(&self) -> bool {
+        self.msg_type == BINDING_RESPONSE
+    }
 }
 
 /// 一次"绑定探测"的抽象——步长学习（3 连测）、NAT 判定（双异 IP）、

@@ -530,8 +530,8 @@ impl SessionOrchestrator {
         let mut model: Option<PortStepModel> = None;
         let mut first_ok: Option<SocketAddr> = None;
         for &obs in self.observers.iter() {
-            let mut txid = [0u8; 12];
-            txid[..4].copy_from_slice(&my_peer_id[..4]);
+            // 每次探测用独立随机 txid（审计 M1）：可预测的 txid 让攻击者能提前拼出应答
+            let (txid, _nonce) = crate::engine::nat_probe::fresh_probe_ids();
             if let Some(r) = probe.probe_observer(obs, txid, None).await {
                 my_mapped = Some((r.ipv4, r.port));
                 first_ok = Some(obs);
