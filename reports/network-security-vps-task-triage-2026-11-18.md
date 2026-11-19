@@ -101,14 +101,26 @@
 ### 部署形态（新增能力）
 
 - 内核 `AdvertiseTarget`：对外地址与三个外部端口分开，端口 0 = 沿用本机。
-- `wgp-node`：`--advertise <ipv4|域名|none>`、`--advertise-{dht,stun,tcp}-port`、`--ddns-refresh`、`--allow-local-endpoints`。
-- 资产：`server/deploy/frp/{frps,frpc}.toml.example`、`server/deploy/install-seed-frp.sh`。
-- 文档：`server/deploy/DEPLOY.md` §10（四种拓扑、FRP 限制、验证清单）、`项目完整文档/17-部署与运维.md` §7。
+- `wgp-node`：`--advertise <ipv4|域名|none>`、`--advertise-{dht,stun,tcp}-port`、`--ddns-refresh`、`--allow-local-endpoints`、`--proxy-protocol <off|v2>`。
+- **不替用户装 frpc**：第三方 FRP 服务的客户端由服务商决定。仓库只保留 `server/deploy/frp/*.toml.example`
+  （自建参考）与节点侧参数说明；原 `install-seed-frp.sh` 已删除。
+- **PROXY protocol v2**：`wgp_dht::proxy_protocol` 解析（IPv4/IPv6、TCP/UDP、LOCAL、截断/伪造拒绝）；
+  观察者用头里的真实客户端地址出映射报告与限速，应答仍回给代理；TCP 信令先 peek 再消费头。
+  默认关闭（打开等于让对端自称来源，只能在「仅可信代理可访问」时用）。
+- 文档：`server/deploy/DEPLOY.md` §10（五种方式 + DDNS 手册 + PROXY v2）、`项目完整文档/17-部署与运维.md` §7/§8。
 - **未验证**：真实 FRP 中继 + 真实 NAT + 真实 DDNS 都没有跑过（没有中继机/域名/第二台客户端）。
 
 回环端到端（真实二进制、Windows）单种子与 `-Discovery` 两种模式本轮均 **PASS**；
-`cargo test --workspace` 22 个目标 0 failed；`cargo check --workspace --all-targets` 0 warning。
+`cargo test --workspace` 全绿（含 `wgp-dht` 118、`wgp-core` 56、`wgp-node` 24）；
+`cargo check --workspace --all-targets` 0 warning。
 （沙箱内跑端到端要把 `TEMP`/`TMP` 指到仓库 `target\` 目录：受限沙箱不允许写系统临时目录。）
+
+### ET 回退（S1-S4）
+
+见 [`20-变更追补-2026-11.md`](../项目完整文档/20-变更追补-2026-11.md) §26。要点：不用 ET 的 Port Forward
+（库里是占位实现），改成「固定端口 UDP ⇄ ET 自定义帧」的桥；房主在临时网络里起进程内本地种子。
+S1/S2 有回环验收，S3 有客户端 9 个单测，**S4 的真数据面需要两台机器 + 真 relay，未跑**；
+一条桥只支持一个对端、同机不能跑两个回退客户端、不碰 TUN。
 
 ### ET（TUN 之外）
 
