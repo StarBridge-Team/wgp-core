@@ -158,12 +158,15 @@ sudo bash server/deploy/install-hobby.sh # 创建用户+装二进制+装单元+e
 | 环境文件 | `/etc/wgp-node/env` | 安装脚本首装从 `wgp-node.env.example` 模板创建（全注释=全默认）；**已存在则绝不覆盖**。改键后 `systemctl restart wgp-node-hobby` |
 | `wgp-node.conf` | 工作目录 | 二进制自动加载；键同 env（去 `WGP_` 前缀） |
 
-键名与 `server.rs::collect_env()` 一一对应：`WGP_BIND` / `WGP_STUN` / `WGP_TCP` / `WGP_HOBBY`（贡献版恒 true 无需设） / `WGP_OBSERVER_RATE_LIMIT` / `WGP_OBSERVER_RATE_WINDOW` / `WGP_IDENTITY` / `WGP_LOG_LEVEL` / `WGP_CONFIG` / `WGP_ADVERTISE` / `WGP_PEERS`。
+键名与 `server.rs::collect_env()` 一一对应：`WGP_BIND` / `WGP_STUN` / `WGP_TCP` / `WGP_HOBBY`（贡献版恒 true 无需设） / `WGP_OBSERVER_RATE_LIMIT` / `WGP_OBSERVER_RATE_WINDOW` / `WGP_IDENTITY` / `WGP_LOG_LEVEL` / `WGP_CONFIG` / `WGP_ADVERTISE` / `WGP_ADVERTISE_DHT_PORT` / `WGP_ADVERTISE_STUN_PORT` / `WGP_ADVERTISE_TCP_PORT` / `WGP_DDNS_REFRESH` / `WGP_ALLOW_LOCAL_ENDPOINTS` / `WGP_PEERS`。
 
-`WGP_ADVERTISE=<本机公网IPv4>`（或 `--advertise`）让节点对外宣告自己：其他节点与客户端可以自动发现它，客户端也不必再手填观察者。
-只接受 IPv4 地址，且假定外部端口与本机端口一致（端口映射请按原号映射）；家宽换了公网 IP 要改配置并重启。宣告后身份文件旁会多一个
-`node_identity.epoch`（启动计数，请和身份文件一起保留）。`WGP_PEERS=udp://另一个种子:11010,...`（或 `--peers`）指定入网引导的其他种子。
-两者都不设时节点不参与发现，行为与以前一致。
+`WGP_ADVERTISE=<地址>`（或 `--advertise`）让节点对外宣告自己：其他节点与客户端可以自动发现它，客户端也不必再手填观察者。地址可以是：
+
+- **固定公网 IPv4**（`203.0.113.7`）：VPS / 固定 IP 机器，外部端口与本机一致时无需其他参数；
+- **域名**（`seed.example.com`，DDNS）：启动时解析，之后每 `WGP_DDNS_REFRESH` 秒（默认 300）重解析；**解析结果变了会自动换纪元重新宣告**，不再需要「改配置 + 重启」；
+- **`none`**：不宣告（NAT 后面的 hobby 节点、只做客户端的节点）。
+
+外部端口与本机不同（FRP / 端口映射）时，必须显式给出 `WGP_ADVERTISE_DHT_PORT` / `WGP_ADVERTISE_STUN_PORT` / `WGP_ADVERTISE_TCP_PORT`，否则别人连的是错的端口。宣告后身份文件旁会多一个 `node_identity.epoch`（启动计数，请和身份文件一起保留）。`WGP_PEERS=udp://另一个种子:11010,...`（或 `--peers`）指定入网引导的其他种子。两者都不设时节点不参与发现，行为与以前一致。
 
 脚本可调安装位置（均有默认，不需要就不设）：`WGP_INSTALL_DIR` / `WGP_RUN_USER` / `WGP_ENV_FILE` / `WGP_BIN`。防火墙仍按 §2 手工执行 `wgp-node.nft`（该文件首行 `flush ruleset` 会清空宿主机全部规则，故脚本不代劳）。
 
@@ -232,9 +235,19 @@ ss -lunpt | grep -E ':(11010|3478|3481)\\b'
 - **CGNAT / 无公网 IPv4**：端口映射无效，`--advertise` 不能填写私网或 CGNAT 地址并期待公网入站；不要做 UPnP/DMZ 暴露。节点可以作为出站客户端连 VPS seed，但目前不是可被其他节点直连的公共 seed。若运营商提供公网 IPv6，可在另行实现并验证 IPv6 广告前作为实验性目标，不要宣称当前 IPv4 DHT 路径已支持 IPv6。
 - **纯 Windows 家庭电脑**：运行 `server/deploy/hobby-windows/` 包，防火墙脚本需管理员运行；用任务计划程序创建“登录时启动”任务，程序指向 `wgp-node-hobby.exe`，起始目录设为包目录以固定身份文件位置。关机启动且无人登录的服务场景优先使用 Linux/systemd 或受控 Windows Service 包装器，不要依赖用户 Startup 文件夹。
 
-### 动态 IPv4 更新（systemd timer）
+### 动态 IPv4 更新（DDNS 内置 / 外部 timer）
 
-程序只接受字面 IPv4，不能把 DDNS 域名直接写进 `WGP_ADVERTISE`。有公网地址的家宽可使用下面脚本定时查公网地址；地址变化时仅替换已存在的 `WGP_ADVERTISE` 行并重启节点。先确认公网 IP 查询服务可信且允许自动请求，再安装：
+**首选：让节点自己盯着 DDNS。** `WGP_ADVERTISE` 直接写域名，节点按 `WGP_DDNS_REFRESH`（默认 300 秒）重解析，地址一变就换纪元重新宣告——不需要重启，也不需要外部脚本：
+
+```bash
+# /etc/wgp-node/env
+WGP_ADVERTISE=seed.example.com
+WGP_DDNS_REFRESH=300
+```
+
+前提是这台机器的公网地址确实被那个域名跟踪（DDNS 客户端或路由器自带的 DDNS 功能负责更新 A 记录）。节点侧的日志会打印每次解析结果与重宣告。
+
+**备选：没有域名、只有「查公网 IP」的条件。** 仓库仍保留外部刷新脚本：它定时查公网地址，只在变化时替换 `WGP_ADVERTISE` 行并重启节点（先确认公网 IP 查询服务可信且允许自动请求）：
 
 仓库提供脚本与 systemd 单元模板；脚本会校验全球可路由 IPv4、使用文件锁防并发、仅地址变化时重启，并在重启失败时回滚环境文件。安装步骤：
 
@@ -250,7 +263,7 @@ sudo journalctl -u wgp-refresh-advertise.service -n 30 --no-pager
 ```
 
 service 默认维护 `/etc/wgp-node/env` 并重启 `wgp-node-hobby`；完整版 VPS 不需要动态刷新。脚本依赖 `curl`、`python3`、`flock`。可在 service drop-in 覆盖 `WGP_IP_CHECK_URL` 使用自有可信地址回显服务。
-脚本不负责 DDNS 提供商 API、路由器端口映射、CGNAT 穿透或端口变化。端口外映射与本机端口必须一致；若更新配置失败，先恢复 `/etc/wgp-node/env` 备份并重启服务。不要把 seed 私钥复制给更新任务。
+该脚本不负责 DDNS 提供商 API、路由器端口映射或 CGNAT 穿透。端口外部映射与本机不一致时，用 `WGP_ADVERTISE_DHT_PORT` 等三个键显式给出外部端口（见 §10）。若更新配置失败，先恢复 `/etc/wgp-node/env` 备份并重启服务。不要把 seed 私钥复制给更新任务。
 
 ### 客户端开机运行
 
@@ -288,3 +301,99 @@ loginctl enable-linger "$USER"  # 仅需在无交互登录也要运行时开启
 - 身份文件即服务器全部状态：备份 `node_identity.key`，丢失 = 节点身份重生成（被已入网路由表视为新节点，无害但不优雅）
 - 被打（DDoS）预案：架构级冗余兜底（社区种子顶替/公共 STUN 顶替观察者）；
   P2P mesh 已建立的业务流零影响——不需要为此买高防
+
+## 10. 四种部署拓扑（VPS / FRP 穿透 / NAPT 端口映射 / DDNS）
+
+按「这台机器有没有可直接入站的公网 IPv4」选形态。四种形态跑的是同一个二进制，差别只在
+`--advertise` 怎么写、端口怎么来。
+
+| 拓扑 | 入站路径 | 关键参数 | 适用 |
+|---|---|---|---|
+| **A. 公网 VPS** | 直连本机公网 IPv4 | `--advertise <公网IPv4>`（端口与本机一致，无需其他参数） | 有固定公网 IP 的云主机（首选） |
+| **B. FRP 穿透** | 公网中继机 `frps` → `frpc` → 本机 | `--advertise <frps 公网地址> --advertise-dht-port … --advertise-stun-port … --advertise-tcp-port …` | 家宽 / 公司网 / 只有内网地址的机器 |
+| **C. NAPT 端口映射** | 路由器/光猫把外部端口映射到本机 | `--advertise <公网IPv4 或 DDNS 域名>`；外部端口与本机不同时再加三个 `--advertise-*-port` | 有公网 IP 的家宽（光猫桥接或 DMZ） |
+| **D. 局域网 / 本机联调** | 同一网段内直连 | `--allow-local-endpoints`（宣告 127.0.0.1 / 10.x / 192.168.x） | 开发、单机多进程、内网小规模试用 |
+
+> **不支持的形态**：CGNAT（`100.64.0.0/10`）后面既没有公网 IPv4 也没有中继机时，`--advertise`
+> 写什么都不会让外部节点连进来；DHCPv6/IPv6 广告未实现（协议面 v1 只有 IPv4）。这两种情况
+> 要么走 B（FRP），要么只作为出站客户端连别人的种子。
+
+### 10.1 FRP 穿透（拓扑 B，NAT 后的种子）
+
+一台机器（`frps`）有公网 IPv4，另一台（`frpc` + `wgp-node`）在 NAT 后面。仓库给了三份东西：
+
+- `server/deploy/frp/frps.toml.example`：中继端配置（含 `allowPorts` 白名单与 token 鉴权）
+- `server/deploy/frp/frpc.toml.example`：NAT 端配置（三个 proxy：DHT UDP / STUN UDP / TCP 信令）
+- `server/deploy/install-seed-frp.sh`：NAT 端一键安装（装 frpc + wgp-node、写单元、起服务、自检）
+
+中继端手工三步：
+
+```bash
+sudo install -d /etc/frp
+sudo cp server/deploy/frp/frps.toml.example /etc/frp/frps.toml   # 改 auth.token
+sudo systemctl enable --now frps                                 # 或用 frps -c /etc/frp/frps.toml
+# 放行 TCP 7000（frps 控制口）与 allowPorts 里的三个端口（云安全组 + 主机防火墙都要）
+```
+
+NAT 端一条命令：
+
+```bash
+FRPS_ADDR=relay.example.com FRP_TOKEN='<与 frps 一致的长随机串>' \
+  sudo -E bash server/deploy/install-seed-frp.sh
+```
+
+脚本最终会写出这样的启动参数（外部端口 ≠ 本机端口，这是本拓扑的关键）：
+
+```ini
+ExecStart=/opt/wgp-node/wgp-node --bind 0.0.0.0:11010 --stun 3478 --tcp 3481 \
+  --advertise relay.example.com \
+  --advertise-dht-port 21010 --advertise-stun-port 23478 --advertise-tcp-port 23481
+```
+
+客户端侧只需 `-p udp://relay.example.com:21010`（TCP 兜底 `tcp://relay.example.com:23481`）。
+
+**限制（必须知道）**：FRP 的 UDP 代理按「访客」跟踪。种子主动推给别人的广告，在还没有任何
+访客之前会被丢弃；一旦有节点来 PING / FIND_SEEDS / FIND_VALUE，双向就通了。所以 FRP 形态的
+种子**更适合被查询，不适合做主动推送源**——它的价值（发现、观察者、房间 KV）不受影响，
+但它自己不擅长「先去告诉别人我在这儿」。需要主动推送时，配置 `WGP_PEERS` 指向至少一个
+能主动连到的种子（例如一台公网 VPS），由对方向它索取。
+
+### 10.2 NAPT 端口映射（拓扑 C，有公网 IP 的家宽）
+
+路由器/光猫把外部端口映射到本机。两种情况：
+
+1. **外部端口 = 本机端口**（最常见）：只写 `--advertise <公网IPv4>`，其余默认；
+2. **外部端口 ≠ 本机端口**（映射表里换了号）：三个 `--advertise-*-port` 显式写出外部端口。
+   注意 `--stun none` / `--tcp none` 时对应的 `--advertise-*-port` 会被拒绝（广告里不能指向空端口）。
+
+公网地址会变时，把 `--advertise` 写成 DDNS 域名（见 §7.2），无需重启。
+
+### 10.3 局域网 / 本机联调（拓扑 D）
+
+端点准入默认**只收公网地址**（审计 M2：挡住「把 127.0.0.1 / 10.x / CGNAT 地址写进公共目录，
+让所有人去探一个注定连不上的地址」）。本机多进程或同一交换机上的部署要显式放宽：
+
+```bash
+wgp-node --bind 0.0.0.0:11010 --advertise 192.168.1.10 --allow-local-endpoints
+wgp-client join U/XXXX-XXXX-XXXX-XXXX -p udp://192.168.1.10:11010 --allow-local-endpoints
+```
+
+`wgp-node` / `wgp-client` 也会按**你自己配置的地址**自动判断：入口里出现回环/私网地址时自动
+放宽（本机联调、`scripts/e2e-local.*` 都属于这种）；公共部署仍然严格。别人的广告地址再特殊
+也改变不了本端的准入规则。
+
+### 10.4 验证清单（针对拓扑 B/C）
+
+| 检查 | 命令 | 期望 |
+|---|---|---|
+| 本机端口在听 | `ss -lunpt \| grep -E ':(11010\|3478\|3481)\b'` | 三个都在 |
+| 中继隧道已建立（B） | `journalctl -u frpc -n 30 \| grep -i 'login to server success'` | 有 |
+| 广告内容正确 | `journalctl -u wgp-node -n 30 \| grep '对外宣告'` | 地址是**中继/公网地址**，端口是**外部端口** |
+| DDNS 生效 | `journalctl -u wgp-node \| grep DDNS` | 有解析结果；地址变化时有「已用纪元 … 重新宣告」 |
+| 外部可达 | 另找一台不同网络的机器跑 `wgp-client join … -p udp://<地址>:<外部DHT端口>` | 1.5 秒内出现 `[种子] … 往返` |
+| 观察者可用 | 客户端启动后看 NAT 探测输出 | 有公网端点（不是 `0.0.0.0:0`） |
+
+> 诚实声明：本仓库此前的验证全部在回环与单机多进程上；拓扑 B（FRP）的配置、脚本与节点参数
+> 已按上述语义实现并有单元测试覆盖参数解析，但**没有在真实 FRP 中继 + 真实 NAT 上跑过**。
+> 第一次上线请按上表逐项确认，并把结果填进 `项目完整文档/18-NAT实测数据.md` §7。
+

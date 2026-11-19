@@ -17,8 +17,8 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
-use wgp_core::{Engine, NodeConfig, NodeRole};
-use wgp_dht::{NodeIdentity, ObserverPolicy};
+use wgp_core::{AdvertisePorts, AdvertiseTarget, Engine, NodeConfig, NodeRole};
+use wgp_dht::{EndpointScope, NodeIdentity, ObserverPolicy};
 use wgp_proto::{SeedEndpoint, SeedScheme};
 
 /// Tokio worker cap for mostly-I/O node runtimes. Set WGP_RUNTIME_WORKERS to override.
@@ -122,6 +122,38 @@ pub fn log_debug(msg: impl AsRef<str>) {
 // 配置
 // ————————————————————————————————————————————————————————————
 
+/// 对外宣告的来源。
+///
+/// 三种部署形态各有各的写法（见 `项目完整文档/21-种子节点部署（VPS-FRP-NAT-DDNS）.md`）：
+/// - [`AdvertiseSource::Fixed`]：VPS / 有固定公网 IPv4 的机器，直接写字面地址；
+/// - [`AdvertiseSource::Dns`]：DDNS（家宽动态 IP、云主机弹性 IP）。启动时解析，之后按
+///   `--ddns-refresh` 周期重解析，**解析结果变了就换纪元重新宣告**——否则已经认识本节点的
+///   人会在老地址上探活到失败为止；
+/// - [`AdvertiseSource::Off`]：不宣告（NAT 后面的 hobby 节点、只做客户端的节点）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdvertiseSource {
+    Off,
+    /// 固定 IPv4
+    Fixed(Ipv4Addr),
+    /// 域名（DDNS）：内核不解析域名，解析在本层完成
+    Dns(String),
+}
+
+impl AdvertiseSource {
+    pub fn is_off(&self) -> bool {
+        matches!(self, Self::Off)
+    }
+
+    /// 运维展示用
+    pub fn display(&self) -> String {
+        match self {
+            Self::Off => "off".to_string(),
+            Self::Fixed(ip) => ip.to_string(),
+            Self::Dns(host) => format!("{host}（DDNS）"),
+        }
+    }
+}
+
 /// 解析后的启动配置
 #[derive(Debug, Clone)]
 pub struct ServerOpts {
@@ -144,8 +176,14 @@ pub struct ServerOpts {
     pub identity_file: PathBuf,
     /// 日志级别
     pub log_level: LogLevel,
-    /// 对外宣告的公网 IPv4（None = 不宣告）
-    pub advertise: Option<Ipv4Addr>,
+    /// 对外宣告来源（Off / 固定 IPv4 / DDNS 域名）
+    pub advertise: AdvertiseSource,
+    /// 对外端口（0 = 沿用本机实际绑定端口）；FRP / 端口映射部署用
+    pub advertise_ports: AdvertisePorts,
+    /// DDNS 域名的重解析周期（秒；0 = 只在启动时解析一次）
+    pub ddns_refresh_secs: u64,
+    /// 是否接受回环/私网端点（本机与局域网联调、FRP 落在内网）
+    pub allow_local_endpoints: bool,
     /// 入网引导端点（其他种子的 UDP 信令地址；域名在启动时解析）
     pub peers: Vec<SeedEndpoint>,
 }
@@ -224,10 +262,11 @@ fn parse_u64(key: &str, v: &str) -> Result<u64, String> {
         .map_err(|_| format!("{key} 需要无符号整数，得到：{v}"))
 }
 
-const BOOL_FLAGS: [&str; 5] = [
+const BOOL_FLAGS: [&str; 6] = [
     "hobby",
     "no_hobby",
     "allow_legacy_identity",
+    "allow_local_endpoints",
     "help",
     "version",
 ];
@@ -356,19 +395,67 @@ pub fn resolve_opts(force_hobby: bool, input: &RawInput) -> Result<ServerOpts, S
     };
 
     let advertise = match m.get("advertise").map(|v| v.trim()) {
-        None | Some("") => None,
-        Some(v) if matches!(v.to_ascii_lowercase().as_str(), "none" | "off") => None,
-        Some(v) => {
-            let ip = v.parse::<Ipv4Addr>().map_err(|_| {
-                format!(
-                    "advertise 非法（应为本节点的公网 IPv4 地址，如 203.0.113.7；不支持域名）：{v}"
-                )
-            })?;
-            if ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() {
-                return Err(format!("advertise 不能是 {ip}：别的节点无法用它连到本节点"));
+        None | Some("") => AdvertiseSource::Off,
+        Some(v) if matches!(v.to_ascii_lowercase().as_str(), "none" | "off") => AdvertiseSource::Off,
+        Some(v) => match v.parse::<Ipv4Addr>() {
+            Ok(ip) => {
+                if ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() {
+                    return Err(format!("advertise 不能是 {ip}：别的节点无法用它连到本节点"));
+                }
+                AdvertiseSource::Fixed(ip)
             }
-            Some(ip)
+            Err(_) => {
+                // 域名（DDNS）：只做格式校验，解析在启动时进行（此刻可能还没解析出来）
+                if !is_plausible_hostname(v) {
+                    return Err(format!(
+                        "advertise 非法：既不是 IPv4 地址也不是合法域名（如 203.0.113.7 / seed.example.com）：{v}"
+                    ));
+                }
+                AdvertiseSource::Dns(v.to_ascii_lowercase())
+            }
+        },
+    };
+
+    // 对外端口（FRP / 端口映射）：0 = 沿用本机实际端口
+    let ext_port = |key: &str| -> Result<u16, String> {
+        match m.get(key) {
+            Some(v) => v
+                .trim()
+                .parse::<u16>()
+                .map_err(|_| format!("{key} 端口非法（应为 0-65535，0 = 沿用本机端口）：{v}")),
+            None => Ok(0),
         }
+    };
+    let advertise_ports = AdvertisePorts {
+        dht: ext_port("advertise_dht_port")?,
+        stun: ext_port("advertise_stun_port")?,
+        tcp: ext_port("advertise_tcp_port")?,
+    };
+    if advertise.is_off()
+        && (advertise_ports.dht != 0 || advertise_ports.stun != 0 || advertise_ports.tcp != 0)
+    {
+        return Err(
+            "配置了对外端口（advertise_*_port）但没有 --advertise：这些端口不会写进任何广告"
+                .to_string(),
+        );
+    }
+    // 本机没开的能力，对外端口写了也没意义——直接拒绝，避免广告里出现「指向空端口」的端点
+    if advertise_ports.stun != 0 && stun.is_none() {
+        return Err("advertise_stun_port 已配置但本机 --stun 已关闭".to_string());
+    }
+    if advertise_ports.tcp != 0 && tcp.is_none() {
+        return Err("advertise_tcp_port 已配置但本机 --tcp 已关闭".to_string());
+    }
+
+    let ddns_refresh_secs = match m.get("ddns_refresh") {
+        Some(v) => parse_u64("ddns_refresh", v)?,
+        // 默认 5 分钟：家宽 IP 变动通常以小时计，5 分钟足够快，也远低于 DDNS 服务商限频
+        None => 300,
+    };
+
+    let allow_local_endpoints = match m.get("allow_local_endpoints") {
+        Some(v) => parse_bool("allow_local_endpoints", v)?,
+        None => false,
     };
 
     let peers = match m.get("peers") {
@@ -405,8 +492,40 @@ pub fn resolve_opts(force_hobby: bool, input: &RawInput) -> Result<ServerOpts, S
         identity_file,
         log_level,
         advertise,
+        advertise_ports,
+        ddns_refresh_secs,
+        allow_local_endpoints,
         peers,
     })
+}
+
+/// 域名的**格式**校验（不做解析）：标签 1-63 字符、字母数字与连字符、首尾不为连字符，
+/// 至少两段且顶级域至少两个字母。IDN 由调用方先转 punycode（本层只管 ASCII）。
+fn is_plausible_hostname(host: &str) -> bool {
+    const MAX_HOST: usize = 253;
+    if host.is_empty() || host.len() > MAX_HOST {
+        return false;
+    }
+    let labels: Vec<&str> = host.split('.').collect();
+    if labels.len() < 2 {
+        return false;
+    }
+    for label in &labels {
+        if label.is_empty() || label.len() > 63 {
+            return false;
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return false;
+        }
+        if !label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return false;
+        }
+    }
+    let tld = labels.last().unwrap();
+    tld.len() >= 2 && tld.bytes().all(|b| b.is_ascii_alphabetic())
 }
 
 /// 从命令行/环境变量定位配置文件路径（不加载）
@@ -429,7 +548,7 @@ fn find_config_path(argv: &[String]) -> Option<PathBuf> {
 }
 
 fn collect_env() -> Vec<(String, String)> {
-    const KEYS: [&str; 12] = [
+    const KEYS: [&str; 17] = [
         "BIND",
         "STUN",
         "TCP",
@@ -441,6 +560,11 @@ fn collect_env() -> Vec<(String, String)> {
         "LOG_LEVEL",
         "CONFIG",
         "ADVERTISE",
+        "ADVERTISE_DHT_PORT",
+        "ADVERTISE_STUN_PORT",
+        "ADVERTISE_TCP_PORT",
+        "DDNS_REFRESH",
+        "ALLOW_LOCAL_ENDPOINTS",
         "PEERS",
     ];
     KEYS.iter()
@@ -490,10 +614,21 @@ pub fn usage(profile: &str) -> String {
   --bind <addr>                      DHT UDP 绑定地址（默认 {DEFAULT_BIND}）\n\
   --stun <port|none>                 观察者/STUN 端口（默认 {DEFAULT_STUN_PORT}；none 关闭）\n\
   --tcp <port|none>                  TCP 信令兜底端口（默认 {DEFAULT_TCP_PORT}；none 关闭）\n\
+                                     ◦ 注意：TCP 只承载 bootstrap / 选点 / 房间 KV 等信令阶段，\n\
+                                       不保证 Forward 与业务隧道在 UDP 完全被封时可达\n\
   --hobby / --no-hobby               贡献模式：拒绝 Forward 中转（PCDN 防护）\n\
   --allow-legacy-identity            兼容旧节点：身份证明失败时回退到旧 PING/PONG 学习\n\
                                      （默认关闭；严格模式只把旧协议用于存活诊断）\n\
-  --advertise <ipv4|none>            对外宣告的公网 IPv4（默认不宣告）：宣告后其他节点与客户端可自动发现本节点\n\
+  --advertise <ipv4|域名|none>       对外宣告的地址（默认不宣告）。可以是固定公网 IPv4，\n\
+                                     也可以是 DDNS 域名（启动时解析、周期重解析，变了就换纪元重宣告）\n\
+  --advertise-dht-port <port>        对外 DHT UDP 端口（0 = 沿用本机，默认 0）\n\
+  --advertise-stun-port <port>       对外 STUN 端口（0 = 沿用本机，默认 0）\n\
+  --advertise-tcp-port <port>        对外 TCP 信令端口（0 = 沿用本机，默认 0）\n\
+                                     ◦ 上面三个用于 FRP / 端口映射：外部端口与本机端口不同时\n\
+                                       必须显式给出，否则别人连的是错的端口\n\
+  --ddns-refresh <secs>              DDNS 域名重解析周期（默认 300；0 = 只在启动时解析一次）\n\
+  --allow-local-endpoints            接受回环/私网端点（本机多进程联调、局域网或 FRP 内网部署；\n\
+                                     默认只收公网地址）\n\
   --peers <list>                     入网引导：其他种子的 udp://主机:端口，逗号分隔，可重复给出\n\
   --observer-rate-limit <n>          观察者每 IP 每窗口响应上限（默认 {limit}）\n\
   --observer-rate-window <secs>      观察者限频窗口秒数（默认 {window}）\n\
@@ -506,7 +641,9 @@ pub fn usage(profile: &str) -> String {
           WGP_ALLOW_LEGACY_IDENTITY /\n\
           WGP_OBSERVER_RATE_LIMIT / WGP_OBSERVER_RATE_WINDOW /\n\
           WGP_IDENTITY / WGP_LOG_LEVEL / WGP_CONFIG /\n\
-          WGP_ADVERTISE / WGP_PEERS\n\
+          WGP_ADVERTISE / WGP_ADVERTISE_DHT_PORT / WGP_ADVERTISE_STUN_PORT /\n\
+          WGP_ADVERTISE_TCP_PORT / WGP_DDNS_REFRESH / WGP_ALLOW_LOCAL_ENDPOINTS /\n\
+          WGP_PEERS\n\
 优先级：命令行 > 环境变量 > 配置文件 > 默认值",
         limit = wgp_dht::OBSERVER_RATE_LIMIT,
         window = wgp_dht::OBSERVER_RATE_WINDOW.as_secs(),
@@ -617,6 +754,19 @@ async fn resolve_peer(ep: &SeedEndpoint) -> Option<SocketAddr> {
     addrs.find(|a| a.is_ipv4())
 }
 
+/// 把一个域名解析成 IPv4（DDNS 用；本协议面只支持 IPv4）。
+///
+/// 端口传 1 只是 `lookup_host` 的接口要求：这里只关心地址，不看端口。
+async fn resolve_ipv4(host: &str) -> Option<Ipv4Addr> {
+    let addrs = tokio::net::lookup_host((host, 1)).await.ok()?;
+    addrs
+        .filter_map(|a| match a.ip() {
+            std::net::IpAddr::V4(v4) => Some(v4),
+            std::net::IpAddr::V6(_) => None,
+        })
+        .next()
+}
+
 // ————————————————————————————————————————————————————————————
 // 运行
 // ————————————————————————————————————————————————————————————
@@ -711,15 +861,50 @@ pub async fn run(profile: &str, force_hobby: bool) {
             None => log_warn(format!("引导端点 {} 无法解析，已跳过", ep.display())),
         }
     }
-    let advertise_epoch = match opts.advertise {
-        Some(_) => {
-            let (epoch, warning) = next_advertise_epoch(&epoch_file_for(&opts.identity_file));
-            if let Some(w) = warning {
-                log_warn(w);
+    // 对外宣告：固定 IPv4 直接可用；DDNS 域名要在这里解析出 IPv4（内核不解析域名）。
+    // 解析不出来不阻止启动——DDNS 记录可能刚好在更新，后台会继续重试。
+    let advertise_ip: Option<Ipv4Addr> = match &opts.advertise {
+        AdvertiseSource::Off => None,
+        AdvertiseSource::Fixed(ip) => Some(*ip),
+        AdvertiseSource::Dns(host) => match resolve_ipv4(host).await {
+            Some(ip) => {
+                log_info(format!("DDNS：{host} → {ip}"));
+                Some(ip)
             }
-            epoch
+            None => {
+                log_warn(format!(
+                    "DDNS：{} 暂时解析不出 IPv4，先以「不宣告」启动；后台每 {} 秒重试",
+                    host,
+                    opts.ddns_refresh_secs.max(30)
+                ));
+                None
+            }
+        },
+    };
+    // 纪元：高 32 位 = 启动计数（落盘、跨重启单调），低 32 位 = 本进程内的广告修订号
+    // （DDNS 解析结果变化时 +1）。接收端只采纳更大的纪元，所以修订号必须随每次重宣告递增。
+    let advertise_epoch_base = if opts.advertise.is_off() {
+        0
+    } else {
+        let (epoch, warning) = next_advertise_epoch(&epoch_file_for(&opts.identity_file));
+        if let Some(w) = warning {
+            log_warn(w);
         }
-        None => 0,
+        epoch
+    };
+
+    // 端点准入策略（审计 M2）：显式放宽，或按「配置里出现的地址」自动判断本机/局域网形态
+    let endpoint_scope = if opts.allow_local_endpoints {
+        EndpointScope::LocalNetwork
+    } else {
+        let mut scope_addrs: Vec<SocketAddr> = peers.clone();
+        if let Ok(bind) = opts.bind.parse::<SocketAddr>() {
+            scope_addrs.push(bind);
+        }
+        if let Some(ip) = advertise_ip {
+            scope_addrs.push(SocketAddr::from((ip, 1)));
+        }
+        wgp_dht::scope_for_endpoints(scope_addrs)
     };
 
     let (engine, _events) = Engine::new();
@@ -730,8 +915,12 @@ pub async fn run(profile: &str, force_hobby: bool) {
         tcp_signal: opts.tcp,
         hobby: opts.hobby,
         observer_policy: opts.observer_policy(),
-        advertise: opts.advertise,
-        advertise_epoch,
+        advertise: advertise_ip.map(|ip| AdvertiseTarget {
+            addr_v4: ip.octets(),
+            ports: opts.advertise_ports,
+        }),
+        advertise_epoch: advertise_epoch_base,
+        endpoint_scope,
         peers: peers.clone(),
         allow_legacy_identity: opts.allow_legacy_identity,
     };
@@ -780,28 +969,100 @@ pub async fn run(profile: &str, force_hobby: bool) {
         "{profile} 已就绪（种子+观察者+承诺兜底）| node_id={:02x?} | {dht_text} | {stun_text} | {tcp_text} | {relay_text}",
         &node_id.0[..4]
     ));
-    match opts.advertise {
+    match advertise_ip {
         Some(ip) => {
+            let ports = node.ports;
+            let ext = |wanted: u16, local: u16| if wanted != 0 { wanted } else { local };
             log_info(format!(
-                "对外宣告 {ip}（第 {} 次启动；{}）：其他节点与客户端可自动发现本节点",
-                advertise_epoch >> 32,
+                "对外宣告 {}:{}（DHT）/ {}（STUN）/ {}（TCP）| 第 {} 次启动 | {}",
+                opts.advertise.display(),
+                ext(opts.advertise_ports.dht, ports.dht),
+                if ports.stun == 0 {
+                    "off".to_string()
+                } else {
+                    ext(opts.advertise_ports.stun, ports.stun).to_string()
+                },
+                if ports.tcp == 0 {
+                    "off".to_string()
+                } else {
+                    ext(opts.advertise_ports.tcp, ports.tcp).to_string()
+                },
+                advertise_epoch_base >> 32,
                 if opts.hobby {
                     "声明不中转"
                 } else {
                     "声明可中转"
                 },
             ));
+            if opts.advertise_ports.dht != 0
+                || opts.advertise_ports.stun != 0
+                || opts.advertise_ports.tcp != 0
+            {
+                log_info(
+                    "外部端口与本机不同（FRP / 端口映射形态）：请确认中继端确实把这些端口转发到了本机",
+                );
+            }
             if ip.is_loopback() || ip.is_private() || ip.is_link_local() {
                 log_warn(format!(
                     "宣告地址 {ip} 不是公网地址：只有本机 / 同一局域网内的节点能据此连到本节点"
                 ));
             }
         }
-        None => log_info("未配置 --advertise：本节点不对外宣告，只能靠手工填写地址找到"),
+        None if opts.advertise.is_off() => {
+            log_info("未配置 --advertise：本节点不对外宣告，只能靠手工填写地址找到")
+        }
+        None => log_warn("对外宣告尚未生效：DDNS 解析出 IPv4 后会自动开始宣告"),
     }
+    log_info(format!(
+        "端点准入策略：{}",
+        match endpoint_scope {
+            EndpointScope::Public => "只收公网地址",
+            EndpointScope::LocalNetwork => "接受回环/私网地址（本机或局域网部署）",
+        }
+    ));
     if !peers.is_empty() {
         let list: Vec<String> = peers.iter().map(|a| a.to_string()).collect();
         log_info(format!("入网引导端点：{}", list.join(", ")));
+    }
+
+    // DDNS 守夜：周期重解析，结果变了就换纪元重宣告（审计简单项「--advertise 只支持固定 IPv4」）
+    if let (AdvertiseSource::Dns(host), Some(dht)) = (&opts.advertise, node.dht.clone()) {
+        if opts.ddns_refresh_secs > 0 {
+            let host = host.clone();
+            let period = opts.ddns_refresh_secs;
+            let ports = node.ports;
+            let target_ports = opts.advertise_ports;
+            let hobby = opts.hobby;
+            let mut revision: u32 = 0;
+            let mut current = advertise_ip;
+            tokio::spawn(async move {
+                let host_label = host.clone();
+                loop {
+                    tokio::time::sleep(Duration::from_secs(period.max(30))).await;
+                    let Some(ip) = resolve_ipv4(&host).await else {
+                        log_warn(format!("DDNS：{host_label} 暂时解析不出 IPv4，保持现有宣告"));
+                        continue;
+                    };
+                    if current == Some(ip) {
+                        continue;
+                    }
+                    revision = revision.saturating_add(1);
+                    let target = AdvertiseTarget {
+                        addr_v4: ip.octets(),
+                        ports: target_ports,
+                    };
+                    let spec = target.spec(ports, hobby);
+                    dht.start_advertising(spec, advertise_epoch_base | u64::from(revision))
+                        .await;
+                    log_info(format!(
+                        "DDNS：{host_label} → {ip}（原 {:?}），已用纪元 {} 重新宣告",
+                        current,
+                        advertise_epoch_base >> 32
+                    ));
+                    current = Some(ip);
+                }
+            });
+        }
     }
 
     // 种子目录有变化就记一笔（运维可见性：谁被发现了、谁失联了）
@@ -999,12 +1260,26 @@ mod tests {
         assert!(parse_config_text("bind 0.0.0.0:1").is_err());
     }
 
+    /// 测试用临时目录：**每个用例一个**，创建失败要立刻带着路径与系统错误失败。
+    ///
+    /// 位置选在仓库的 `target/test-tmp/` 而不是系统临时目录：后者在受限环境（只读沙箱、
+    /// 某些 CI 容器）里可能不可写。旧实现还让同一进程的多个用例共用
+    /// `wgp-node-test-{pid}` 一条路径，一个 `remove_dir_all` 会删掉另一个正在用的目录，
+    /// 报出「拒绝访问 / 找不到路径」，看起来像产品缺陷（审计简单项）。
+    fn test_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-tmp")
+            .join(format!("wgp-node-test-{}-{tag}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir)
+            .unwrap_or_else(|e| panic!("创建测试临时目录 {} 失败：{e}", dir.display()));
+        dir
+    }
+
     #[test]
     fn identity_roundtrip_and_corruption_detected() {
-        let dir = std::env::temp_dir().join(format!("wgp-node-test-{}", std::process::id()));
-        let _ = fs::create_dir_all(&dir);
+        let dir = test_dir("identity");
         let path = dir.join("node_identity.key");
-        let _ = fs::remove_file(&path);
 
         let a = load_or_create_identity(&path).unwrap();
         let b = load_or_create_identity(&path).unwrap();
@@ -1022,32 +1297,141 @@ mod tests {
     #[test]
     fn advertise_and_peers_default_to_off() {
         let o = resolve_opts(false, &raw(&[], &[], &[])).unwrap();
-        assert_eq!(o.advertise, None);
+        assert!(o.advertise.is_off());
         assert!(o.peers.is_empty());
+        assert_eq!(o.advertise_ports, AdvertisePorts::default());
+        assert_eq!(o.ddns_refresh_secs, 300);
+        assert!(!o.allow_local_endpoints);
     }
 
     #[test]
     fn advertise_is_parsed_and_validated() {
         let o = resolve_opts(false, &raw(&[], &[], &["--advertise", "203.0.113.7"])).unwrap();
-        assert_eq!(o.advertise, Some(Ipv4Addr::new(203, 0, 113, 7)));
+        assert_eq!(
+            o.advertise,
+            AdvertiseSource::Fixed(Ipv4Addr::new(203, 0, 113, 7))
+        );
         // 关闭写法：命令行的 none 覆盖配置文件里的地址
         let o = resolve_opts(
             false,
             &raw(&[("advertise", "203.0.113.7")], &[], &["--advertise=none"]),
         )
         .unwrap();
-        assert_eq!(o.advertise, None);
-        // 域名、越界、不可用地址：启动即报错，而不是带着一个谁也连不上的地址去宣告
+        assert!(o.advertise.is_off());
+        // 越界、不可用地址：启动即报错，而不是带着一个谁也连不上的地址去宣告
         for bad in [
-            "seed.example.com",
             "999.1.1.1",
             "0.0.0.0",
             "255.255.255.255",
             "224.0.0.1",
+            "not a host",
+            "localhost",
+            "-bad.example",
+            "a..b",
         ] {
             let e = resolve_opts(false, &raw(&[], &[], &["--advertise", bad])).unwrap_err();
             assert!(e.contains("advertise"), "{bad}: {e}");
         }
+    }
+
+    /// DDNS：域名形态的 --advertise 是合法输入（解析在启动时进行）
+    #[test]
+    fn advertise_accepts_ddns_hostname() {
+        let o = resolve_opts(
+            false,
+            &raw(&[], &[], &["--advertise", "Seed.Example.COM"]),
+        )
+        .unwrap();
+        assert_eq!(o.advertise, AdvertiseSource::Dns("seed.example.com".into()));
+        assert_eq!(o.advertise.display(), "seed.example.com（DDNS）");
+        // 重解析周期可配
+        let o = resolve_opts(false, &raw(&[], &[], &["--advertise", "a.example", "--ddns-refresh", "60"]))
+            .unwrap();
+        assert_eq!(o.ddns_refresh_secs, 60);
+        // 0 = 只在启动时解析一次
+        let o = resolve_opts(false, &raw(&[], &[], &["--advertise", "a.example", "--ddns-refresh", "0"]))
+            .unwrap();
+        assert_eq!(o.ddns_refresh_secs, 0);
+    }
+
+    /// FRP / 端口映射：外部端口可独立配置，且配置了就必须有 --advertise
+    #[test]
+    fn advertise_external_ports_require_advertise_and_matching_local_service() {
+        let o = resolve_opts(
+            false,
+            &raw(
+                &[],
+                &[],
+                &[
+                    "--advertise",
+                    "203.0.113.7",
+                    "--advertise-dht-port",
+                    "20010",
+                    "--advertise-stun-port",
+                    "23478",
+                    "--advertise-tcp-port",
+                    "23481",
+                ],
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            o.advertise_ports,
+            AdvertisePorts {
+                dht: 20010,
+                stun: 23478,
+                tcp: 23481
+            }
+        );
+
+        // 没写 --advertise 却配了外部端口：报错（那些端口不会进入任何广告）
+        let e = resolve_opts(
+            false,
+            &raw(&[], &[], &["--advertise-dht-port", "20010"]),
+        )
+        .unwrap_err();
+        assert!(e.contains("advertise"), "{e}");
+
+        // 本机没开 STUN / TCP，却写了对外端口：报错，避免广告里出现指向空端口
+        let e = resolve_opts(
+            false,
+            &raw(
+                &[],
+                &[],
+                &["--advertise", "203.0.113.7", "--stun", "none", "--advertise-stun-port", "23478"],
+            ),
+        )
+        .unwrap_err();
+        assert!(e.contains("stun"), "{e}");
+        let e = resolve_opts(
+            false,
+            &raw(
+                &[],
+                &[],
+                &["--advertise", "203.0.113.7", "--tcp", "none", "--advertise-tcp-port", "23481"],
+            ),
+        )
+        .unwrap_err();
+        assert!(e.contains("tcp"), "{e}");
+    }
+
+    /// 局域网 / 本机部署：显式放宽端点准入（审计 M2）
+    #[test]
+    fn allow_local_endpoints_flag() {
+        let o = resolve_opts(false, &raw(&[], &[], &["--allow-local-endpoints"])).unwrap();
+        assert!(o.allow_local_endpoints);
+        // 配置文件里写连字符也认（parse_config_text 负责 - → _ 归一）
+        let kv = parse_config_text("allow-local-endpoints = true\n").unwrap();
+        let o = resolve_opts(
+            false,
+            &RawInput {
+                file: kv,
+                env: Vec::new(),
+                argv: Vec::new(),
+            },
+        )
+        .unwrap();
+        assert!(o.allow_local_endpoints, "配置文件里的键名做 - → _ 归一");
     }
 
     #[test]
@@ -1099,9 +1483,7 @@ mod tests {
 
     #[test]
     fn advertise_epoch_strictly_increases_across_restarts() {
-        let dir = std::env::temp_dir().join(format!("wgp-node-epoch-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let dir = test_dir("epoch");
         let path = epoch_file_for(&dir.join("node_identity.key"));
         assert_eq!(path.file_name().unwrap(), "node_identity.epoch");
 
