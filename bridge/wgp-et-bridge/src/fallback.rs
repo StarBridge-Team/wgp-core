@@ -47,6 +47,19 @@ pub const SERVICE_PORT_STUN: u16 = 3478;
 /// 打洞端口的派生基址与跨度：`punch_base + peer_id % span`
 pub const PUNCH_BASE: u16 = 42_100;
 pub const PUNCH_SPAN: u32 = 900;
+
+/// 本机打洞载体用的端口 = 对外打洞端口 + 这个偏移。
+///
+/// **为什么不能同一个端口**：对外打洞端口由桥监听（对端的包先到桥），而本机应用（wgp 的
+/// 打洞载体）必须绑另一个端口——两者同机同地址时绑同一个端口会直接冲突。
+/// 桥在 host 模式会把「发往我的打洞端口」的帧写回 `127.0.0.1:(端口+偏移)`。
+/// 客户端侧用同一个公式（`wgp-client` 的 `ET_PUNCH_APP_OFFSET`），改这里要一起改。
+pub const PUNCH_APP_OFFSET: u16 = 1_000;
+
+/// 本机应用应该绑定的打洞端口
+pub fn punch_app_port(peer_id: u32) -> u16 {
+    punch_port(peer_id).saturating_add(PUNCH_APP_OFFSET)
+}
 /// 桥默认监听的地址：与 127.0.0.1 分开，本体进程照常用 127.0.0.1，不会抢端口
 pub const DEFAULT_BIND_IP: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 2);
 
@@ -471,7 +484,16 @@ impl FallbackBridge {
         };
         // 目标地址：房主侧固定 `local_app_ip:port`；加入方侧用「最近一次从该端口发出去的地址」
         let dst = match self.config.local_app_ip {
-            Some(ip) => SocketAddr::new(IpAddr::V4(ip), port),
+            Some(ip) => {
+                // 发往「我的打洞端口」的帧写回本机应用的打洞载体端口（+偏移），
+                // 因为同一个端口已经被桥占着收对端的包了。
+                let app_port = if port == punch_port(self.link.peer_id) {
+                    punch_app_port(self.link.peer_id)
+                } else {
+                    port
+                };
+                SocketAddr::new(IpAddr::V4(ip), app_port)
+            }
             None => match self
                 .app_addr
                 .lock()
@@ -480,6 +502,12 @@ impl FallbackBridge {
                 .copied()
             {
                 Some(addr) => addr,
+                // 还没学到本机应用地址：如果这是「对端的打洞端口」，那它一定是给本机打洞载体的
+                // 探针（对端先探过来、本端还没发过东西）。交给本机载体端口，别丢。
+                None if port == punch_port(from) => SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    punch_app_port(self.link.peer_id),
+                ),
                 None => {
                     let _ = self.event_tx.send(BridgeEvent::Dropped {
                         reason: format!("端口 {port}：还不知道本机应用地址，丢弃 {from} 的帧"),

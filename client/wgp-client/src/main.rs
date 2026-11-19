@@ -1056,6 +1056,10 @@ const ET_READY_TIMEOUT: Duration = Duration::from_secs(15);
 /// 回退形态下本机种子的固定服务端口（DHT / 观察者）
 const FALLBACK_SEED_PORT: u16 = 11_010;
 const FALLBACK_STUN_PORT: u16 = 3_478;
+/// 回退桥默认绑定的本侧回环地址（与本体进程的 127.0.0.1 分开，避免抢端口）
+const FALLBACK_BIND_IP: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 2);
+/// 本机打洞载体端口相对「对外打洞端口」的偏移（必须与 `wgp-et-bridge` 的 `PUNCH_APP_OFFSET` 一致）
+const ET_PUNCH_APP_OFFSET: u16 = 1_000;
 /// 与桥上种子互认的重试次数（第一次 PING 要等桥的 ET 握手完成，一次就放弃太早）
 const FALLBACK_PING_ATTEMPTS: usize = 10;
 
@@ -1138,6 +1142,21 @@ fn parse_ready_line(line: &str) -> Option<EtReady> {
 
 /// 桥可执行文件的位置：环境变量 `WGP_ET_FALLBACK` 优先，否则与当前可执行文件同目录
 /// （发布包里 `wgp-client` 与 `wgp-et-fallback` 并排）。
+/// 桥绑定的本侧回环地址（`WGP_ET_FALLBACK_BIND`，默认 `127.0.0.2`）。
+///
+/// 默认值与本体进程的 `127.0.0.1` 分开，免得抢端口。**同一台机器上跑两个回退实例**
+/// （例如演示/测试：房主 + 加入方）时必须给不同地址（`127.0.0.2` / `127.0.0.4`），
+/// 否则两座桥会抢同一个 `11010`。跨机部署不需要理会这个变量。
+///
+/// 非法值一律退回默认值：这是个调试旋钮，不值得让客户端因为环境变量写错而启动失败。
+fn fallback_bind_ip(raw: Option<&str>) -> Ipv4Addr {
+    raw.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse::<Ipv4Addr>().ok())
+        .filter(|ip| ip.is_loopback())
+        .unwrap_or(FALLBACK_BIND_IP)
+}
+
 fn fallback_binary_path(
     explicit: Option<&str>,
     current_exe: Option<&Path>,
@@ -1249,13 +1268,17 @@ impl EtFallback {
         (self.ready.bind, self.ready.punch)
     }
 
-    /// 打洞载体的绑定地址（固定端口，不是临时端口）。
+    /// 打洞载体的绑定地址。
     ///
-    /// 桥只会把对端报文写回 `:<punch>`——房主侧固定写回 `127.0.0.1:<同名端口>`，
-    /// 加入方侧写回"本机应用最近从这个端口发出的地址"。载体绑临时端口的话那枚报文没人收，
-    /// 打洞永远收不到对端探针。代价：同一台机器跑两个回退客户端会抢同一个 UDP 端口。
+    /// **端口 = 桥的对外打洞端口 + [`ET_PUNCH_APP_OFFSET`]**：对外那个端口已经被桥占着收对端的
+    /// 包了（桥在 host 模式会把「发往我的打洞端口」的帧写回 `127.0.0.1:(端口+偏移)`），
+    /// 载体跟它同端口会直接 bind 冲突。偏移量必须与 `wgp-et-bridge` 的 `PUNCH_APP_OFFSET` 一致。
+    /// 代价：同一台机器跑两个回退客户端会抢同一个 UDP 端口。
     fn punch_bind(&self) -> SocketAddr {
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), self.ready.punch)
+        SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            self.ready.punch.saturating_add(ET_PUNCH_APP_OFFSET),
+        )
     }
 }
 
@@ -1334,6 +1357,7 @@ async fn start_et_fallback(
         std::env::current_exe().ok().as_deref(),
     )?;
     let mode = if host { "host" } else { "joiner" };
+    let bind_ip = fallback_bind_ip(std::env::var("WGP_ET_FALLBACK_BIND").ok().as_deref());
     let args: Vec<String> = vec![
         "--relay".to_string(),
         relay.relay_spec(),
@@ -1341,12 +1365,21 @@ async fn start_et_fallback(
         hex(&key),
         "--mode".to_string(),
         mode.to_string(),
+        "--bind".to_string(),
+        bind_ip.to_string(),
     ];
     let mut bridge = EtBridge::spawn(&program, &args)?;
     let ready = bridge.read_ready().await?;
 
     // d) 接线：种子 = 桥的 DHT 口；观察者见下；打洞端口由桥派生
-    let seed_addr = SocketAddr::new(IpAddr::V4(ready.bind), FALLBACK_SEED_PORT);
+    // 房主的种子就在本机（127.0.0.1:11010），不要绕桥：桥只负责把**对端**的报文送到它。
+    // 绕桥的话，桥会把「本机客户端发往 11010 的信令」当成要发给对端的流量转走，客户端
+    // 反而永远握不上自己家种子的手。
+    let seed_addr = if host {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), FALLBACK_SEED_PORT)
+    } else {
+        SocketAddr::new(IpAddr::V4(ready.bind), FALLBACK_SEED_PORT)
+    };
     let bridge_observer = SocketAddr::new(IpAddr::V4(ready.bind), FALLBACK_STUN_PORT);
     let observers = if host {
         // 房主：本地种子的观察者就在 127.0.0.1:3478，直接探它。桥在 host 模式只会把
@@ -1378,8 +1411,10 @@ async fn start_et_fallback(
     let obs: Vec<String> = observers.iter().map(SocketAddr::to_string).collect();
     println!("[回退] 观察者  = {}", obs.join(", "));
     println!(
-        "[回退] 打洞    = 绑定 0.0.0.0:{}（固定端口），对外宣告 {}:{}",
-        ready.punch, ready.bind, ready.punch
+        "[回退] 打洞    = 本机载体 0.0.0.0:{}（固定端口），对外宣告 {}:{}（桥在听这个端口）",
+        ready.punch.saturating_add(ET_PUNCH_APP_OFFSET),
+        ready.bind,
+        ready.punch
     );
     println!(
         "[回退] 桥进程  = {}（peer={}；同一台机器只能跑一个回退客户端，否则抢同一个打洞端口）",
@@ -2403,6 +2438,30 @@ mod tests {
         ] {
             assert!(parse_ready_line(bad).is_none(), "`{bad}` 应解析失败");
         }
+    }
+
+    /// 桥的本侧回环地址：默认 127.0.0.2；同机双实例时用不同地址；非法值退回默认
+    #[test]
+    fn fallback_bind_ip_defaults_and_accepts_loopback_overrides() {
+        assert_eq!(fallback_bind_ip(None), Ipv4Addr::new(127, 0, 0, 2));
+        assert_eq!(fallback_bind_ip(Some("  ")), Ipv4Addr::new(127, 0, 0, 2));
+        assert_eq!(
+            fallback_bind_ip(Some("127.0.0.4")),
+            Ipv4Addr::new(127, 0, 0, 4)
+        );
+        // 非回环地址不接受（桥只服务本机回环，避免把它挂到公网接口上）
+        assert_eq!(
+            fallback_bind_ip(Some("0.0.0.0")),
+            Ipv4Addr::new(127, 0, 0, 2)
+        );
+        assert_eq!(
+            fallback_bind_ip(Some("192.168.1.10")),
+            Ipv4Addr::new(127, 0, 0, 2)
+        );
+        assert_eq!(
+            fallback_bind_ip(Some("not-an-ip")),
+            Ipv4Addr::new(127, 0, 0, 2)
+        );
     }
 
     #[test]

@@ -160,6 +160,7 @@ async fn punch_ports_reach_the_peer_application() {
     )
     .await
     .expect("房主桥");
+    let host_id = host_bridge.peer_id();
     let host_punch = host_bridge.punch_port();
     let (host_stop, host_stop_rx) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(host_bridge.run(host_stop_rx));
@@ -177,16 +178,21 @@ async fn punch_ports_reach_the_peer_application() {
     )
     .await
     .expect("加入方桥");
+    let joiner_id = joiner_bridge.peer_id();
     let joiner_punch = joiner_bridge.punch_port();
     let (joiner_stop, joiner_stop_rx) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(joiner_bridge.run(joiner_stop_rx));
 
-    // 两侧应用：绑在自己的打洞端口上（回退形态里 wgp 的打洞载体就是这个端口）
+    // 两侧应用：绑在**本机应用侧**的打洞端口上（= 对外打洞端口 + 偏移；
+    // 同一个端口已经被桥占着收对端的包了，应用不能再绑它）
     assert_ne!(host_punch, joiner_punch, "两个节点号派生的端口不应相同");
-    let host_app = UdpSocket::bind((Ipv4Addr::LOCALHOST, host_punch)).expect("房主应用绑定打洞端口");
+    let host_app_port = wgp_et_bridge::fallback::punch_app_port(host_id);
+    let joiner_app_port = wgp_et_bridge::fallback::punch_app_port(joiner_id);
+    let host_app =
+        UdpSocket::bind((Ipv4Addr::LOCALHOST, host_app_port)).expect("房主应用绑定打洞端口");
     host_app.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
     let joiner_app =
-        UdpSocket::bind((Ipv4Addr::LOCALHOST, joiner_punch)).expect("加入方应用绑定打洞端口");
+        UdpSocket::bind((Ipv4Addr::LOCALHOST, joiner_app_port)).expect("加入方应用绑定打洞端口");
     joiner_app.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(15);
