@@ -204,6 +204,11 @@ pub struct NodeConfig {
     pub advertise_epoch: u64,
     /// 端点地址准入策略（审计 M2）。默认只收公网地址；本机/局域网部署由部署层显式放宽。
     pub endpoint_scope: wgp_dht::EndpointScope,
+    /// 识别前置代理注入的 PROXY protocol v2（FRP / nginx stream / 云 LB 后面时用）。
+    ///
+    /// 打开后观察者会用头里的真实客户端地址出映射报告，TCP 信令会先吃掉这段头。
+    /// **只能在「本端口只可能被可信代理访问」时打开**，详见 `wgp_dht::proxy_protocol`。
+    pub proxy_protocol: bool,
     /// 入网引导端点：其他种子的 DHT 地址（已解析）。空 = 独立运行，等别人来找
     pub peers: Vec<std::net::SocketAddr>,
     /// 身份证明兼容策略（17 §11.6）：true = 允许回退到旧 PING/PONG 学习（迁移期）。
@@ -645,6 +650,8 @@ impl Engine {
             node.pin_seeds(&cfg.peers).await;
             // 端点准入策略由部署层决定（默认公网；本机/局域网/FRP 内网部署显式放宽）
             node.set_endpoint_scope(cfg.endpoint_scope);
+            // 前置代理注入 PROXY v2 时，STUN 与 TCP 信令都要先剥头
+            node.set_proxy_protocol(cfg.proxy_protocol);
             let ports = AdvertisePorts {
                 dht: node.local_addr().map(|a| a.port()).unwrap_or(0),
                 stun: observer
@@ -1012,6 +1019,7 @@ mod tests {
                 advertise: Some(AdvertiseTarget::addr(Ipv4Addr::LOCALHOST.octets())),
                 advertise_epoch: 1,
                 endpoint_scope: wgp_dht::EndpointScope::LocalNetwork,
+                proxy_protocol: false,
                 peers,
                 allow_legacy_identity: false,
             }
@@ -1085,6 +1093,7 @@ mod tests {
                 advertise: Some(AdvertiseTarget::addr(Ipv4Addr::LOCALHOST.octets())),
                 advertise_epoch: 1,
                 endpoint_scope: wgp_dht::EndpointScope::LocalNetwork,
+                proxy_protocol: false,
                 peers,
                 allow_legacy_identity: false,
             }

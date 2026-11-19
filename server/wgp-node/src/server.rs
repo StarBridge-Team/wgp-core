@@ -184,6 +184,8 @@ pub struct ServerOpts {
     pub ddns_refresh_secs: u64,
     /// 是否接受回环/私网端点（本机与局域网联调、FRP 落在内网）
     pub allow_local_endpoints: bool,
+    /// 是否识别前置代理注入的 PROXY protocol v2（FRP / nginx stream / 云 LB 后面）
+    pub proxy_protocol: bool,
     /// 入网引导端点（其他种子的 UDP 信令地址；域名在启动时解析）
     pub peers: Vec<SeedEndpoint>,
 }
@@ -194,6 +196,7 @@ impl ServerOpts {
         ObserverPolicy {
             rate_limit: self.observer_rate_limit,
             rate_window: Duration::from_secs(self.observer_rate_window_secs),
+            proxy_protocol: self.proxy_protocol,
         }
     }
 }
@@ -458,6 +461,26 @@ pub fn resolve_opts(force_hobby: bool, input: &RawInput) -> Result<ServerOpts, S
         None => false,
     };
 
+    // 前置代理（FRP / nginx stream / 云 LB）注入 PROXY protocol v2 时打开：
+    // 观察者与 TCP 信令会先剥掉这段头，用头里的真实客户端地址出映射报告。
+    // 只支持 v2；v1 是文本协议、这里不解析。
+    let proxy_protocol = match m.get("proxy_protocol").map(|v| v.trim().to_ascii_lowercase()) {
+        None => false,
+        Some(v) if matches!(v.as_str(), "" | "off" | "none" | "false" | "0") => false,
+        Some(v) if matches!(v.as_str(), "v2" | "2" | "on" | "true" | "1") => true,
+        Some(v) if v == "v1" => {
+            return Err(
+                "proxy_protocol 只支持 v2（v1 是文本协议，本实现不解析）：请在前置代理侧改用 v2"
+                    .to_string(),
+            )
+        }
+        Some(v) => {
+            return Err(format!(
+                "proxy_protocol 非法（off | v2）：{v}"
+            ))
+        }
+    };
+
     let peers = match m.get("peers") {
         Some(v) => {
             let (peers, bad) = SeedEndpoint::parse_list(v);
@@ -495,6 +518,7 @@ pub fn resolve_opts(force_hobby: bool, input: &RawInput) -> Result<ServerOpts, S
         advertise_ports,
         ddns_refresh_secs,
         allow_local_endpoints,
+        proxy_protocol,
         peers,
     })
 }
@@ -548,7 +572,7 @@ fn find_config_path(argv: &[String]) -> Option<PathBuf> {
 }
 
 fn collect_env() -> Vec<(String, String)> {
-    const KEYS: [&str; 17] = [
+    const KEYS: [&str; 18] = [
         "BIND",
         "STUN",
         "TCP",
@@ -565,6 +589,7 @@ fn collect_env() -> Vec<(String, String)> {
         "ADVERTISE_TCP_PORT",
         "DDNS_REFRESH",
         "ALLOW_LOCAL_ENDPOINTS",
+        "PROXY_PROTOCOL",
         "PEERS",
     ];
     KEYS.iter()
@@ -629,6 +654,9 @@ pub fn usage(profile: &str) -> String {
   --ddns-refresh <secs>              DDNS 域名重解析周期（默认 300；0 = 只在启动时解析一次）\n\
   --allow-local-endpoints            接受回环/私网端点（本机多进程联调、局域网或 FRP 内网部署；\n\
                                      默认只收公网地址）\n\
+  --proxy-protocol <off|v2>          前置代理注入 PROXY protocol v2 时打开：观察者与 TCP 信令会用\n\
+                                     头里的**真实客户端地址**（而不是中继地址）出映射报告与限速。\n\
+                                     只能在「本端口只可能被可信代理访问」时打开，否则来源可伪造\n\
   --peers <list>                     入网引导：其他种子的 udp://主机:端口，逗号分隔，可重复给出\n\
   --observer-rate-limit <n>          观察者每 IP 每窗口响应上限（默认 {limit}）\n\
   --observer-rate-window <secs>      观察者限频窗口秒数（默认 {window}）\n\
@@ -643,7 +671,7 @@ pub fn usage(profile: &str) -> String {
           WGP_IDENTITY / WGP_LOG_LEVEL / WGP_CONFIG /\n\
           WGP_ADVERTISE / WGP_ADVERTISE_DHT_PORT / WGP_ADVERTISE_STUN_PORT /\n\
           WGP_ADVERTISE_TCP_PORT / WGP_DDNS_REFRESH / WGP_ALLOW_LOCAL_ENDPOINTS /\n\
-          WGP_PEERS\n\
+          WGP_PROXY_PROTOCOL / WGP_PEERS\n\
 优先级：命令行 > 环境变量 > 配置文件 > 默认值",
         limit = wgp_dht::OBSERVER_RATE_LIMIT,
         window = wgp_dht::OBSERVER_RATE_WINDOW.as_secs(),
@@ -921,6 +949,7 @@ pub async fn run(profile: &str, force_hobby: bool) {
         }),
         advertise_epoch: advertise_epoch_base,
         endpoint_scope,
+        proxy_protocol: opts.proxy_protocol,
         peers: peers.clone(),
         allow_legacy_identity: opts.allow_legacy_identity,
     };
@@ -1021,6 +1050,12 @@ pub async fn run(profile: &str, force_hobby: bool) {
             EndpointScope::LocalNetwork => "接受回环/私网地址（本机或局域网部署）",
         }
     ));
+    if opts.proxy_protocol {
+        log_info(
+            "PROXY protocol v2：已启用（观察者/信令使用前置代理声明的真实客户端地址）\
+             —— 只能用于「本端口仅可信代理可访问」的部署",
+        );
+    }
     if !peers.is_empty() {
         let list: Vec<String> = peers.iter().map(|a| a.to_string()).collect();
         log_info(format!("入网引导端点：{}", list.join(", ")));
@@ -1418,8 +1453,7 @@ mod tests {
 
     /// 局域网 / 本机部署：显式放宽端点准入（审计 M2）
     #[test]
-    fn allow_local_endpoints_flag() {
-        let o = resolve_opts(false, &raw(&[], &[], &["--allow-local-endpoints"])).unwrap();
+    fn allow_local_endpoints_flag() {        let o = resolve_opts(false, &raw(&[], &[], &["--allow-local-endpoints"])).unwrap();
         assert!(o.allow_local_endpoints);
         // 配置文件里写连字符也认（parse_config_text 负责 - → _ 归一）
         let kv = parse_config_text("allow-local-endpoints = true\n").unwrap();
@@ -1516,5 +1550,30 @@ mod tests {
         let u = usage("wgp-node");
         assert!(u.contains("WGP_BIND"));
         assert!(u.contains("优先级"));
+    }
+
+    /// 前置代理的 PROXY protocol v2 开关：默认关，只认 v2
+    #[test]
+    fn proxy_protocol_flag_accepts_only_v2() {
+        let o = resolve_opts(false, &raw(&[], &[], &[])).unwrap();
+        assert!(!o.proxy_protocol, "默认关闭");
+
+        for on in ["v2", "2", "on", "true"] {
+            let o = resolve_opts(false, &raw(&[], &[], &["--proxy-protocol", on])).unwrap();
+            assert!(o.proxy_protocol, "{on} 应开启");
+        }
+        for off in ["off", "none", "0", "false"] {
+            let o = resolve_opts(false, &raw(&[], &[], &["--proxy-protocol", off])).unwrap();
+            assert!(!o.proxy_protocol, "{off} 应关闭");
+        }
+        // v1 是文本协议：明确拒绝，而不是「悄悄当 off」（运维会以为开了）
+        let e = resolve_opts(false, &raw(&[], &[], &["--proxy-protocol", "v1"])).unwrap_err();
+        assert!(e.contains("只支持 v2"), "{e}");
+        let e = resolve_opts(false, &raw(&[], &[], &["--proxy-protocol", "maybe"])).unwrap_err();
+        assert!(e.contains("proxy_protocol 非法"), "{e}");
+
+        // 打开后观察者策略与节点配置都要跟着变
+        let o = resolve_opts(false, &raw(&[], &[], &["--proxy-protocol", "v2"])).unwrap();
+        assert!(o.observer_policy().proxy_protocol);
     }
 }

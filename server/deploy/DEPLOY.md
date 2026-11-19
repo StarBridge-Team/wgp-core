@@ -361,29 +361,23 @@ loginctl enable-linger "$USER"  # 仅需在无交互登录也要运行时开启
 ### 10.2 FRP 穿透（方式 C，没有公网 IPv4 时）
 
 一台机器（`frps`）有公网 IPv4，另一台（`frpc` + `wgp-node`）在 NAT 后面、且拿不到公网 IPv4
-（CGNAT、公司网、宿舍网）。仓库给了三份东西：
+（CGNAT、公司网、宿舍网）。
 
-- `server/deploy/frp/frps.toml.example`：中继端配置（含 `allowPorts` 白名单与 token 鉴权）
-- `server/deploy/frp/frpc.toml.example`：NAT 端配置（三个 proxy：DHT UDP / STUN UDP / TCP 信令）
-- `server/deploy/install-seed-frp.sh`：NAT 端一键安装（装 frpc + wgp-node、写单元、起服务、自检）
+> **本项目不下载、不安装、不管理 frpc。** 用第三方 FRP 服务时，frpc 的版本与参数往往由服务商
+> 决定（网页面板填映射、或他们分发的客户端），自己下一个 frpc 通常连不上。这里只说明
+> **节点侧要配合什么**；frpc/frps 怎么起由你和服务商决定。`server/deploy/frp/*.toml.example`
+> 只是自建时的参考样例。
 
-中继端手工三步：
+**你需要在 FRP 那一侧（服务商面板或自建 frpc）建三条映射**，指向这台机器的本机端口：
 
-```bash
-sudo install -d /etc/frp
-sudo cp server/deploy/frp/frps.toml.example /etc/frp/frps.toml   # 改 auth.token
-sudo systemctl enable --now frps                                 # 或用 frps -c /etc/frp/frps.toml
-# 放行 TCP 7000（frps 控制口）与 allowPorts 里的三个端口（云安全组 + 主机防火墙都要）
-```
+| 远端（公网侧） | 类型 | 本地目标 | 用途 |
+|---|---|---|---|
+| 21010 | UDP | `127.0.0.1:11010` | DHT 信令 |
+| 23478 | UDP | `127.0.0.1:3478` | 观察者 / STUN |
+| 23481 | TCP | `127.0.0.1:3481` | TCP 信令兜底 |
 
-NAT 端一条命令：
-
-```bash
-FRPS_ADDR=relay.example.com FRP_TOKEN='<与 frps 一致的长随机串>' \
-  sudo -E bash server/deploy/install-seed-frp.sh
-```
-
-脚本最终会写出这样的启动参数（外部端口 ≠ 本机端口，这是本拓扑的关键）：
+**节点侧只做两件事**：① 宣告对外地址与**外部端口**（端口换号了就必须显式给，否则别人连的是错的端口）；
+② 如果你的 FRP/前置代理会注入 PROXY protocol v2，加 `--proxy-protocol v2`（见 §10.6）。
 
 ```ini
 ExecStart=/opt/wgp-node/wgp-node --bind 0.0.0.0:11010 --stun 3478 --tcp 3481 \
@@ -393,11 +387,14 @@ ExecStart=/opt/wgp-node/wgp-node --bind 0.0.0.0:11010 --stun 3478 --tcp 3481 \
 
 客户端侧只需 `-p udp://relay.example.com:21010`（TCP 兜底 `tcp://relay.example.com:23481`）。
 
-**限制（必须知道）**：FRP 的 UDP 代理按「访客」跟踪。种子主动推给别人的广告，在还没有任何
-访客之前会被丢弃；一旦有节点来 PING / FIND_SEEDS / FIND_VALUE，双向就通了。所以 FRP 形态的
-种子**更适合被查询，不适合做主动推送源**——它的价值（发现、观察者、房间 KV）不受影响，
-但它自己不擅长「先去告诉别人我在这儿」。需要主动推送时，配置 `WGP_PEERS` 指向至少一个
-能主动连到的种子（例如一台公网 VPS），由对方向它索取。
+**限制（必须知道）**：
+
+- FRP 的 UDP 代理按「访客」跟踪：**种子主动推给别人的广告，在还没有访客时会丢**。
+  所以 FRP 后面的种子擅长「被查询」（PING / FIND_SEEDS / 房间读写都正常），不擅长主动推送；
+  想让它尽快进别人目录，给它配 `--peers udp://<一台公网种子>:11010`。
+- 中继机的带宽与稳定性决定体验；公共中继可能限速。
+- 只映射了 UDP 没映射 TCP：UDP 全灭时没有信令兜底。
+- 你看到的源地址会是中继地址，除非代理支持并在节点上开了 PROXY protocol v2（§10.6）。
 
 ### 10.3 局域网 / 本机联调（方式 D）
 
@@ -468,4 +465,34 @@ WGP_DDNS_REFRESH=300               # 重解析周期（秒）；0 = 只在启动
 > 诚实声明：本仓库此前的验证全部在回环与单机多进程上；方式 C（FRP）、手动端口映射与 DDNS 的
 > 参数解析、广告组装、重宣告逻辑都有单元测试，但**没有在真实 FRP 中继 + 真实 NAT + 真实 DDNS
 > 域名上跑过**。第一次上线请按上表逐项确认，并把结果填进 `项目完整文档/18-NAT实测数据.md` §7。
+
+### 10.6 前置代理与 PROXY protocol v2（可选）
+
+有些前置代理（FRP 的 `proxy_protocol_version = "v2"`、nginx `stream` 的 `proxy_protocol`、部分云
+负载均衡）会在转发时把**真实客户端地址**放在连接/数据报最前面，这就是 HAProxy 的 PROXY protocol v2。
+
+**为什么需要**：种子挂在代理后面时，我们看到的源地址是代理地址。观察者若拿它当「客户端公网
+端点」，NAT 判定会得出错误结论（打洞指向代理）；限速也会把所有用户算成同一个 IP。
+打开下面这个开关，观察者与 TCP 信令会先吃掉这段头，用头里的地址出映射报告与限速：
+
+```ini
+# /etc/wgp-node/env（或 --proxy-protocol v2）
+WGP_PROXY_PROTOCOL=v2
+```
+
+启动日志会打印：
+
+```
+[INFO] PROXY protocol v2：已启用（观察者/信令使用前置代理声明的真实客户端地址）—— 只能用于「本端口仅可信代理可访问」的部署
+```
+
+**安全边界（必须遵守）**：这个开关把「我是谁」交给对端自称。只能在「本端口只可能被可信代理
+访问」时打开（服务商隧道、本机 nginx、只监听回环再让代理转发）。直接暴露在公网时打开，任何人
+都能伪造来源地址，污染映射报告、地址簿与限速。默认关闭；关着的时候带头的报文会被当坏包忽略。
+
+**它不解决什么**：PROXY v2 给的是「代理看到的那个 TCP/UDP 源地址」。对 UDP 来说那就是客户端的
+真实 NAT 映射（有用）；对 **TCP** 信令来说，TCP 源端口 ≠ 该客户端的 UDP 端口，所以**不能**据此
+填地址簿里的 UDP 端点——Forward 中转仍然需要存储节点知道目标的 UDP 地址（方式 C 的固有限制）。
+代理有这个能力就两边一起开；没有就别开。
+
 

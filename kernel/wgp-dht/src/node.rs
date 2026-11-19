@@ -342,6 +342,8 @@ pub struct DhtNode {
     response_budget: Mutex<ByteBudget>,
     /// 端点地址准入策略（审计 M2）：默认只收公网地址
     endpoint_scope: AtomicU8,
+    /// 是否识别前置代理注入的 PROXY protocol v2（默认关闭；见 proxy_protocol 模块文档）
+    proxy_protocol: AtomicBool,
     /// 身份证明策略（严格 / 兼容旧 PING-PONG）
     identity_policy: AtomicU8,
     /// 对外信令的承载方式（UDP / TCP 兜底）。切换后所有出站 RPC 都按它分派，
@@ -393,6 +395,7 @@ impl DhtNode {
             stun_gate: Mutex::new(RateGate::new(RatePolicy::default())),
             response_budget: Mutex::new(ByteBudget::new(ByteBudgetPolicy::default())),
             endpoint_scope: AtomicU8::new(scope.as_u8()),
+            proxy_protocol: AtomicBool::new(false),
             identity_policy: AtomicU8::new(IdentityPolicy::Strict.as_u8()),
             signaling: AtomicU8::new(Transport::Udp.as_u8()),
             legacy_fallbacks: AtomicU64::new(0),
@@ -418,19 +421,32 @@ impl DhtNode {
                 let Some(node) = loop_node.upgrade() else {
                     break;
                 };
-                if let Some(pkt) = RpcPacket::decode(&buf[..n]) {
+                // 前置代理（FRP / nginx stream 等）注入 PROXY v2 时先剥掉头：
+                // STUN 用头里的真实来源出报告，RPC 只用剩下的载荷解帧。
+                let proxy_v2 = node.proxy_protocol();
+                let (claimed, body): (SocketAddr, &[u8]) = if proxy_v2 {
+                    match crate::proxy_protocol::strip_v2(&buf[..n]) {
+                        Some((info, rest)) => (info.source.unwrap_or(src), rest),
+                        None => (src, &buf[..n]),
+                    }
+                } else {
+                    (src, &buf[..n])
+                };
+                if let Some(pkt) = RpcPacket::decode(body) {
                     node.dispatch(pkt, Sink::Udp(src)).await;
-                } else if n == seed_advertise_v2::LEN
-                    && classify(&buf[..n]) == Some(seed_advertise_v2::TYPE)
+                } else if body.len() == seed_advertise_v2::LEN
+                    && classify(body) == Some(seed_advertise_v2::TYPE)
                 {
                     // 别的节点推送来的种子广告（非 RPC：定长报文，无应答）
-                    node.on_pushed_advert(&buf[..n]).await;
-                } else if let Some(resp) = crate::observe::try_answer_stun(&buf[..n], src) {
+                    node.on_pushed_advert(body).await;
+                } else if let Some((_who, resp)) =
+                    crate::observe::try_answer_stun_ex(body, claimed, proxy_v2)
+                {
                     // STUN 应答与观察者服务共用限速机制（审计 M6）：没人能从 DHT socket
-                    // 上无成本地刷出上行流量。
+                    // 上无成本地刷出上行流量。限速按**声称的真实来源**计数（代理后面就是客户端）。
                     let admitted = {
                         let mut gate = node.stun_gate.lock().await;
-                        gate.admit(src.ip(), Instant::now())
+                        gate.admit(claimed.ip(), Instant::now())
                     };
                     if admitted {
                         let _ = node.socket.send_to(&resp, src).await;
@@ -515,6 +531,19 @@ impl DhtNode {
     /// 该端点是否可作为目的地址（按当前策略）
     fn endpoint_ok(&self, addr: SocketAddr) -> bool {
         is_usable_endpoint(addr, self.endpoint_scope())
+    }
+
+    /// 是否识别前置代理注入的 PROXY protocol v2（默认关闭）。
+    ///
+    /// 打开后：UDP 端口上的 STUN 应答会用头里的**真实客户端地址**做映射报告（观察者口径），
+    /// TCP 信令会在连接开头先吃掉这段头再解帧。**只能在「本端口只可能被可信代理访问」时打开**，
+    /// 否则任何人都能自称任意来源（污染映射报告、地址簿与限速）。
+    pub fn set_proxy_protocol(&self, enabled: bool) {
+        self.proxy_protocol.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn proxy_protocol(&self) -> bool {
+        self.proxy_protocol.load(Ordering::Relaxed)
     }
 
     /// 覆盖 DHT socket 上直接应答 STUN 的限速策略（运维配置注入；默认见 `RatePolicy`）
@@ -1222,7 +1251,11 @@ impl DhtNode {
 
     /// 单条 TCP 信令连接：读端解帧 → dispatch(Sink::Tcp)；写端将应答帧回灌。
     /// 空闲超时关闭（防慢连接长期占用名额）。
-    async fn serve_tcp_conn(&self, stream: TcpStream) {
+    async fn serve_tcp_conn(&self, mut stream: TcpStream) {
+        // 前置代理注入 PROXY v2 时先把头吃掉（只用 peek 确认签名，不消费正常流量）
+        if self.proxy_protocol() {
+            let _ = read_proxy_v2(&mut stream).await;
+        }
         let (mut rd, mut wr) = stream.into_split();
         let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let writer = tokio::spawn(async move {
@@ -2018,6 +2051,36 @@ impl DhtNode {
         self.routing.lock().await.remove(&id);
         self.addr_book.lock().await.remove(&id);
     }
+}
+
+/// 若连接以 PROXY protocol v2 头开头，读掉它并返回头里声明的真实源地址。
+///
+/// 用 `peek` 先确认签名：不是 v2 就一个字节都不消费——同一个端口上「配了代理」和
+/// 「没配代理」的客户端可以共存，不会把正常帧当成头。
+async fn read_proxy_v2(stream: &mut TcpStream) -> Option<SocketAddr> {
+    use crate::proxy_protocol;
+    // 等头到达（代理连接建立后会立刻发头；正常客户端则永远不会发这 12 字节）
+    let mut sig = [0u8; 12];
+    let mut rounds = 0;
+    while rounds < 40 {
+        match stream.peek(&mut sig).await {
+            Ok(n) if n >= sig.len() => break,
+            Ok(_) => {}
+            Err(_) => return None,
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        rounds += 1;
+    }
+    if !proxy_protocol::looks_like_v2(&sig) {
+        return None;
+    }
+    let mut head = [0u8; proxy_protocol::FIXED_LEN];
+    stream.read_exact(&mut head).await.ok()?;
+    let addr_len = u16::from_be_bytes([head[14], head[15]]) as usize;
+    let mut full = vec![0u8; proxy_protocol::FIXED_LEN + addr_len];
+    full[..proxy_protocol::FIXED_LEN].copy_from_slice(&head);
+    stream.read_exact(&mut full[proxy_protocol::FIXED_LEN..]).await.ok()?;
+    proxy_protocol::parse_v2(&full).and_then(|info| info.source)
 }
 
 /// 写一帧：`[u16 BE 长度][payload]`

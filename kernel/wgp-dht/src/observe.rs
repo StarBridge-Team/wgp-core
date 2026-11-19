@@ -29,6 +29,11 @@ pub const OBSERVER_RATE_WINDOW: Duration = Duration::from_secs(10);
 pub struct ObserverPolicy {
     pub rate_limit: u32,
     pub rate_window: Duration,
+    /// 前置代理会注入 PROXY protocol v2 时置 true：用头里的**真实**客户端地址做
+    /// 映射报告与限速，而不是代理自己的地址。默认 false（直接把来源当客户端）。
+    ///
+    /// 只能在「本端口只可能被可信代理访问」时打开，否则任何人都能伪造来源。
+    pub proxy_protocol: bool,
 }
 
 impl Default for ObserverPolicy {
@@ -36,6 +41,7 @@ impl Default for ObserverPolicy {
         Self {
             rate_limit: OBSERVER_RATE_LIMIT,
             rate_window: OBSERVER_RATE_WINDOW,
+            proxy_protocol: false,
         }
     }
 }
@@ -53,12 +59,36 @@ impl ObserverPolicy {
 
 /// 对入站报文判定是否为 Binding Request，是则构造响应（None = 非 STUN 业务）
 pub fn try_answer_stun(buf: &[u8], src: SocketAddr) -> Option<Vec<u8>> {
-    let header = StunHeader::decode(buf)?;
+    try_answer_stun_ex(buf, src, false).map(|(_, resp)| resp)
+}
+
+/// 同 [`try_answer_stun`]，但可以识别前置代理注入的 PROXY protocol v2。
+///
+/// 返回 `(声称的客户端地址, 响应字节)`：
+/// - `proxy_v2` 为 true 且报文以 v2 头开头时，映射报告与限速都用头里的真实来源；
+/// - 否则用 `src`（UDP 看到的来源）。
+///
+/// **响应永远回给 `src`**（也就是代理），绝不回给头里声明的地址——那个地址在隧道外面，
+/// 直接发过去既到不了，也会成为反射放大器。
+pub fn try_answer_stun_ex(
+    buf: &[u8],
+    src: SocketAddr,
+    proxy_v2: bool,
+) -> Option<(SocketAddr, Vec<u8>)> {
+    let (claimed, body) = if proxy_v2 {
+        match crate::proxy_protocol::strip_v2(buf) {
+            Some((info, rest)) => (info.source.unwrap_or(src), rest),
+            None => (src, buf),
+        }
+    } else {
+        (src, buf)
+    };
+    let header = StunHeader::decode(body)?;
     if !header.is_binding_request() {
         return None;
     }
     // 客户端的 WGP-PEER 扩展（若有）→ 原样回显（Nonce 关联 + 往返测量）
-    let echo = decode_attrs(buf.get(20..)?).and_then(|attrs| {
+    let echo = decode_attrs(body.get(20..)?).and_then(|attrs| {
         for (t, v) in attrs {
             if t == wgp_attr::WGP_PEER {
                 return WgpPeerAttr::decode(&v);
@@ -68,11 +98,14 @@ pub fn try_answer_stun(buf: &[u8], src: SocketAddr) -> Option<Vec<u8>> {
     });
 
     // 仅支持 IPv4 源（v1 观察者；IPv6 未来线）
-    let ipv4 = match src.ip() {
+    let ipv4 = match claimed.ip() {
         std::net::IpAddr::V4(v4) => v4.octets(),
         _ => return None,
     };
-    Some(binding_response(&header.tx_id, ipv4, src.port(), echo.as_ref()))
+    Some((
+        claimed,
+        binding_response(&header.tx_id, ipv4, claimed.port(), echo.as_ref()),
+    ))
 }
 
 /// 独立观察者服务（专用端口；内置每 IP 限频）
@@ -111,15 +144,19 @@ impl ObserverServer {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                if let Some(resp) = try_answer_stun(&buf[..n], src) {
-                    // 限频闸门：超限丢弃（防刷观察者/贡献节点保带宽特征）
+                if let Some((claimed, resp)) =
+                    try_answer_stun_ex(&buf[..n], src, loop_server.policy.proxy_protocol)
+                {
+                    // 限频闸门：按**真实来源**计数（PROXY v2 打开时就是头里的客户端地址）。
+                    // 超限静默丢弃（防刷观察者/贡献节点保带宽特征）。
                     let admitted = {
                         let mut g = loop_server.gate.lock().await;
-                        g.admit(src.ip(), Instant::now())
+                        g.admit(claimed.ip(), Instant::now())
                     };
                     if !admitted {
-                        continue; // 静默丢弃
+                        continue;
                     }
+                    // 回给代理（src），不是头里声明的地址
                     let _ = loop_socket.send_to(&resp, src).await;
                 }
             }
@@ -283,8 +320,7 @@ mod tests {
         );
     }
 
-    /// 绕过回归：同一 IP、不同源端口轮流向观察者发请求——
-    /// 限频必须按 IP 归一，总额度依然是 12（旧实现按 IP:port 计数可无限刷）
+    /// 绕过回归：同一 IP、不同源端口轮流向观察者发请求——    /// 限频必须按 IP 归一，总额度依然是 12（旧实现按 IP:port 计数可无限刷）
     #[tokio::test]
     async fn observer_rate_limit_keys_by_ip_not_port() {
         let server = ObserverServer::bind(0).await.unwrap();
@@ -319,5 +355,92 @@ mod tests {
             received <= OBSERVER_RATE_LIMIT as usize,
             "端口轮换不得放大总额度：收 {received}（上限 {OBSERVER_RATE_LIMIT}）"
         );
+    }
+
+    /// 组一个 PROXY v2 UDP/IPv4 头（测试用）
+    fn proxy_v2_udp_header(src: [u8; 4], src_port: u16, dst: [u8; 4], dst_port: u16) -> Vec<u8> {
+        let mut out = crate::proxy_protocol::SIGNATURE.to_vec();
+        out.push(0x21); // version 2, PROXY
+        out.push(0x12); // UDP over IPv4
+        out.extend_from_slice(&12u16.to_be_bytes());
+        out.extend_from_slice(&src);
+        out.extend_from_slice(&dst);
+        out.extend_from_slice(&src_port.to_be_bytes());
+        out.extend_from_slice(&dst_port.to_be_bytes());
+        out
+    }
+
+    /// 前置代理（FRP / nginx stream）注入 PROXY v2 时：
+    /// 映射报告必须用**头里的真实客户端地址**，应答仍然回给代理。
+    #[tokio::test]
+    async fn observer_with_proxy_v2_reports_the_real_client_address() {
+        let policy = ObserverPolicy {
+            rate_limit: OBSERVER_RATE_LIMIT,
+            rate_window: OBSERVER_RATE_WINDOW,
+            proxy_protocol: true,
+        };
+        let server = ObserverServer::bind_with_policy(0, policy).await.unwrap();
+        let server_addr: SocketAddr = format!(
+            "127.0.0.1:{}",
+            server.local_addr().unwrap().port()
+        )
+        .parse()
+        .unwrap();
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let txid = [0x7Bu8; 12];
+        let nonce = [1u8; 8];
+
+        // 头里声称：真实客户端是 203.0.113.9:41107
+        let mut datagram = proxy_v2_udp_header([203, 0, 113, 9], 41107, [198, 51, 100, 2], 3478);
+        datagram.extend_from_slice(&client_binding_with_echo(txid, nonce));
+        client.send_to(&datagram, server_addr).await.unwrap();
+
+        let mut buf = [0u8; 512];
+        let (n, src) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.recv_from(&mut buf),
+        )
+        .await
+        .expect("应有应答")
+        .unwrap();
+        // 应答必须回到代理（也就是发送方），不能发往头里声称的地址
+        assert_eq!(src, server_addr, "应答必须回到代理地址");
+
+        let attrs = decode_attrs(&buf[20..n]).unwrap();
+        let mut mapped = None;
+        for (t, v) in attrs {
+            if t == ATTR_XOR_MAPPED_ADDRESS {
+                mapped = Some(decode_xor_mapped(&v).unwrap());
+            }
+        }
+        assert_eq!(
+            mapped,
+            Some(([203, 0, 113, 9], 41107)),
+            "映射报告必须使用 PROXY v2 头里的真实来源"
+        );
+    }
+
+    /// 没开 PROXY v2 时，带头的报文不该被当成 STUN（否则报告会指向伪造地址）
+    #[tokio::test]
+    async fn observer_without_proxy_v2_ignores_prefixed_datagrams() {
+        let server = ObserverServer::bind(0).await.unwrap();
+        let server_addr: SocketAddr = format!(
+            "127.0.0.1:{}",
+            server.local_addr().unwrap().port()
+        )
+        .parse()
+        .unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut datagram = proxy_v2_udp_header([203, 0, 113, 9], 41107, [198, 51, 100, 2], 3478);
+        datagram.extend_from_slice(&client_binding_with_echo([0x7C; 12], [2u8; 8]));
+        client.send_to(&datagram, server_addr).await.unwrap();
+        let mut buf = [0u8; 64];
+        let res = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            client.recv_from(&mut buf),
+        )
+        .await;
+        assert!(res.is_err(), "默认关闭时必须把它当坏包忽略");
     }
 }
