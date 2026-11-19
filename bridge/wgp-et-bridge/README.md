@@ -26,6 +26,38 @@
 | 不转发别人的包 | mesh-tun-proto 是轻量客户端：`to_peer_id` 不是自己的帧直接丢。所以两个叶子节点之间要互通，中间必须有真正的 ET relay（官方 Core）——本项目节点目前只能当叶子 |
 | 一条隧道只有一个数据报消费者 | `Tunnel::take_dgrams` 只能取一次，所以同一对节点上**第一条** ET 流吃数据报，后续 ET 流全部走可靠流（控制与数据混在一起） |
 
+## 两条相反方向，别搞混
+
+| 方向 | 用途 | 入口 |
+|---|---|---|
+| **ET 跑在 wgp 隧道上** | 两个 wgp 节点打洞成功后，把它当一条 ET 链路，加入 ET 网络 | `EtNode` / `TunnelFrameTransport`（本 README 的 §怎么接的） |
+| **wgp 跑在 ET 上（回退通道）** | 一个 wgp 种子都没有时，借 ET 公共节点组临时网络，把本机固定端口透明送到对端 | `fallback` 模块 + `wgp-et-fallback` 可执行文件（下面的 §回退通道） |
+
+### 回退通道（`fallback` 模块 / `wgp-et-fallback`）
+
+没有 wgp 种子、只有 ET 公共节点时，`wgp-client` 会拉起这个程序：
+
+```text
+wgp-et-fallback --relay tcp://relay.example.com:11010 --room-key <64位hex> --mode host|joiner
+```
+
+- 启动后 stdout 打一行 `WGP-ET-FALLBACK READY peer=<u32> bind=<ip> punch=<u16>`，父进程据此接线；
+- 在 `127.0.0.2`（与本体进程的 `127.0.0.1` 分开，不抢端口）上监听 `11010`/`3478`，把 UDP 报文封成
+  ET 自定义帧（`send_data_to` / `InboundUserData`）发给对端；`host` 模式写回 `127.0.0.1:<同名端口>`
+  的本地种子，`joiner` 模式回给「最近一次从该端口发出去的本地地址」；
+- 打洞端口按 ET 节点号派生：`42100 + peer_id % 900`，两侧各自算得出对方的端口，不需要协商；
+- 网络名/密钥由房间键派生（`wgp-<room_key[..4] hex>` / `room_key[8..24] hex`），只有拿到房间码的人能加入。
+
+**实现要点（踩过的坑）**：`add_stream_conn` 的流式传输用阻塞 `read` 实现 `recv_frame`，
+**必须先设读超时**（`set_read_timeout(100ms)`，与库自带 `examples/poc.rs` 一致），否则 `tick()`
+会一直卡在 read 里——握手成功、数据永远收不到，看起来像「库不支持自定义 payload」。
+
+**限制**：一条桥只支持一个对端参与数据面（房主 ⇄ 一个加入方）；流量经公共中继，带宽与稳定性
+不受本项目控制；不碰 TUN。
+
+验收用例：`tests/fallback_bridge.rs`（两座桥经一条 ET 链路互发 UDP 报文，回环，1–2 秒）、
+`tests/stream_user_data_probe.rs`（钉住「流式传输 + 自定义 payload」这条库能力）。
+
 ## 职责边界
 
 | 仓库 | 管什么 |

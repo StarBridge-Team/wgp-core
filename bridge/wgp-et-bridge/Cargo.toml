@@ -17,7 +17,11 @@ mesh-tun-proto = { path = "../../../mesh-tun-proto" }
 wgp-port = { path = "../wgp-port" }
 anyhow = "1"
 bytes = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "signal", "io-util", "net"] }
+
+[[bin]]
+name = "wgp-et-fallback"
+path = "src/bin/wgp-et-fallback.rs"
 
 [dev-dependencies]
 wgp-core = { path = "../../kernel/wgp-core" }

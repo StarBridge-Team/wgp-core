@@ -24,9 +24,12 @@
 //! 本 crate 仍然**不含 TUN 设备**：IP 包以 [`EtEvent::Node`] 里的 `InboundIpPacket` 交给上层，
 //! 由上层决定写哪儿。
 
+/// ET 回退通道：没有 wgp 种子时，借 ET 公共节点组临时网络，把固定端口透明送到对端。
+/// 见 [`fallback`] 的模块文档与 `reports/et-fallback-seed-feasibility-2026-11-19.md`。
+pub mod fallback;
+
 use anyhow::anyhow;
-use bytes::{BufMut, BytesMut};
-use mesh_tun_proto::{
+use bytes::{BufMut, BytesMut};use mesh_tun_proto::{
     MeshFrameTransport, PacketType, P2pEvent, P2pNode, PeerManagerHeader,
     PEER_MANAGER_HEADER_SIZE,
 };
