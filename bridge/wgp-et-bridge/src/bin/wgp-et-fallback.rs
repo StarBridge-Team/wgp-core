@@ -206,7 +206,7 @@ async fn main() -> ExitCode {
         bridge.punch_port()
     );
     eprintln!(
-        "[et-fallback] 已加入临时 ET 网络（经公共中继 {relay_spec}）：本侧 {bind}:{ports}，打洞端口 {punch}",
+        "[et-fallback] 正在经公共 ET 中继 {relay_spec} 加入临时网络：本侧 {bind}:{ports}，打洞端口 {punch}",
         bind = bridge.bind_ip(),
         ports = args
             .services

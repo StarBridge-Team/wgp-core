@@ -157,6 +157,12 @@ struct EtLink {
     stop: Arc<AtomicBool>,
     /// 当前到 relay 的流：`Drop` 时 `shutdown` 它，好让卡在握手/读上的线程立刻退出
     stream: Arc<Mutex<Option<TcpStream>>>,
+    /// 路由表里除自己和 relay 之外的节点：**这才是数据面的对端**。
+    ///
+    /// 连公共 relay 时两个叶子彼此不直连：报文必须按 `to_peer_id` 交给 relay 转发。
+    /// 早先的实现把 relay 当成「唯一对端」，于是所有帧都发给 relay 自己（它只会丢掉），
+    /// 表现为「一直说还没有连上 ET 对端」。
+    peers: Arc<Mutex<Vec<u32>>>,
 }
 
 impl EtLink {
@@ -176,6 +182,8 @@ impl EtLink {
         let stop_thread = stop.clone();
         let stream_slot: Arc<Mutex<Option<TcpStream>>> = Arc::new(Mutex::new(None));
         let stream_thread = stream_slot.clone();
+        let peers_slot: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+        let peers_thread = peers_slot.clone();
 
         let thread = std::thread::Builder::new()
             .name("wgp-et-fallback".to_string())
@@ -188,6 +196,7 @@ impl EtLink {
                     return;
                 }
                 let mut connected = false;
+                let mut relay_peer_id: Option<u32> = None;
                 let mut last_connect: Option<Instant> = None;
                 let mut last_announce: Option<Instant> = None;
                 loop {
@@ -210,6 +219,7 @@ impl EtLink {
                             match node.add_stream_conn(stream) {
                                 Ok(peer) => {
                                     connected = true;
+                                    relay_peer_id = Some(peer);
                                     // 该库只在 tick 里发 PeerDown，不发 PeerUp：这里补一条，
                                     // 桥才知道「可以开始转发了」。
                                     let _ = ev_tx.send(P2pEvent::PeerUp {
@@ -253,6 +263,28 @@ impl EtLink {
                     if node.connected_peers().is_empty() {
                         connected = false;
                     }
+                    // ⑤ 刷新「数据面对端」：路由表里的其他节点（不含自己、不含 relay）。
+                    // 公共 relay 下两个叶子彼此不直连，报文要按 to_peer_id 交给 relay 转发；
+                    // 把 relay 当对端发是没用的（它只会丢掉）。
+                    let my_id = node.identity.my_peer_id;
+                    // 直连的 + 路由表里的（星型拓扑下对端只出现在后者；直连测试里只出现在前者）。
+                    // relay 也留在列表里：给它发的帧它自己会丢，不影响正确性。
+                    let mut list: Vec<u32> = node
+                        .connected_peers()
+                        .into_iter()
+                        .map(|(id, _)| id)
+                        .chain(node.mesh.route.peers.iter().map(|p| p.peer_id))
+                        .filter(|id| *id != my_id)
+                        .collect();
+                    list.sort_unstable();
+                    list.dedup();
+                    {
+                        let mut slot = peers_thread.lock().expect("peers 锁中毒");
+                        if *slot != list {
+                            trace!("数据面对端：{list:?}（relay={relay_peer_id:?}）");
+                            *slot = list;
+                        }
+                    }
                     std::thread::sleep(TICK);
                 }
             })
@@ -268,7 +300,13 @@ impl EtLink {
             thread: Some(thread),
             stop,
             stream: stream_slot,
+            peers: peers_slot,
         })
+    }
+
+    /// 数据面对端（路由表里除自己和 relay 之外的节点）
+    fn peers(&self) -> Vec<u32> {
+        self.peers.lock().expect("peers 锁中毒").clone()
     }
 
     fn send(&self, to: u32, frame: Vec<u8>) -> anyhow::Result<()> {
@@ -363,17 +401,9 @@ impl FallbackBridge {
         self.config.bind_ip
     }
 
-    /// 已连接的对端（取第一个当数据面对端）
-    fn single_peer(&self) -> Option<u32> {
-        let peers = self.peers.lock().expect("peers 锁中毒");
-        match peers.len() {
-            0 => None,
-            1 => Some(peers[0]),
-            _ => {
-                // 多个对端时数据面只支持一个：仍然取第一个，并把这件事记在日志里
-                Some(peers[0])
-            }
-        }
+    /// 数据面对端列表（来自 ET 路由表；relay 已被排除）
+    fn peer_list(&self) -> Vec<u32> {
+        self.peers.lock().expect("peers 锁中毒").clone()
     }
 
     /// 为某个对端补一个打洞端口监听（`bind_ip:punch_port(peer)`）
@@ -399,11 +429,29 @@ impl FallbackBridge {
         let mut buf = vec![0u8; RECV_BUF];
         // ET 事件与 UDP 接收并行：用一个 select 轮询所有 socket
         loop {
+            // ⓪ 对端集合以 ET 路由表为准（含经 relay 转发的远端，relay 自己不算）：
+            //    新出现的对端要补打洞端口监听，消失的要清掉。
+            let live = self.link.peers();
+            {
+                let known = self.peer_list();
+                if known != live {
+                    for peer in live.iter().filter(|p| !known.contains(p)) {
+                        if let Err(e) = self.ensure_punch_socket(*peer).await {
+                            let _ = self.event_tx.send(BridgeEvent::Dropped {
+                                reason: e.to_string(),
+                            });
+                        }
+                    }
+                    *self.peers.lock().expect("peers 锁中毒") = live;
+                }
+            }
+
             // ① 收 ET 帧（非阻塞）
             while let Ok(event) = self.link.events.try_recv() {
                 match event {
                     P2pEvent::PeerUp { peer_id, .. } => {
-                        self.peers.lock().expect("peers 锁中毒").push(peer_id);
+                        // relay 连上（也可能是直连对端）：打洞端口要跟着准备，但「数据面对端」
+                        // 以路由表为准（连公共 relay 时对端并不是这条直连）。
                         if let Err(e) = self.ensure_punch_socket(peer_id).await {
                             let _ = self.event_tx.send(BridgeEvent::Dropped {
                                 reason: e.to_string(),
@@ -412,10 +460,6 @@ impl FallbackBridge {
                         let _ = self.event_tx.send(BridgeEvent::PeerUp { peer_id });
                     }
                     P2pEvent::PeerDown { peer_id, .. } => {
-                        self.peers
-                            .lock()
-                            .expect("peers 锁中毒")
-                            .retain(|p| *p != peer_id);
                         let _ = self.event_tx.send(BridgeEvent::PeerDown { peer_id });
                     }
                     P2pEvent::InboundUserData { from_peer_id, data } => {
@@ -452,22 +496,32 @@ impl FallbackBridge {
     /// 本机应用发来一枚报文：记下它的地址，转发给对端
     async fn on_local_datagram(&mut self, port: u16, src: SocketAddr, payload: &[u8]) {
         trace!("本地 -> 端口 {port}：来自 {src} 的 {} 字节", payload.len());
-        let Some(peer) = self.single_peer() else {
+        let peers = self.peer_list();
+        if peers.is_empty() {
             let _ = self.event_tx.send(BridgeEvent::Dropped {
-                reason: format!("端口 {port} 收到报文，但还没有连上任何 ET 对端"),
+                reason: format!(
+                    "端口 {port} 收到报文，但 ET 路由表里还没有对端（只连上中继 / 中继还没同步到对端）"
+                ),
             });
             return;
-        };
-        self.app_addr
-            .lock()
-            .expect("app_addr 锁中毒")
-            .insert((peer, port), src);
+        }
+        // 记下「本机应用在这个端口上的地址」：回程按 (对端, 端口) 找它
+        for peer in &peers {
+            self.app_addr
+                .lock()
+                .expect("app_addr 锁中毒")
+                .insert((*peer, port), src);
+        }
         let frame = encode_frame(port, payload);
-        trace!("转发给对端 {peer}：端口 {port}，{} 字节", payload.len());
-        if let Err(e) = self.link.send(peer, frame) {
-            let _ = self.event_tx.send(BridgeEvent::Dropped {
-                reason: e.to_string(),
-            });
+        trace!("转发给 {} 个对端 {peers:?}：端口 {port}，{} 字节", peers.len(), payload.len());
+        // 交给每个已知对端：经公共 relay 时由它按 to_peer_id 转发；直连时就是对方本人
+        for peer in peers {
+            if let Err(e) = self.link.send(peer, frame.clone()) {
+                let _ = self.event_tx.send(BridgeEvent::Dropped {
+                    reason: e.to_string(),
+                });
+                break;
+            }
         }
     }
 

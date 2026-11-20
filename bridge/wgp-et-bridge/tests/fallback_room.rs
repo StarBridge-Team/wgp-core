@@ -140,10 +140,24 @@ async fn room_is_readable_and_writable_through_the_fallback_bridge() {
     let bridged_seed = SocketAddr::from((Ipv4Addr::new(127, 0, 0, 4), DHT_PORT));
 
     // ① 信令：PING 能通（身份证明握手也要经桥走一遍）
-    let pong = joiner_node
-        .ping(bridged_seed)
-        .await
-        .expect("加入方应能经桥 PING 到房主种子");
+    //
+    // 要重试：桥是先连上 ET、再从路由表学到对端的，这之前的报文会被丢掉；真实客户端
+    // 也是这样重试的（`warm_up` 最多 10 次），第一次可能因为丢包/竞态失败。
+    let mut last_err = String::new();
+    let mut pong = None;
+    for _ in 0..10 {
+        match joiner_node.ping(bridged_seed).await {
+            Ok(p) => {
+                pong = Some(p);
+                break;
+            }
+            Err(e) => {
+                last_err = format!("{e:?}");
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+        }
+    }
+    let pong = pong.unwrap_or_else(|| panic!("加入方应能经桥 PING 到房主种子（最后一次：{last_err}）"));
     assert_eq!(pong.node_id, host_seed.node_id(), "应答者必须是房主种子");
 
     // ② 房间读写：读得到房主建的房间
